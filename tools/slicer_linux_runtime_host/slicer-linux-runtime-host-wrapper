@@ -1,0 +1,126 @@
+#!/bin/sh
+set -eu
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+HOST_PATH="${1:-}"
+RUNTIME_DIR="${2:-}"
+COMPONENT_DIR="${3:-}"
+
+if [ -z "$HOST_PATH" ]; then
+    echo "missing host path" >&2
+    exit 127
+fi
+
+runtime_dir_default() {
+    printf '%s\n' "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime/runtime"
+}
+
+app_support_dir() {
+    printf '%s\n' "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime"
+}
+
+shell_quote() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
+
+trim_file() {
+    path="$1"
+    if [ ! -f "$path" ]; then
+        return 1
+    fi
+    LC_ALL=C tr -d '\r' < "$path" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+find_limactl() {
+    if [ -n "${SLICER_LINUX_RUNTIME_LIMACTL:-}" ] && [ -x "${SLICER_LINUX_RUNTIME_LIMACTL}" ]; then
+        printf '%s\n' "$SLICER_LINUX_RUNTIME_LIMACTL"
+        return 0
+    fi
+
+    local_lima="$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime/lima/bin/limactl"
+    if [ -x "$local_lima" ]; then
+        printf '%s\n' "$local_lima"
+        return 0
+    fi
+
+    if command -v limactl >/dev/null 2>&1; then
+        command -v limactl
+        return 0
+    fi
+
+    for candidate in \
+        "/opt/homebrew/bin/limactl" \
+        "/usr/local/bin/limactl"
+    do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+if [ -z "$RUNTIME_DIR" ]; then
+    RUNTIME_DIR="${SLICER_LINUX_RUNTIME_MAC_RUNTIME_DIR:-$(runtime_dir_default)}"
+fi
+if [ -z "$COMPONENT_DIR" ]; then
+    COMPONENT_DIR="${SLICER_LINUX_RUNTIME_COMPONENT_DIR:-$RUNTIME_DIR}"
+fi
+
+sync_component_payload() {
+    [ -d "$COMPONENT_DIR" ] || return 0
+    mkdir -p "$RUNTIME_DIR"
+    for path in "$COMPONENT_DIR"/*; do
+        [ -f "$path" ] || continue
+        base="$(basename "$path")"
+        case "$base" in
+            libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|ca-certificates.crt|slicer_base64.cer|lib*.so|lib*.so.*|*.so|*.so.*)
+                if [ ! -f "$RUNTIME_DIR/$base" ] || ! cmp -s "$path" "$RUNTIME_DIR/$base"; then
+                    cp -f "$path" "$RUNTIME_DIR/$base"
+                fi
+                case "$base" in
+                    *.so|*.so.*|lib*.so|lib*.so.*) chmod 755 "$RUNTIME_DIR/$base" 2>/dev/null || true ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+sync_component_payload
+
+INSTANCE="${SLICER_LINUX_RUNTIME_MAC_LIMA_INSTANCE:-}"
+if [ -z "$INSTANCE" ]; then
+    INSTANCE=$(trim_file "$COMPONENT_DIR/slicer_linux_runtime_lima_instance.txt" || true)
+fi
+if [ -z "$INSTANCE" ]; then
+    INSTANCE="slicer-linux-runtime"
+fi
+
+LIMACTL=$(find_limactl || true)
+if [ -z "$LIMACTL" ]; then
+    echo "limactl not found" >&2
+    exit 127
+fi
+
+APP_SUPPORT_DIR=$(app_support_dir)
+LOG_DIR="$APP_SUPPORT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/linux-runtime-host.log"
+
+{
+    printf '%s\n' "---- slicer linux runtime launch ----"
+    date
+    printf 'instance=%s\n' "$INSTANCE"
+    printf 'host_path=%s\n' "$HOST_PATH"
+    printf 'runtime_dir=%s\n' "$RUNTIME_DIR"
+    printf 'component_dir=%s\n' "$COMPONENT_DIR"
+    printf 'expected_abi=%s\n' "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}"
+} >> "$LOG_FILE" 2>/dev/null || true
+
+CMD="if [ \"\$(uname -s)\" != Linux ]; then echo 'not running inside Linux guest' >&2; exit 127; fi; export SLICER_LINUX_RUNTIME_COMPONENT_DIR=$(shell_quote "$RUNTIME_DIR"); export SLICER_LINUX_RUNTIME_COMPONENT_SO=$(shell_quote "$RUNTIME_DIR/libbambu_networking.so"); export SLICER_LINUX_RUNTIME_SOURCE_SO=$(shell_quote "$RUNTIME_DIR/libBambuSource.so"); export SLICER_LINUX_RUNTIME_MEDIA_SO=$(shell_quote "$RUNTIME_DIR/liblive555.so"); export SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION=$(shell_quote "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}"); export SLICER_LINUX_RUNTIME_REQUIRE_LINUX_GUEST=1; unset LD_LIBRARY_PATH; if [ -f $(shell_quote "$RUNTIME_DIR/ca-certificates.crt") ]; then export SSL_CERT_FILE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); export CURL_CA_BUNDLE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); fi; if [ -d /etc/ssl/certs ]; then export SSL_CERT_DIR=/etc/ssl/certs; fi; exec /bin/sh $(shell_quote "$HOST_PATH")"
+
+exec "$LIMACTL" --tty=false shell "$INSTANCE" -- /bin/sh -lc "$CMD" 2>>"$LOG_FILE"

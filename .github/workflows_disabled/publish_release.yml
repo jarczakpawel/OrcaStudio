@@ -1,0 +1,113 @@
+name: Publish to draft release
+
+# Manually pulls the platform binaries produced by a "Build all" run and uploads
+# them to an existing DRAFT release. Decoupled from the build so you can test a
+# build first, then publish exactly that run's artifacts once you're happy.
+#
+# Trigger: Actions tab -> "Publish to draft release" -> Run workflow.
+# Locked to a single person: the first step aborts unless the actor matches the
+# `RELEASE_PUBLISHER` repo variable (set to "SoftFever"). To allow someone else,
+# change that variable: gh variable set RELEASE_PUBLISHER --body "<login>".
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of the "Build all" workflow to pull binaries from (the number in the Actions run URL)'
+        required: true
+        type: string
+      tag:
+        description: 'Tag of the draft release to upload to (e.g. v2.4.0-beta)'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # upload release assets
+  actions: read     # download artifacts from another run
+
+jobs:
+  publish:
+    name: Publish binaries to draft release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUN_ID: ${{ inputs.run_id }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Restrict to the release publisher
+        env:
+          PUBLISHER: ${{ vars.RELEASE_PUBLISHER }}
+        run: |
+          if [ -z "$PUBLISHER" ]; then
+            echo "::error::RELEASE_PUBLISHER repo variable is not set."
+            exit 1
+          fi
+          if [ "${{ github.actor }}" != "$PUBLISHER" ]; then
+            echo "::error::Only @$PUBLISHER may run this workflow (you are @${{ github.actor }})."
+            exit 1
+          fi
+          echo "Authorized: @${{ github.actor }}"
+
+      - name: Verify target is a draft release
+        run: |
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
+            echo "::error::Release '$TAG' not found. Create the draft (with this tag) first."
+            exit 1
+          fi
+          is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::Release '$TAG' is published, not a draft. Aborting to avoid touching a live release."
+            exit 1
+          fi
+
+      - name: Verify source build run
+        run: |
+          info=$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json workflowName,conclusion,headBranch)
+          name=$(echo "$info" | jq -r '.workflowName')
+          conclusion=$(echo "$info" | jq -r '.conclusion')
+          branch=$(echo "$info" | jq -r '.headBranch')
+          echo "Source run #$RUN_ID: '$name' on '$branch' (conclusion: $conclusion)"
+          if [ "$conclusion" != "success" ]; then
+            echo "::warning::Source run did not conclude 'success' ($conclusion). Some assets may be missing."
+          fi
+
+      - name: Download release artifacts from build run
+        run: |
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts \
+            -p 'BambuStudio-OrcaSlicer_Windows_*' \
+            -p 'BambuStudio-OrcaSlicer_Mac_arm64_*' \
+            -p 'BambuStudio-OrcaSlicer_Mac_x86_64_*' \
+            -p 'bambustudio-orcaslicer-linux-appimage-*' \
+            -p 'bambustudio-orcaslicer-linux-*' \
+            -p 'PDB'
+          echo "Downloaded artifact folders:"
+          ls -1 artifacts
+
+      - name: Assemble release assets
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_Windows_*.exe' ! -path '*_portable*' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_Windows_*_portable.zip' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_LinuxDir_*.tar.gz' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_Linux_AppImage_*.AppImage' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_Mac_arm64_*.dmg' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_Mac_x86_64_*.dmg' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_*.flatpak' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'BambuStudio-OrcaSlicer_*.deb' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'SHA256SUMS*.txt' -exec cp -v {} upload/ \;
+          find artifacts -type f -name 'Debug_PDB_*.7z' -exec cp -v {} upload/ \;
+
+          echo "Assets to upload:"
+          ls -lh upload
+          if [ -z "$(ls -A upload)" ]; then
+            echo "::error::No assets assembled. Check the run_id and that its artifacts haven't expired."
+            exit 1
+          fi
+
+      - name: Upload assets to draft release
+        run: |
+          gh release upload "$TAG" upload/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Uploaded to draft release: $TAG"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'

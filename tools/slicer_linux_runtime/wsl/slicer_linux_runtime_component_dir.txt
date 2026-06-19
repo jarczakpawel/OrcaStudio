@@ -1,0 +1,1 @@
+BambuStudio_OrcaSlicer\ota\plugins
