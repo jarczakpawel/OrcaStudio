@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+APPIMAGETOOLURL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$(uname -m).AppImage"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="@CMAKE_SOURCE_DIR@"
+
+
+APP_IMAGE="BambuStudio-OrcaSlicer_Linux_V@SoftFever_VERSION@.AppImage"
+APP_ICON_NAME="BambuStudio-OrcaSlicer"
+APP_DESKTOP_ID="com.orcaslicer.BambuStudio-OrcaSlicer"
+
+wget ${APPIMAGETOOLURL} -O ../appimagetool.AppImage
+chmod +x ../appimagetool.AppImage
+
+if [ -f /.dockerenv ] ; then # Only run if inside of a Docker Container
+sed '0,/AI\x02/{s|AI\x02|\x00\x00\x00|}' -i  ../appimagetool.AppImage
+fi
+
+mv @SLIC3R_APP_CMD@ AppRun
+chmod +x AppRun
+
+cp resources/images/BambuStudio_192px.png "${APP_ICON_NAME}.png"
+mkdir -p usr/share/icons/hicolor/192x192/apps
+cp resources/images/BambuStudio_192px.png "usr/share/icons/hicolor/192x192/apps/${APP_ICON_NAME}.png"
+cat <<EOF > "${APP_DESKTOP_ID}.desktop"
+[Desktop Entry]
+Name=BambuStudio-OrcaSlicer
+Exec=AppRun %F
+Icon=${APP_ICON_NAME}
+Type=Application
+PrefersNonDefaultGPU=true
+X-KDE-RunOnDiscreteGpu=true
+Categories=Utility;
+MimeType=model/stl;application/vnd.ms-3mfdocument;application/prs.wavefront-obj;application/x-amf;
+StartupWMClass=BambuStudio_OrcaSlicer
+EOF
+
+mkdir -p usr/share/applications
+cp "${APP_DESKTOP_ID}.desktop" usr/share/applications/
+
+mkdir -p usr/share/metainfo
+cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.BambuStudio.metainfo.xml" \
+  "usr/share/metainfo/${APP_DESKTOP_ID}.metainfo.xml"
+cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.BambuStudio.metainfo.xml" \
+  "usr/share/metainfo/${APP_DESKTOP_ID}.appdata.xml"
+
+sed -i \
+  -e "s|<id>com.orcaslicer.BambuStudio</id>|<id>${APP_DESKTOP_ID}</id>|" \
+  -e "s|<launchable type=\"desktop-id\">com.orcaslicer.BambuStudio.desktop</launchable>|<launchable type=\"desktop-id\">${APP_DESKTOP_ID}.desktop</launchable>|" \
+  "usr/share/metainfo/${APP_DESKTOP_ID}.metainfo.xml" \
+  "usr/share/metainfo/${APP_DESKTOP_ID}.appdata.xml"
+
+
+export ARCH=$(uname -m)
+
+if [ -f /.dockerenv ] ; then # Only run if inside of a Docker Container
+  ../appimagetool.AppImage --appimage-extract-and-run . $([ -n "${container}" ] && echo '--appimage-extract-and-run')
+else
+  ../appimagetool.AppImage . $([ -n "${container}" ] && echo '--appimage-extract-and-run')
+fi
+
+generated_appimage="$(find . -maxdepth 1 -type f -name '*.AppImage' ! -name 'appimagetool.AppImage' | LC_ALL=C sort | head -n 1)"
+if [ -z "${generated_appimage}" ]; then
+  echo "ERROR: appimagetool did not produce an AppImage" >&2
+  exit 1
+fi
+mv "${generated_appimage}" "${APP_IMAGE}"
+chmod +x "${APP_IMAGE}"

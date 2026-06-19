@@ -1,0 +1,84 @@
+#!/bin/sh
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+CACHE_FILE="$DIR/.selected_host_abi"
+LOADER="$DIR/ld-linux-x86-64.so.2"
+
+library_path() {
+    printf '%s' "$DIR"
+    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        printf ':%s' "$LD_LIBRARY_PATH"
+    fi
+}
+
+run_host() {
+    bin="$1"
+    shift
+    if [ -x "$LOADER" ]; then
+        LD_LIBRARY_PATH=$(library_path) exec "$LOADER" --library-path "$(library_path)" "$bin" "$@"
+    fi
+    LD_LIBRARY_PATH=$(library_path) exec "$bin" "$@"
+}
+
+probe_host() {
+    bin="$1"
+    [ -x "$bin" ] || return 1
+    if [ -x "$LOADER" ]; then
+        LD_LIBRARY_PATH=$(library_path) \
+        SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
+        SLICER_LINUX_RUNTIME_COUNTRY_CODE="${SLICER_LINUX_RUNTIME_COUNTRY_CODE:-PL}" \
+        "$LOADER" --library-path "$(library_path)" "$bin" --probe-load >/dev/null 2>&1
+        return $?
+    fi
+    LD_LIBRARY_PATH=$(library_path) \
+    SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
+    SLICER_LINUX_RUNTIME_COUNTRY_CODE="${SLICER_LINUX_RUNTIME_COUNTRY_CODE:-PL}" \
+    "$bin" --probe-load >/dev/null 2>&1
+}
+
+choose_bin() {
+    requested_abi="${SLICER_LINUX_RUNTIME_ABI:-}"
+    if [ -n "$requested_abi" ] && [ -x "$DIR/slicer_linux_runtime_host_${requested_abi}" ]; then
+        printf '%s\n' "$DIR/slicer_linux_runtime_host_${requested_abi}"
+        return 0
+    fi
+
+    if [ -f "$CACHE_FILE" ]; then
+        cached=$(cat "$CACHE_FILE" 2>/dev/null || true)
+        if [ -n "$cached" ] && [ -x "$DIR/slicer_linux_runtime_host_$cached" ]; then
+            printf '%s\n' "$DIR/slicer_linux_runtime_host_$cached"
+            return 0
+        fi
+    fi
+
+    for abi in abi1 abi0; do
+        if probe_host "$DIR/slicer_linux_runtime_host_$abi"; then
+            printf '%s' "$abi" > "$CACHE_FILE"
+            printf '%s\n' "$DIR/slicer_linux_runtime_host_$abi"
+            return 0
+        fi
+    done
+
+    if [ -x "$DIR/slicer_linux_runtime_host_abi1" ]; then
+        printf '%s\n' "$DIR/slicer_linux_runtime_host_abi1"
+        return 0
+    fi
+    if [ -x "$DIR/slicer_linux_runtime_host_abi0" ]; then
+        printf '%s\n' "$DIR/slicer_linux_runtime_host_abi0"
+        return 0
+    fi
+    return 1
+}
+
+BIN=$(choose_bin) || {
+    echo "no compatible host ABI variant found" >&2
+    exit 127
+}
+
+if [ "${1:-}" = "--print-bin" ]; then
+    printf '%s\n' "$BIN"
+    exit 0
+fi
+
+run_host "$BIN" "$@"

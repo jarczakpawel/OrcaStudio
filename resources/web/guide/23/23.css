@@ -1,0 +1,87 @@
+/* TABS SYSTEM / CUSTOM */
+#Title {
+	margin: 0px 40px;
+	border-bottom: 1px solid var(--border-color);
+	display: flex;
+	flex-direction: row;
+	justify-content: center;
+	align-items: center;
+}
+
+#Title div {
+	cursor: pointer;
+	font-size: 24px;
+}
+
+#Title div.TitleSelected {
+	height: calc(100% - 6px);
+	display: flex;
+	align-items: center;
+	border-bottom: 6px solid var(--main-color);
+}
+
+#Title div.TitleUnselected {
+	height: 100%;
+	display: flex;
+	align-items: center;
+	color: #000;
+}
+
+/* SYSTEM FILAMENTS PAGE */
+body:has(#SystemFilamentBtn.TitleSelected) #Content { /* :has selector browser support 2023+ */
+	padding: 15px 15px 5px;
+}
+
+#SystemFilamentsArea {
+	display: none;
+	flex-direction: column;
+	height: 100%;
+}
+
+/* CUSTOM FILAMENTS PAGE */
+#CustomFilamentsArea {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+
+#CFilament_List {
+	display:flex;
+	overflow-y:auto;
+	flex-wrap:wrap;
+	justify-content:flex-start;
+	align-items: flex-start;
+	align-content:flex-start;
+	line-height: 32px;
+	height: 100%;
+}
+
+.CFilament_Item {
+	display: flex;
+	align-items: center;
+	margin-right: 10%;
+	width: 44%;
+}
+
+.CFilament_Item:nth-of-type(2n) {
+	margin-right: 2%;
+}
+
+.CFilament_Name {
+	width: 100%;
+	overflow: hidden;
+    white-space: nowrap; /* ?????? */
+    text-overflow: ellipsis; /* ????????? */
+}
+
+#CFilament_Btn_Area {
+	display: flex;
+	align-items: center;
+	height: 30px;
+}
+
+.CFilament_EditBtn {
+	cursor: pointer;
+	width: 20px;
+	height: 20px;
+}
