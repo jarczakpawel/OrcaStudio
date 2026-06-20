@@ -71,17 +71,11 @@ Nothing special is required.
 
 Install and run normally.
 
-If the application does not connect to the printer - close the program and launch it again (first launch).
-
 ### macOS
 
 Nothing needs to be installed manually.
 
 On first use, the application will ask to install the local Linux runtime.
-
-If the application does not connect to the printer - close the program and launch it again (first launch).
-
-The camera issue is still present on macOS and will be fixed soon.
 
 ## Removing the runtime
 
@@ -133,10 +127,11 @@ rm -rf "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-ru
 
 ## What was done
 
-* Updated to OrcaSlicer as of June 14, 2026, up to commit `9bcee518f859205fbcf3455c4f89fce5c606049c` + added OrcaSlicer commits `e700113b39f39b837175c680929538aa9655a9f9` and `5ed8f5ef258898a4006677bab8a3f2e412adedec`.
+* Updated to OrcaSlicer as of June 14, 2026, up to commit [`9bcee518f859205fbcf3455c4f89fce5c606049c`](https://github.com/SoftFever/OrcaSlicer/commit/9bcee518f859205fbcf3455c4f89fce5c606049c) + added OrcaSlicer commits [`e700113b39f39b837175c680929538aa9655a9f9`](https://github.com/SoftFever/OrcaSlicer/commit/e700113b39f39b837175c680929538aa9655a9f9) and [`5ed8f5ef258898a4006677bab8a3f2e412adedec`](https://github.com/SoftFever/OrcaSlicer/commit/5ed8f5ef258898a4006677bab8a3f2e412adedec).
 * Restored BambuNetwork support through the Linux `bambu_networking` path.
 * Added Windows WSL2 runtime support.
 * Added macOS Lima runtime support.
+* Fixed macOS runtime integration, including printer connection, file browsing and camera preview.
 * Added experimental Bambu Lab A2L printer support - it has not been tested.
 * Fixed the issue that appears when using BMCU with A1 / A1-mini printers on firmware `01.08.01.00` and `01.08.00.00`.
 * Fixed the known integration issues from this fork.
