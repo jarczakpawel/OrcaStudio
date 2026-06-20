@@ -1,6 +1,8 @@
 #include "AVVideoDecoder.hpp"
 
 #include <assert.h>
+#include <cstdlib>
+#include <cstring>
 
 extern "C"
 {
@@ -47,6 +49,10 @@ int AVVideoDecoder::open(Bambu_StreamInfo const &info)
 
 int AVVideoDecoder::decode(const Bambu_Sample &sample)
 {
+    got_frame_ = false;
+    if (!sample.buffer || sample.size <= 0)
+        return AVERROR_INVALIDDATA;
+
     int ret = -1;
     AVPacket *pkt = av_packet_alloc();
     if (!pkt) {
@@ -115,6 +121,49 @@ bool AVVideoDecoder::toWxImage(wxImage &image, wxSize const &size2)
         return false;
     }
     image = wxImage(size.GetWidth(), size.GetHeight(), bits_.data(), true);
+    if (!image.IsOk()) {
+        fprintf(stderr, "AVVideoDecoder: image not ok %dx%d\n", size.GetWidth(), size.GetHeight());
+        return false;
+    }
+    return true;
+}
+
+bool AVVideoDecoder::toWxImageOwned(wxImage &image, wxSize const &size2)
+{
+    if (!got_frame_)
+        return false;
+
+    auto size1 = size2;
+    if (!size1.IsFullySpecified())
+        size1 = {frame_->width, frame_->height};
+    auto size = size1;
+    if (size.GetWidth() & 0x0f)
+        size.SetWidth((size.GetWidth() & ~0x0f) + 0x10);
+
+    AVPixelFormat wxFmt = AV_PIX_FMT_RGB24;
+    sws_ctx_ = sws_getCachedContext(sws_ctx_,
+                                    frame_->width, frame_->height, AVPixelFormat(frame_->format),
+                                    size1.GetWidth(), size1.GetHeight(), wxFmt, SWS_FAST_BILINEAR,
+                                    nullptr, nullptr, nullptr);
+    if (sws_ctx_ == nullptr)
+        return false;
+
+    size_t length = size_t(size.GetWidth()) * size_t(size.GetHeight()) * 3;
+    auto *data = static_cast<unsigned char *>(std::malloc(length));
+    if (!data)
+        return false;
+    if (size.GetWidth() != size1.GetWidth())
+        std::memset(data, 0, length);
+
+    uint8_t *datas[] = {data};
+    int strides[] = {size.GetWidth() * 3};
+    int result_h = sws_scale(sws_ctx_, frame_->data, frame_->linesize, 0, frame_->height, datas, strides);
+    if (result_h != size.GetHeight()) {
+        std::free(data);
+        return false;
+    }
+
+    image = wxImage(size.GetWidth(), size.GetHeight(), data, false);
     if (!image.IsOk()) {
         fprintf(stderr, "AVVideoDecoder: image not ok %dx%d\n", size.GetWidth(), size.GetHeight());
         return false;

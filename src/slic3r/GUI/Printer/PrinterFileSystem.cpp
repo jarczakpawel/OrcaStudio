@@ -18,6 +18,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cstring>
+#include <algorithm>
 
 #ifndef NDEBUG
 //#define PRINTER_FILE_SYSTEM_TEST
@@ -72,6 +73,19 @@ struct StaticBambuLib : BambuLib {
     static void reset();
     static void release();
 private:
+    void add_copy(BambuLib *copy)
+    {
+        if (!copy)
+            return;
+        if (std::find(copies_.begin(), copies_.end(), copy) == copies_.end())
+            copies_.push_back(copy);
+    }
+
+    bool has_real_create() const
+    {
+        return Bambu_Create && Bambu_Create != Fake_Bambu_Create;
+    }
+
     std::vector<BambuLib *> copies_;
 };
 
@@ -1834,10 +1848,13 @@ static void* get_function(const char* name)
 StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
 {
     static StaticBambuLib lib;
-    // first load the library
+    lib.add_copy(copy);
 
-    if (lib.Bambu_Create)
+    if (lib.has_real_create()) {
+        if (copy)
+            *copy = lib;
         return lib;
+    }
 
     if (!module) {
         module = Slic3r::NetworkAgent::get_bambu_source_entry();
@@ -1859,19 +1876,23 @@ StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
     GET_FUNC(Bambu_Destroy);
     GET_FUNC(Bambu_SetLogger);
     GET_FUNC(Bambu_FreeLogMsg);
+    GET_FUNC(Bambu_Init);
     GET_FUNC(Bambu_Deinit);
+    GET_FUNC(Bambu_GetLastErrorMsg);
 
-    if (!lib.Bambu_Create) {
+    if (!lib.Bambu_Create)
         lib.Bambu_Create = Fake_Bambu_Create;
-        if (copy)
-            lib.copies_.push_back(copy);
-    }
+
+    if (copy)
+        *copy = lib;
+
     return lib;
 }
 
 void StaticBambuLib::reset()
 {
-    get().Bambu_Create = nullptr;
+    auto &old_lib = get();
+    old_lib.Bambu_Create = nullptr;
     auto &lib = get();
     for (auto c : lib.copies_)
         *c = lib;

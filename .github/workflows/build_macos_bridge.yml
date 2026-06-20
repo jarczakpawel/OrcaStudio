@@ -15,6 +15,15 @@ jobs:
         with:
           lfs: 'false'
 
+      - name: Normalize script permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$GITHUB_WORKSPACE" -type f \( -name "*.sh" -o -name "*.command" \) -exec chmod +x {} +
+          chmod +x "$GITHUB_WORKSPACE/build_release_macos.sh"
+          chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
+
+
       - uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~4.3.0"
@@ -65,12 +74,28 @@ jobs:
     needs: prepare_slicer_linux_runtime
     env:
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CERTIFICATE_ID }}
+      APPLE_DEV_ACCOUNT: ${{ secrets.APPLE_DEV_ACCOUNT }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      APP_PWD: ${{ secrets.APP_PWD }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           lfs: 'false'
+
+      - name: Normalize script permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$GITHUB_WORKSPACE" -type f \( -name "*.sh" -o -name "*.command" \) -exec chmod +x {} +
+          chmod +x "$GITHUB_WORKSPACE/build_release_macos.sh"
+          chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
+
 
       - uses: lukka/get-cmake@latest
         with:
@@ -106,6 +131,23 @@ jobs:
           brew list
           mkdir -p "$GITHUB_WORKSPACE/deps/build/arm64"
 
+      - name: Import macOS signing certificate
+        if: ${{ env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' && env.MACOS_CODESIGN_IDENTITY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/build_certificate.p12"
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security import "$certificate_path" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path"
+
       - name: Build macOS arm64 deps
         shell: bash
         run: |
@@ -120,12 +162,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          app="$GITHUB_WORKSPACE/build/arm64/OrcaSlicer/BambuStudio.app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          spctl --assess --type execute --verbose=4 "$app" || true
           mkdir -p "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg"
           rm -rf "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg"/*
-          cp -R "$GITHUB_WORKSPACE/build/arm64/OrcaSlicer/BambuStudio.app" "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg/"
+          cp -R "$app" "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg/"
           ln -sfn /Applications "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg/Applications"
-          ver=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
-          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg" -ov -format UDZO "$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_arm64_V${ver}.dmg"
+          ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          if [ -z "$ver" ]; then
+            echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
+            exit 1
+          fi
+          dmg="$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_arm64_V${ver}.dmg"
+          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg" -ov -format UDZO "$dmg"
+          if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ] && [ -n "${APPLE_DEV_ACCOUNT:-}" ] && [ -n "${TEAM_ID:-}" ] && [ -n "${APP_PWD:-}" ]; then
+            codesign --force --deep --verbose --options runtime --timestamp --entitlements "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements" --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
+            xcrun notarytool submit "$dmg" --apple-id "$APPLE_DEV_ACCOUNT" --team-id "$TEAM_ID" --password "$APP_PWD" --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --verbose=4 "$dmg" || true
+          else
+            echo "No Apple Developer ID notarization secrets configured. Publishing ad-hoc signed macOS DMG."
+            echo "Users may need Control-click -> Open or Privacy & Security -> Open Anyway on first launch."
+          fi
 
       - name: Explain skipped hosted runtime validation
         shell: bash
@@ -145,12 +205,28 @@ jobs:
     needs: prepare_slicer_linux_runtime
     env:
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CERTIFICATE_ID }}
+      APPLE_DEV_ACCOUNT: ${{ secrets.APPLE_DEV_ACCOUNT }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+      APP_PWD: ${{ secrets.APP_PWD }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           lfs: 'false'
+
+      - name: Normalize script permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "$GITHUB_WORKSPACE" -type f \( -name "*.sh" -o -name "*.command" \) -exec chmod +x {} +
+          chmod +x "$GITHUB_WORKSPACE/build_release_macos.sh"
+          chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
+
 
       - uses: lukka/get-cmake@latest
         with:
@@ -186,6 +262,23 @@ jobs:
           brew list
           mkdir -p "$GITHUB_WORKSPACE/deps/build/x86_64"
 
+      - name: Import macOS signing certificate
+        if: ${{ env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' && env.MACOS_CODESIGN_IDENTITY != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_path="$RUNNER_TEMP/build_certificate.p12"
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security import "$certificate_path" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path"
+
       - name: Build macOS x86_64 deps
         shell: bash
         run: |
@@ -200,12 +293,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          app="$GITHUB_WORKSPACE/build/x86_64/OrcaSlicer/BambuStudio.app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          spctl --assess --type execute --verbose=4 "$app" || true
           mkdir -p "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg"
           rm -rf "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg"/*
-          cp -R "$GITHUB_WORKSPACE/build/x86_64/OrcaSlicer/BambuStudio.app" "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg/"
+          cp -R "$app" "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg/"
           ln -sfn /Applications "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg/Applications"
-          ver=$(grep 'set(SoftFever_VERSION' version.inc | cut -d '"' -f2)
-          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg" -ov -format UDZO "$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_x86_64_V${ver}.dmg"
+          ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          if [ -z "$ver" ]; then
+            echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
+            exit 1
+          fi
+          dmg="$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_x86_64_V${ver}.dmg"
+          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg" -ov -format UDZO "$dmg"
+          if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ] && [ -n "${APPLE_DEV_ACCOUNT:-}" ] && [ -n "${TEAM_ID:-}" ] && [ -n "${APP_PWD:-}" ]; then
+            codesign --force --deep --verbose --options runtime --timestamp --entitlements "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements" --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
+            xcrun notarytool submit "$dmg" --apple-id "$APPLE_DEV_ACCOUNT" --team-id "$TEAM_ID" --password "$APP_PWD" --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --verbose=4 "$dmg" || true
+          else
+            echo "No Apple Developer ID notarization secrets configured. Publishing ad-hoc signed macOS DMG."
+            echo "Users may need Control-click -> Open or Privacy & Security -> Open Anyway on first launch."
+          fi
 
       - name: Explain skipped hosted runtime validation
         shell: bash

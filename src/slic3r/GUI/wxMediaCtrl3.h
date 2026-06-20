@@ -11,20 +11,15 @@
 #include "wx/uri.h"
 #include "wx/mediactrl.h"
 #include "wx/timer.h"
+#include <wx/bitmap.h>
 #include "../Utils/FrameBuffer.hpp"
 #include <atomic>
+#include <string>
 
 wxDECLARE_EVENT(EVT_MEDIA_CTRL_STAT, wxCommandEvent);
 wxDECLARE_EVENT(EVT_MEDIA_CTRL_FIRST_FRAME, wxCommandEvent);
 
 void wxMediaCtrl_OnSize(wxWindow * ctrl, wxSize const & videoSize, int width, int height);
-
-#ifdef __WXMAC__
-
-#include "wxMediaCtrl2.h"
-#define wxMediaCtrl3 wxMediaCtrl2
-
-#else
 
 #define BAMBU_DYNAMIC
 #include <condition_variable>
@@ -50,6 +45,9 @@ public:
     ~wxMediaCtrl3();
 
     void Load(wxURI url, std::chrono::system_clock::time_point play_start_time = {});
+#if defined(__WXMAC__) || defined(__APPLE__)
+    void LoadRaw(wxString const &url, std::chrono::system_clock::time_point play_start_time = {});
+#endif
 
     std::chrono::system_clock::time_point m_play_start_time;
 
@@ -96,7 +94,15 @@ private:
     wxSize m_video_size = wxDefaultSize;
     wxSize m_frame_size = wxDefaultSize;
     PlayFrame m_frame;
+#if defined(__WXMAC__) || defined(__APPLE__)
+    struct MediaUrl {
+        std::string value;
+        bool has_scheme = false;
+    };
+    std::shared_ptr<MediaUrl> m_url;
+#else
     std::shared_ptr<wxURI> m_url;
+#endif
     std::mutex m_mutex;
     std::mutex m_ui_mutex;
     std::condition_variable m_cond;
@@ -111,7 +117,5 @@ private:
     wxTimer m_render_timer;
     std::atomic<bool> m_need_refresh{false};
 };
-
-#endif
 
 #endif /* wxMediaCtrl3_h */

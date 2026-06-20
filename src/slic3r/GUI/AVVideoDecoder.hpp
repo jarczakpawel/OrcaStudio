@@ -32,6 +32,8 @@ public:
 
     bool toWxImage(wxImage &image, wxSize const &size);
 
+    bool toWxImageOwned(wxImage &image, wxSize const &size);
+
     bool toWxBitmap(wxBitmap &bitmap, wxSize const & size);
 
 private:

@@ -704,8 +704,9 @@ if (APPLE)
             GUI/DeepLinkHandlerMac.mm
             GUI/DeepLinkHandlerMac.h
             GUI/GUI_UtilsMac.mm
-            GUI/wxMediaCtrl2.mm
-            GUI/wxMediaCtrl2.h
+            GUI/AVVideoDecoder.cpp
+            GUI/AVVideoDecoder.hpp
+            GUI/wxMediaCtrl3.cpp
             GUI/wxMediaCtrl3.h
         )
     FIND_LIBRARY(DISKARBITRATION_LIBRARY DiskArbitration)
@@ -803,10 +804,16 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         ${CURL_LIBRARIES}
     )
 elseif (APPLE)
+    find_library(FFMPEG_AVCODEC_LIB NAMES avcodec PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib NO_DEFAULT_PATH)
+    find_library(FFMPEG_AVUTIL_LIB  NAMES avutil  PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib NO_DEFAULT_PATH)
+    find_library(FFMPEG_SWSCALE_LIB NAMES swscale PATHS ${CMAKE_PREFIX_PATH} PATH_SUFFIXES lib NO_DEFAULT_PATH)
+    if (NOT FFMPEG_AVCODEC_LIB OR NOT FFMPEG_AVUTIL_LIB OR NOT FFMPEG_SWSCALE_LIB)
+        message(FATAL_ERROR "Missing FFmpeg libs for macOS liveview decoding. Expected avcodec/avutil/swscale under ${CMAKE_PREFIX_PATH}/lib")
+    endif ()
     if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
-        target_link_libraries(libslic3r_gui ${DISKARBITRATION_LIBRARY} "-framework Security" "-framework OpenGL")
+        target_link_libraries(libslic3r_gui ${DISKARBITRATION_LIBRARY} "-framework Security" "-framework OpenGL" ${FFMPEG_AVCODEC_LIB} ${FFMPEG_AVUTIL_LIB} ${FFMPEG_SWSCALE_LIB})
     else()
-        target_link_libraries(libslic3r_gui ${DISKARBITRATION_LIBRARY} "-framework Security")
+        target_link_libraries(libslic3r_gui ${DISKARBITRATION_LIBRARY} "-framework Security" ${FFMPEG_AVCODEC_LIB} ${FFMPEG_AVUTIL_LIB} ${FFMPEG_SWSCALE_LIB})
     endif()
 endif()
 

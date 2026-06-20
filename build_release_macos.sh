@@ -254,6 +254,7 @@ function build_slicer() {
                     -DCMAKE_BUILD_TYPE="$BUILD_CONFIG" \
                     -DCMAKE_OSX_ARCHITECTURES="${_ARCH}" \
                     -DCMAKE_OSX_DEPLOYMENT_TARGET="${OSX_DEPLOYMENT_TARGET}" \
+                    -DCMAKE_PREFIX_PATH="$DEPS/usr/local" \
                     -DCMAKE_IGNORE_PREFIX_PATH="${CMAKE_IGNORE_PREFIX_PATH}" \
                     ${CMAKE_POLICY_COMPAT}
             fi
@@ -379,6 +380,159 @@ function build_slicer() {
                 "$runtime_dst/slicer_linux_runtime_host_abi0" \
                 "$runtime_dst/ld-linux-x86-64.so.2"
 
+            resources_cert_dst="./$APP_BUNDLE_NAME/Contents/Resources/cert"
+            mkdir -p "$resources_cert_dst"
+            if [ -f "$runtime_src/slicer_base64.cer" ]; then
+                cp -f "$runtime_src/slicer_base64.cer" "$resources_cert_dst/slicer_base64.cer"
+            elif [ -f "$PROJECT_DIR/resources/cert/slicer_base64.cer" ]; then
+                cp -f "$PROJECT_DIR/resources/cert/slicer_base64.cer" "$resources_cert_dst/slicer_base64.cer"
+            else
+                echo "Missing slicer_base64.cer for Contents/Resources/cert"
+                exit 1
+            fi
+            if [ -f "$runtime_src/ca-certificates.crt" ]; then
+                cp -f "$runtime_src/ca-certificates.crt" "$resources_cert_dst/ca-certificates.crt"
+            elif [ -f "$PROJECT_DIR/resources/cert/ca-certificates.crt" ]; then
+                cp -f "$PROJECT_DIR/resources/cert/ca-certificates.crt" "$resources_cert_dst/ca-certificates.crt"
+            fi
+            echo "macOS cert files after packaging:"
+            ls -la "$resources_cert_dst" || true
+            ls -la "$runtime_dst"/slicer_base64.cer "$runtime_dst"/ca-certificates.crt 2>/dev/null || true
+
+            frameworks_dst="./$APP_BUNDLE_NAME/Contents/Frameworks"
+            mkdir -p "$frameworks_dst"
+            deps_lib_dirs=("$DEPS/usr/local/lib" "$DEPS/lib")
+            for ffmpeg_pattern in libavcodec*.dylib libavutil*.dylib libswscale*.dylib libswresample*.dylib; do
+                found_ffmpeg=0
+                for deps_lib_dir in "${deps_lib_dirs[@]}"; do
+                    [ -d "$deps_lib_dir" ] || continue
+                    for ffmpeg_lib in "$deps_lib_dir"/$ffmpeg_pattern; do
+                        if [ -f "$ffmpeg_lib" ]; then
+                            cp -f "$ffmpeg_lib" "$frameworks_dst/$(basename "$ffmpeg_lib")"
+                            found_ffmpeg=1
+                        fi
+                    done
+                done
+                if [ "$found_ffmpeg" -eq 0 ] && [ "$ffmpeg_pattern" != "libswresample*.dylib" ]; then
+                    echo "Missing macOS FFmpeg runtime file matching ${deps_lib_dirs[*]} / $ffmpeg_pattern"
+                    exit 1
+                fi
+            done
+
+            is_macho_file() {
+                local target="$1"
+                [ -f "$target" ] || return 1
+                file "$target" | grep -q "Mach-O"
+            }
+
+            add_rpath_if_missing() {
+                local target="$1"
+                local rpath="$2"
+                is_macho_file "$target" || return 0
+                otool -l "$target" | awk '
+                    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+                    in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+                ' | grep -Fx "$rpath" >/dev/null 2>&1 && return 0
+                install_name_tool -add_rpath "$rpath" "$target" 2>/dev/null || true
+            }
+
+            is_system_macos_dependency() {
+                local dep="$1"
+                case "$dep" in
+                    @rpath/*|@loader_path/*|@executable_path/*|/usr/lib/*|/System/Library/*)
+                        return 0
+                        ;;
+                esac
+                return 1
+            }
+
+            fix_bundle_ref_if_present() {
+                local target="$1"
+                local dep="$2"
+                local dep_base
+                dep_base="$(basename "$dep")"
+                if [ -f "$frameworks_dst/$dep_base" ]; then
+                    install_name_tool -change "$dep" "@rpath/$dep_base" "$target" 2>/dev/null || true
+                fi
+            }
+
+            normalize_macho_file() {
+                local target="$1"
+                is_macho_file "$target" || return 0
+
+                case "$(basename "$target")" in
+                    *.dylib)
+                        install_name_tool -id "@rpath/$(basename "$target")" "$target" 2>/dev/null || true
+                        ;;
+                esac
+
+                add_rpath_if_missing "$target" "@executable_path/../Frameworks"
+                add_rpath_if_missing "$target" "@loader_path"
+                add_rpath_if_missing "$target" "@loader_path/../Frameworks"
+                add_rpath_if_missing "$target" "@loader_path/../../Frameworks"
+
+                while IFS= read -r dep; do
+                    [ -n "$dep" ] || continue
+                    fix_bundle_ref_if_present "$target" "$dep"
+                done < <(otool -L "$target" | awk 'NR > 1 {print $1}')
+            }
+
+            bundle_transitive_framework_deps() {
+                local changed=1
+                local pass=0
+                while [ "$changed" -eq 1 ]; do
+                    changed=0
+                    pass=$((pass + 1))
+                    echo "Bundling transitive macOS dylib dependencies, pass $pass"
+
+                    while IFS= read -r -d '' macho_file; do
+                        is_macho_file "$macho_file" || continue
+                        normalize_macho_file "$macho_file"
+
+                        while IFS= read -r dep; do
+                            [ -n "$dep" ] || continue
+                            is_system_macos_dependency "$dep" && continue
+
+                            dep_base="$(basename "$dep")"
+                            dep_dst="$frameworks_dst/$dep_base"
+
+                            if [ -f "$dep" ]; then
+                                if [ ! -f "$dep_dst" ]; then
+                                    echo "Bundling macOS dependency: $dep -> $dep_dst"
+                                    cp -f "$dep" "$dep_dst"
+                                    chmod u+w "$dep_dst" 2>/dev/null || true
+                                    changed=1
+                                fi
+                                install_name_tool -change "$dep" "@rpath/$dep_base" "$macho_file" 2>/dev/null || true
+                            elif [ -f "$dep_dst" ]; then
+                                install_name_tool -change "$dep" "@rpath/$dep_base" "$macho_file" 2>/dev/null || true
+                            else
+                                echo "WARNING: unresolved non-system dependency for $macho_file: $dep"
+                            fi
+                        done < <(otool -L "$macho_file" | awk 'NR > 1 {print $1}')
+                    done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
+
+                    if [ "$pass" -gt 30 ]; then
+                        echo "ERROR: too many dependency bundling passes"
+                        exit 1
+                    fi
+                done
+
+                while IFS= read -r -d '' macho_file; do
+                    normalize_macho_file "$macho_file"
+                done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
+            }
+
+            bundle_transitive_framework_deps
+
+            echo "macOS media/runtime dylib references after packaging:"
+            while IFS= read -r -d '' candidate; do
+                if is_macho_file "$candidate" && otool -L "$candidate" | grep -E 'libavcodec|libavutil|libswscale|libswresample|libX11|libxcb|libXau|libXdmcp' >/dev/null 2>&1; then
+                    echo "-- $candidate"
+                    otool -L "$candidate" | grep -E 'libavcodec|libavutil|libswscale|libswresample|libX11|libxcb|libXau|libXdmcp'
+                fi
+            done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
+
             find ./$APP_BUNDLE_NAME/ -name '.DS_Store' -delete
             
             # Copy OrcaSlicer_profile_validator.app if it exists
@@ -389,6 +543,22 @@ function build_slicer() {
                 # delete .DS_Store file
                 find ./OrcaSlicer_profile_validator.app/ -name '.DS_Store' -delete
             fi
+
+            sign_identity="${MACOS_CODESIGN_IDENTITY:-${CERTIFICATE_ID:-}}"
+            sign_args=(--force --deep --verbose)
+            if [ -n "$sign_identity" ]; then
+                sign_args+=(--options runtime --timestamp --entitlements "$PROJECT_DIR/scripts/disable_validation.entitlements" --sign "$sign_identity")
+                echo "Signing macOS app with identity: $sign_identity"
+            else
+                sign_args+=(--sign -)
+                echo "Signing macOS app with ad-hoc identity"
+            fi
+
+            if [ -d ./OrcaSlicer_profile_validator.app ]; then
+                codesign "${sign_args[@]}" ./OrcaSlicer_profile_validator.app
+            fi
+            codesign "${sign_args[@]}" ./$APP_BUNDLE_NAME
+            codesign --verify --deep --strict --verbose=4 ./$APP_BUNDLE_NAME
         )
 
         # extract version

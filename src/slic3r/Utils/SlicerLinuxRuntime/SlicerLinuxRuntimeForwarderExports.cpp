@@ -17,6 +17,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <filesystem>
+#include <boost/log/trivial.hpp>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -337,6 +339,19 @@ static std::string normalize_windows_runtime_path(std::string path)
 }
 #endif
 
+static std::string runtime_component_cert_folder(const std::string& filename)
+{
+    if (filename.empty())
+        return {};
+    const char* dir = std::getenv("SLICER_LINUX_RUNTIME_COMPONENT_DIR");
+    if (!dir || !*dir)
+        return {};
+    std::filesystem::path cert_path = std::filesystem::path(dir) / filename;
+    if (!std::filesystem::exists(cert_path) || std::filesystem::is_directory(cert_path))
+        return {};
+    return cert_path.parent_path().string();
+}
+
 static BBL::PrintParams normalize_runtime_paths(BBL::PrintParams params)
 {
     params.filename = normalize_windows_runtime_path(std::move(params.filename));
@@ -551,7 +566,8 @@ SLICER_LINUX_RUNTIME_EXPORT int bambu_network_set_cert_file(void* agent, std::st
 {
     auto* a = require_agent(agent);
     if (!a) return invalid_handle();
-    a->cert_dir = normalize_windows_runtime_path(std::move(folder));
+    const std::string runtime_cert_dir = runtime_component_cert_folder(filename);
+    a->cert_dir = runtime_cert_dir.empty() ? normalize_windows_runtime_path(std::move(folder)) : runtime_cert_dir;
     a->cert_file = std::move(filename);
     return RpcClient::instance().invoke_int("net.set_cert_file", {{"agent", agent_id(a)}, {"folder", a->cert_dir}, {"filename", a->cert_file}});
 }
@@ -947,9 +963,16 @@ SLICER_LINUX_RUNTIME_EXPORT Slic3r::ft_err ft_job_get_msg(Slic3r::FT_JobHandle* 
 SLICER_LINUX_RUNTIME_EXPORT int Bambu_Create(Bambu_Tunnel* tunnel, char const* path)
 {
     if (!tunnel) return -1;
-    const auto j = ok_or_error(RpcClient::instance().invoke_json("src.create", {{"path", std::string(path ? path : "")}}));
+    const std::string path_value(path ? path : "");
+    const bool is_bambu = path_value.rfind("bambu:///", 0) == 0;
+    const bool is_tutk = path_value.rfind("bambu:///tutk", 0) == 0;
+    BOOST_LOG_TRIVIAL(info) << "slicer-linux-runtime-forwarder: src.create.begin path_len=" << path_value.size()
+                            << ", path_is_bambu=" << (is_bambu ? 1 : 0)
+                            << ", path_is_tutk=" << (is_tutk ? 1 : 0);
+    const auto j = ok_or_error(RpcClient::instance().invoke_json("src.create", {{"path", path_value}}));
     const int ret = j.value("value", -1);
     const auto remote = j.value("tunnel", 0LL);
+    BOOST_LOG_TRIVIAL(info) << "slicer-linux-runtime-forwarder: src.create.end value=" << ret << ", tunnel=" << remote;
     if (ret != 0 || remote == 0) {
         *tunnel = nullptr;
         return ret;

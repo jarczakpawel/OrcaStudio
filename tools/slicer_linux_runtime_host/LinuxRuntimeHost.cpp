@@ -19,6 +19,8 @@
 #include <filesystem>
 #include <fstream>
 #include <unistd.h>
+#include <algorithm>
+#include <cctype>
 
 using namespace std::chrono_literals;
 
@@ -104,6 +106,158 @@ std::string trim_for_log(const std::string& value, std::size_t limit = 8192)
     return value.substr(0, limit) + "...<truncated>";
 }
 
+std::string lower_ascii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+bool contains_ascii_ci(const std::string& value, const std::string& needle)
+{
+    return lower_ascii(value).find(lower_ascii(needle)) != std::string::npos;
+}
+
+bool sensitive_log_key(const std::string& key)
+{
+    const std::string k = lower_ascii(key);
+    return k.find("token") != std::string::npos ||
+           k.find("passwd") != std::string::npos ||
+           k.find("password") != std::string::npos ||
+           k.find("authkey") != std::string::npos ||
+           k == "authorization" ||
+           k == "cookie" ||
+           k == "set-cookie" ||
+           k == "ticket" ||
+           k == "license" ||
+           k == "access_code" ||
+           k == "user_access_code" ||
+           k == "sec_link" ||
+           k == "http_body" ||
+           k == "login_cmd" ||
+           k == "logout_cmd" ||
+           k == "login_info" ||
+           k == "user_info" ||
+           k == "user_info_original" ||
+           k == "user_info_normalized" ||
+           k == "headers";
+}
+
+bool private_identifier_log_key(const std::string& key)
+{
+    const std::string k = lower_ascii(key);
+    return k == "dev_id" ||
+           k == "sdev_id" ||
+           k == "device" ||
+           k == "serial" ||
+           k == "sn" ||
+           k == "uid" ||
+           k == "user_id" ||
+           k == "username" ||
+           k == "user_name" ||
+           k == "user_nickname" ||
+           k == "user_avatar" ||
+           k == "email";
+}
+
+std::string redact_len(const std::string& value)
+{
+    return "<redacted len=" + std::to_string(value.size()) + ">";
+}
+
+std::string mask_identifier(const std::string& value)
+{
+    if (value.empty())
+        return {};
+    if (value.size() <= 8)
+        return "<id len=" + std::to_string(value.size()) + ">";
+    return value.substr(0, 4) + "..." + value.substr(value.size() - 4) + " (len=" + std::to_string(value.size()) + ")";
+}
+
+std::string mask_private_ip(const std::string& value)
+{
+    const auto last_dot = value.rfind('.');
+    if (last_dot == std::string::npos)
+        return mask_identifier(value);
+    return value.substr(0, last_dot + 1) + "x";
+}
+
+bool has_url_param_ci(const std::string& value, const std::string& key)
+{
+    const std::string lower = lower_ascii(value);
+    const std::string k = lower_ascii(key);
+    return lower.find("?" + k + "=") != std::string::npos ||
+           lower.find("&" + k + "=") != std::string::npos;
+}
+
+std::string bambu_url_kind_for_log(const std::string& value)
+{
+    constexpr const char* prefix = "bambu:///";
+    if (value.rfind(prefix, 0) != 0)
+        return "unknown";
+
+    const std::size_t start = std::strlen(prefix);
+    if (start >= value.size())
+        return "root";
+
+    if (value.compare(start, 4, "tutk") == 0)
+        return "tutk";
+    if (value.compare(start, 7, "rtsp___") == 0)
+        return "rtsp";
+    if (value.compare(start, 8, "local___") == 0)
+        return "local";
+    return "other";
+}
+
+std::string bambu_url_summary(const std::string& value)
+{
+    const std::string kind = bambu_url_kind_for_log(value);
+
+    return "bambu_url{len=" + std::to_string(value.size()) +
+           ",kind=" + kind +
+           ",has_uid=" + (has_url_param_ci(value, "uid") ? "1" : "0") +
+           ",has_authkey=" + (has_url_param_ci(value, "authkey") ? "1" : "0") +
+           ",has_passwd=" + (has_url_param_ci(value, "passwd") ? "1" : "0") +
+           ",has_license=" + (has_url_param_ci(value, "license") ? "1" : "0") +
+           ",has_token=" + (has_url_param_ci(value, "token") ? "1" : "0") +
+           ",has_refresh_url=" + (has_url_param_ci(value, "refresh_url") ? "1" : "0") +
+           ",has_device=" + (has_url_param_ci(value, "device") ? "1" : "0") +
+           "}";
+}
+
+std::string sanitize_log_string(const std::string& key, const std::string& value)
+{
+    if (sensitive_log_key(key))
+        return redact_len(value);
+    if (private_identifier_log_key(key))
+        return mask_identifier(value);
+    if (key == "dev_ip" || key == "ip" || key == "lan_ip")
+        return mask_private_ip(value);
+    if (value.rfind("bambu:///", 0) == 0)
+        return bambu_url_summary(value);
+    if (contains_ascii_ci(value, "authkey=") || contains_ascii_ci(value, "passwd=") || contains_ascii_ci(value, "token=") || contains_ascii_ci(value, "access_code"))
+        return redact_len(value);
+    return value;
+}
+
+nlohmann::json sanitize_log_json(const nlohmann::json& value, const std::string& key = {})
+{
+    if (value.is_object()) {
+        nlohmann::json out = nlohmann::json::object();
+        for (auto it = value.begin(); it != value.end(); ++it)
+            out[it.key()] = sanitize_log_json(it.value(), it.key());
+        return out;
+    }
+    if (value.is_array()) {
+        nlohmann::json out = nlohmann::json::array();
+        for (const auto& item : value)
+            out.push_back(sanitize_log_json(item, key));
+        return out;
+    }
+    if (value.is_string())
+        return sanitize_log_string(key, value.get<std::string>());
+    return value;
+}
+
 
 std::string replace_url_param_value(std::string value, const std::string& key, const std::string& replacement)
 {
@@ -134,7 +288,7 @@ void host_log_json(const std::string& kind, const nlohmann::json& payload)
     try {
         nlohmann::json line;
         line["kind"] = kind;
-        line["payload"] = payload;
+        line["payload"] = sanitize_log_json(payload);
         std::string text = trim_for_log(line.dump());
         std::lock_guard<std::mutex> lock(g_host_log_mutex);
         std::cerr << "[SLRUNTIME] " << text << std::endl;
@@ -1595,18 +1749,79 @@ nlohmann::json LinuxRuntimeHost::handle(const std::string& method, const nlohman
         const std::string path = raw_path.rfind("bambu:///", 0) == 0
             ? replace_url_param_value(raw_path, "refresh_url", refresh_agora_url_ptr_string())
             : raw_path;
+        nlohmann::json create_meta{{"path_len", path.size()},
+                                   {"path_is_bambu", path.rfind("bambu:///", 0) == 0},
+                                   {"path_is_tutk", path.rfind("bambu:///tutk", 0) == 0},
+                                   {"path_is_local", path.rfind("bambu:///local", 0) == 0},
+                                   {"has_refresh_url", path.find("refresh_url=") != std::string::npos}};
+        host_log_json("src.create.begin", create_meta);
         const int ret = f(&tunnel, path.c_str());
-        if (ret != 0)
+        nlohmann::json log_payload = create_meta;
+        log_payload["value"] = ret;
+        if (ret != 0) {
+            log_payload["tunnel"] = 0;
+            host_log_json("src.create", log_payload);
             return {{"ok", true}, {"value", ret}, {"tunnel", 0}};
+        }
         const auto id = m_next_tunnel++;
         { std::lock_guard<std::mutex> lock(m_state_mutex); m_tunnels[id] = tunnel; }
+        log_payload["tunnel"] = id;
+        host_log_json("src.create", log_payload);
         return {{"ok", true}, {"value", ret}, {"tunnel", id}};
     }
-    if (method == "src.open") { auto f = src<int (*)(Bambu_Tunnel)>("Bambu_Open"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t)}} : not_supported(method); }
-    if (method == "src.start_stream") { auto f = src<int (*)(Bambu_Tunnel, bool)>("Bambu_StartStream"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t, payload.value("video", false))}} : not_supported(method); }
-    if (method == "src.start_stream_ex") { auto f = src<int (*)(Bambu_Tunnel, int)>("Bambu_StartStreamEx"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t, payload.value("type", 0))}} : not_supported(method); }
-    if (method == "src.get_stream_count") { auto f = src<int (*)(Bambu_Tunnel)>("Bambu_GetStreamCount"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t)}} : not_supported(method); }
-    if (method == "src.get_stream_info") { auto f = src<int (*)(Bambu_Tunnel, int, Bambu_StreamInfo*)>("Bambu_GetStreamInfo"); auto t = lookup_tunnel(); if (!f || !t) return not_supported(method); Bambu_StreamInfo info{}; const int ret = f(t, payload.value("index", 0), &info); nlohmann::json out{{"ok", true}, {"value", ret}}; if (ret == 0) { nlohmann::json ji{{"type", info.type}, {"sub_type", info.sub_type}, {"format_type", info.format_type}, {"format_size", info.format_size}, {"max_frame_size", info.max_frame_size}, {"format_buffer", info.format_buffer && info.format_size > 0 ? std::string(reinterpret_cast<const char*>(info.format_buffer), info.format_size) : std::string()}}; if (info.type == VIDE) ji.update({{"width", info.format.video.width}, {"height", info.format.video.height}, {"frame_rate", info.format.video.frame_rate}}); else ji.update({{"sample_rate", info.format.audio.sample_rate}, {"channel_count", info.format.audio.channel_count}, {"sample_size", info.format.audio.sample_size}}); out["info"] = ji; } return out; }
+    if (method == "src.open") {
+        auto f = src<int (*)(Bambu_Tunnel)>("Bambu_Open");
+        auto t = lookup_tunnel();
+        if (!f || !t) return not_supported(method);
+        const int ret = f(t);
+        host_log_json("src.open", {{"value", ret}, {"tunnel", payload.value("tunnel", 0LL)}});
+        return {{"ok", true}, {"value", ret}};
+    }
+    if (method == "src.start_stream") {
+        auto f = src<int (*)(Bambu_Tunnel, bool)>("Bambu_StartStream");
+        auto t = lookup_tunnel();
+        if (!f || !t) return not_supported(method);
+        const bool video = payload.value("video", false);
+        const int ret = f(t, video);
+        host_log_json("src.start_stream", {{"value", ret}, {"video", video}, {"tunnel", payload.value("tunnel", 0LL)}});
+        return {{"ok", true}, {"value", ret}};
+    }
+    if (method == "src.start_stream_ex") {
+        auto f = src<int (*)(Bambu_Tunnel, int)>("Bambu_StartStreamEx");
+        auto t = lookup_tunnel();
+        if (!f || !t) return not_supported(method);
+        const int type = payload.value("type", 0);
+        const int ret = f(t, type);
+        host_log_json("src.start_stream_ex", {{"value", ret}, {"type", type}, {"tunnel", payload.value("tunnel", 0LL)}});
+        return {{"ok", true}, {"value", ret}};
+    }
+    if (method == "src.get_stream_count") {
+        auto f = src<int (*)(Bambu_Tunnel)>("Bambu_GetStreamCount");
+        auto t = lookup_tunnel();
+        if (!f || !t) return not_supported(method);
+        const int ret = f(t);
+        host_log_json("src.get_stream_count", {{"value", ret}, {"tunnel", payload.value("tunnel", 0LL)}});
+        return {{"ok", true}, {"value", ret}};
+    }
+    if (method == "src.get_stream_info") {
+        auto f = src<int (*)(Bambu_Tunnel, int, Bambu_StreamInfo*)>("Bambu_GetStreamInfo");
+        auto t = lookup_tunnel();
+        if (!f || !t) return not_supported(method);
+        const int index = payload.value("index", 0);
+        Bambu_StreamInfo info{};
+        const int ret = f(t, index, &info);
+        nlohmann::json out{{"ok", true}, {"value", ret}};
+        nlohmann::json log_payload{{"value", ret}, {"index", index}, {"tunnel", payload.value("tunnel", 0LL)}};
+        if (ret == 0) {
+            nlohmann::json ji{{"type", info.type}, {"sub_type", info.sub_type}, {"format_type", info.format_type}, {"format_size", info.format_size}, {"max_frame_size", info.max_frame_size}, {"format_buffer", info.format_buffer && info.format_size > 0 ? std::string(reinterpret_cast<const char*>(info.format_buffer), info.format_size) : std::string()}};
+            if (info.type == VIDE) ji.update({{"width", info.format.video.width}, {"height", info.format.video.height}, {"frame_rate", info.format.video.frame_rate}});
+            else ji.update({{"sample_rate", info.format.audio.sample_rate}, {"channel_count", info.format.audio.channel_count}, {"sample_size", info.format.audio.sample_size}});
+            out["info"] = ji;
+            log_payload.update({{"type", info.type}, {"sub_type", info.sub_type}, {"format_type", info.format_type}, {"width", info.type == VIDE ? info.format.video.width : 0}, {"height", info.type == VIDE ? info.format.video.height : 0}, {"frame_rate", info.type == VIDE ? info.format.video.frame_rate : 0}});
+        }
+        host_log_json("src.get_stream_info", log_payload);
+        return out;
+    }
     if (method == "src.get_duration") { auto f = src<unsigned long (*)(Bambu_Tunnel)>("Bambu_GetDuration"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t)}} : not_supported(method); }
     if (method == "src.seek") { auto f = src<int (*)(Bambu_Tunnel, unsigned long)>("Bambu_Seek"); auto t = lookup_tunnel(); return f && t ? nlohmann::json{{"ok", true}, {"value", f(t, payload.value("time", 0UL))}} : not_supported(method); }
     if (method == "src.send_message") {
@@ -1670,6 +1885,9 @@ nlohmann::json LinuxRuntimeHost::handle(const std::string& method, const nlohman
                 j["__binary_pending"] = true;
             }
         }
+        static int read_sample_log_budget = 20;
+        if (ret != Bambu_would_block || read_sample_log_budget-- > 0)
+            host_log_json("src.read_sample", {{"value", ret}, {"size", ret == 0 ? sample.size : 0}, {"flags", ret == 0 ? sample.flags : 0}, {"tunnel", payload.value("tunnel", 0LL)}});
         return j;
     }
     if (method == "src.close") { auto f = src<void (*)(Bambu_Tunnel)>("Bambu_Close"); auto t = lookup_tunnel(); if (!f || !t) return not_supported(method); f(t); return {{"ok", true}, {"value", 0}}; }
