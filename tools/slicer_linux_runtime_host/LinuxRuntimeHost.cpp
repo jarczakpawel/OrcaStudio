@@ -1105,7 +1105,22 @@ nlohmann::json LinuxRuntimeHost::handle(const std::string& method, const nlohman
     if (method == "net.del_subscribe") { auto f = net<int (*)(void*, std::vector<std::string>)>("bambu_network_del_subscribe"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a, payload.value("devs", std::vector<std::string>()))}} : not_supported(method); }
     if (method == "net.enable_multi_machine") { auto f = net<void (*)(void*, bool)>("bambu_network_enable_multi_machine"); auto a = lookup_agent(); if (!f || !a) return not_supported(method); f(a, payload.value("enable", false)); return {{"ok", true}, {"value", 0}}; }
     if (method == "net.send_message") { auto f = net<int (*)(void*, std::string, std::string, int, int)>("bambu_network_send_message"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a, payload.value("dev_id", std::string()), payload.value("msg", std::string()), payload.value("qos", 0), payload.value("flag", 0))}} : not_supported(method); }
-    if (method == "net.connect_printer") { auto f = net<int (*)(void*, std::string, std::string, std::string, std::string, bool)>("bambu_network_connect_printer"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a, payload.value("dev_id", std::string()), payload.value("dev_ip", std::string()), payload.value("username", std::string()), payload.value("password", std::string()), payload.value("use_ssl", false))}} : not_supported(method); }
+    if (method == "net.connect_printer") {
+        auto f = net<int (*)(void*, std::string, std::string, std::string, std::string, bool)>("bambu_network_connect_printer");
+        auto a = lookup_agent();
+        if (!f || !a) return not_supported(method);
+
+        const auto dev_id = payload.value("dev_id", std::string());
+        const auto dev_ip = payload.value("dev_ip", std::string());
+        const auto username = payload.value("username", std::string());
+        const auto password = payload.value("password", std::string());
+        const bool use_ssl = payload.value("use_ssl", false);
+
+        host_log_json("net.connect_printer.begin", {{"agent", agent_id}, {"dev_id", dev_id}, {"dev_ip", dev_ip}, {"username", username}, {"use_ssl", use_ssl}});
+        const int ret = f(a, dev_id, dev_ip, username, password, use_ssl);
+        host_log_json("net.connect_printer.end", {{"agent", agent_id}, {"dev_id", dev_id}, {"dev_ip", dev_ip}, {"value", ret}});
+        return {{"ok", true}, {"value", ret}};
+    }
     if (method == "net.disconnect_printer") { auto f = net<int (*)(void*)>("bambu_network_disconnect_printer"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a)}} : not_supported(method); }
     if (method == "net.send_message_to_printer") { auto f = net<int (*)(void*, std::string, std::string, int, int)>("bambu_network_send_message_to_printer"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a, payload.value("dev_id", std::string()), payload.value("msg", std::string()), payload.value("qos", 0), payload.value("flag", 0))}} : not_supported(method); }
     if (method == "net.update_cert") { auto f = net<int (*)(void*)>("bambu_network_update_cert"); auto a = lookup_agent(); return f && a ? nlohmann::json{{"ok", true}, {"value", f(a)}} : not_supported(method); }

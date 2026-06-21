@@ -628,7 +628,22 @@ SLICER_LINUX_RUNTIME_EXPORT int bambu_network_del_subscribe(void* agent, std::ve
 SLICER_LINUX_RUNTIME_EXPORT void bambu_network_enable_multi_machine(void* agent, bool enable) { auto* a = require_agent(agent); if (a) { a->multi_machine_enabled = enable; RpcClient::instance().invoke_void("net.enable_multi_machine", {{"agent", agent_id(a)}, {"enable", enable}}); } }
 
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_send_message(void* agent, std::string dev_id, std::string msg, int qos, int flag) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.send_message", {{"agent", agent_id(a)}, {"dev_id", dev_id}, {"msg", msg}, {"qos", qos}, {"flag", flag}}) : invalid_handle(); }
-SLICER_LINUX_RUNTIME_EXPORT int bambu_network_connect_printer(void* agent, std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.connect_printer", {{"agent", agent_id(a)}, {"dev_id", dev_id}, {"dev_ip", dev_ip}, {"username", username}, {"password", password}, {"use_ssl", use_ssl}}) : invalid_handle(); }
+SLICER_LINUX_RUNTIME_EXPORT int bambu_network_connect_printer(void* agent, std::string dev_id, std::string dev_ip, std::string username, std::string password, bool use_ssl)
+{
+    auto* a = require_agent(agent);
+    if (!a)
+        return invalid_handle();
+
+#if defined(__APPLE__)
+    std::thread([remote_agent = agent_id(a), dev_id = std::move(dev_id), dev_ip = std::move(dev_ip), username = std::move(username), password = std::move(password), use_ssl] {
+        const int ret = RpcClient::instance().invoke_int("net.connect_printer", {{"agent", remote_agent}, {"dev_id", dev_id}, {"dev_ip", dev_ip}, {"username", username}, {"password", password}, {"use_ssl", use_ssl}});
+        BOOST_LOG_TRIVIAL(info) << "slicer-linux-runtime-forwarder: connect_printer async ret=" << ret;
+    }).detach();
+    return 0;
+#else
+    return RpcClient::instance().invoke_int("net.connect_printer", {{"agent", agent_id(a)}, {"dev_id", dev_id}, {"dev_ip", dev_ip}, {"username", username}, {"password", password}, {"use_ssl", use_ssl}});
+#endif
+}
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_disconnect_printer(void* agent) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.disconnect_printer", {{"agent", agent_id(a)}}) : invalid_handle(); }
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_send_message_to_printer(void* agent, std::string dev_id, std::string msg, int qos, int flag) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.send_message_to_printer", {{"agent", agent_id(a)}, {"dev_id", dev_id}, {"msg", msg}, {"qos", qos}, {"flag", flag}}) : invalid_handle(); }
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_update_cert(void* agent) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.update_cert", {{"agent", agent_id(a)}}) : invalid_handle(); }
