@@ -311,7 +311,7 @@ static std::string wxmedia_bambu_last_error(BambuLib& lib)
         return {};
     const char* raw = lib.Bambu_GetLastErrorMsg();
     std::string out = raw ? std::string(raw) : std::string();
-#ifndef _WIN32
+#if defined(__WXMAC__) || defined(__APPLE__)
     if (raw && lib.Bambu_FreeLogMsg)
         lib.Bambu_FreeLogMsg(raw);
 #endif
