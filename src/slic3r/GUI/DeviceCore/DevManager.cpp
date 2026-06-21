@@ -961,13 +961,17 @@ namespace Slic3r
         }
 
         // certificate
-        try {
-            agent->install_device_cert(obj->get_dev_id(), obj->is_lan_mode_printer());
-        } catch (const std::exception& e) {
-            BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert exception="
-                                     << e.what();
-        } catch (...) {
-            BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert unknown exception";
+        if (!Slic3r::GUI::wxGetApp().is_bmcu_auto_retry_active(obj->get_dev_id())) {
+            try {
+                agent->install_device_cert(obj->get_dev_id(), obj->is_lan_mode_printer());
+            } catch (const std::exception& e) {
+                BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert exception="
+                                         << e.what();
+            } catch (...) {
+                BOOST_LOG_TRIVIAL(error) << "DeviceManagerRefresher::on_timer install_device_cert unknown exception";
+            }
+        } else {
+            BOOST_LOG_TRIVIAL(info) << "DeviceManagerRefresher::on_timer skip install_device_cert during BMCU auto retry, dev_id=" << obj->get_dev_id();
         }
     }
 }

@@ -19,6 +19,7 @@
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <boost/algorithm/string/case_conv.hpp>
 #include <wx/dir.h>
 #include "fast_float/fast_float.h"
 
@@ -136,6 +137,7 @@ inline void auto_ignore_print_error_if_needed(Slic3r::MachineObject* obj)
     }
 
     const auto now = std::chrono::steady_clock::now();
+    Slic3r::GUI::wxGetApp().begin_bmcu_auto_retry(obj->get_dev_id());
     const bool is_new_error = obj->last_auto_ignored_print_error_ != active_error;
 
     const bool command_due =

@@ -107,7 +107,7 @@ bool BBLPrinterAgent::retry_last_print_request(const std::string& dev_id)
         if (m_last_print_request.type == LastPrintRequestType::none) {
             return false;
         }
-        if (m_last_print_request.retry_count >= 3) {
+        if (m_last_print_request.retry_count >= 7) {
             return false;
         }
         if (!dev_id.empty() && !m_last_print_request.params.dev_id.empty() && m_last_print_request.params.dev_id != dev_id) {

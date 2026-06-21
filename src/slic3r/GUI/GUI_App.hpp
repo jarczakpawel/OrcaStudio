@@ -28,6 +28,7 @@
 #include <wx/snglinst.h>
 #include <wx/msgdlg.h>
 
+#include <chrono>
 #include <mutex>
 #include <stack>
 
@@ -331,6 +332,9 @@ private:
     bool             m_show_http_error_msgdlg{false};
     std::chrono::steady_clock::time_point m_last_401_error_time;
     bool             m_show_error_msgdlg{false};
+    std::mutex       m_bmcu_auto_retry_mutex;
+    std::string      m_bmcu_auto_retry_dev_id;
+    std::chrono::steady_clock::time_point m_bmcu_auto_retry_until{};
     wxString         m_info_dialog_content;
     HttpServer       m_http_server;
     bool             m_show_gcode_window{true};
@@ -515,6 +519,9 @@ public:
     void            check_new_version(bool show_tips = false, int by_user = 0);
     void            check_new_version_sf(bool show_tips = false, int by_user = 0);
     bool            process_network_msg(std::string dev_id, std::string msg);
+    void            begin_bmcu_auto_retry(const std::string& dev_id, int timeout_ms = 25000);
+    void            finish_bmcu_auto_retry(const std::string& dev_id = std::string());
+    bool            is_bmcu_auto_retry_active(const std::string& dev_id = std::string());
     void            request_new_version(int by_user);
     void            enter_force_upgrade();
     void            set_skip_version(bool skip = true);

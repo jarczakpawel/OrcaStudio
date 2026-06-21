@@ -798,6 +798,7 @@ void SendToPrinterDialog::on_cancel(wxCloseEvent &event)
     if (auto* dev = Slic3r::GUI::wxGetApp().getDeviceManager()) {
         dev->set_auto_retry_print_ui_callback(nullptr);
     }
+    stop_auto_retry_0500_409d(true);
     m_worker->cancel_all();
 
     if (m_task_timer && m_task_timer->IsRunning()) {
@@ -807,6 +808,117 @@ void SendToPrinterDialog::on_cancel(wxCloseEvent &event)
 
     Reset();
     this->EndModal(wxID_CANCEL);
+}
+
+
+namespace {
+constexpr int BMCU_AUTO_RETRY_STEP_SECONDS = 3;
+constexpr int BMCU_AUTO_RETRY_MAX_ROUNDS = 7;
+}
+
+void SendToPrinterDialog::schedule_auto_retry_0500_409d(const std::string& dev_id)
+{
+    m_auto_retry_0500_409d_dev_id = dev_id.empty() ? m_printer_last_select : dev_id;
+    m_auto_retry_0500_409d_round = 0;
+    m_auto_retry_0500_409d_wait_left = BMCU_AUTO_RETRY_STEP_SECONDS;
+    m_auto_retry_0500_409d_pending = true;
+
+    if (DeviceManager* dev = wxGetApp().getDeviceManager()) {
+        if (MachineObject* obj = dev->get_my_machine(m_auto_retry_0500_409d_dev_id)) {
+            m_auto_retry_0500_409d_update_time = obj->last_update_time;
+        } else {
+            m_auto_retry_0500_409d_update_time = {};
+        }
+    } else {
+        m_auto_retry_0500_409d_update_time = {};
+    }
+
+    wxGetApp().begin_bmcu_auto_retry(m_auto_retry_0500_409d_dev_id);
+    m_status_bar->set_status_text(wxString::Format(_L("(%d/%d) BMCU error. Please wait %d s..."), m_auto_retry_0500_409d_round + 1, BMCU_AUTO_RETRY_MAX_ROUNDS, m_auto_retry_0500_409d_wait_left));
+
+    if (!m_auto_retry_0500_409d_timer) {
+        m_auto_retry_0500_409d_timer.reset(new wxTimer(this, wxWindow::NewControlId()));
+        Bind(wxEVT_TIMER, &SendToPrinterDialog::on_auto_retry_0500_409d_timer, this, m_auto_retry_0500_409d_timer->GetId());
+    } else if (m_auto_retry_0500_409d_timer->IsRunning()) {
+        m_auto_retry_0500_409d_timer->Stop();
+    }
+
+    BOOST_LOG_TRIVIAL(info) << "schedule BMCU auto retry countdown, dev_id=" << m_auto_retry_0500_409d_dev_id;
+    m_auto_retry_0500_409d_timer->StartOnce(1000);
+}
+
+bool SendToPrinterDialog::is_auto_retry_0500_409d_ready()
+{
+    DeviceManager* dev = wxGetApp().getDeviceManager();
+    if (!dev) { return false; }
+
+    MachineObject* obj = dev->get_my_machine(m_auto_retry_0500_409d_dev_id.empty() ? m_printer_last_select : m_auto_retry_0500_409d_dev_id);
+    if (!obj) { return false; }
+
+    if (m_auto_retry_0500_409d_update_time.time_since_epoch().count() != 0 &&
+        obj->last_update_time <= m_auto_retry_0500_409d_update_time) {
+        return false;
+    }
+
+    try {
+        if (!obj->is_connected() || obj->is_connecting()) { return false; }
+    } catch (...) {
+        return false;
+    }
+
+    return true;
+}
+
+void SendToPrinterDialog::stop_auto_retry_0500_409d(bool clear_guard)
+{
+    if (m_auto_retry_0500_409d_timer && m_auto_retry_0500_409d_timer->IsRunning()) {
+        m_auto_retry_0500_409d_timer->Stop();
+    }
+    if (clear_guard) {
+        wxGetApp().finish_bmcu_auto_retry(m_auto_retry_0500_409d_dev_id);
+    }
+    m_auto_retry_0500_409d_pending = false;
+    m_auto_retry_0500_409d_round = 0;
+    m_auto_retry_0500_409d_wait_left = 0;
+    m_auto_retry_0500_409d_update_time = {};
+}
+
+void SendToPrinterDialog::on_auto_retry_0500_409d_timer(wxTimerEvent& event)
+{
+    if (!m_auto_retry_0500_409d_pending) { return; }
+
+    if (m_auto_retry_0500_409d_wait_left > 1) {
+        --m_auto_retry_0500_409d_wait_left;
+        m_status_bar->set_status_text(wxString::Format(_L("(%d/%d) BMCU error. Please wait %d s..."), m_auto_retry_0500_409d_round + 1, BMCU_AUTO_RETRY_MAX_ROUNDS, m_auto_retry_0500_409d_wait_left));
+        m_auto_retry_0500_409d_timer->StartOnce(1000);
+        return;
+    }
+
+    ++m_auto_retry_0500_409d_round;
+    if (!is_auto_retry_0500_409d_ready()) {
+        if (m_auto_retry_0500_409d_round >= BMCU_AUTO_RETRY_MAX_ROUNDS) {
+            BOOST_LOG_TRIVIAL(warning) << "BMCU auto retry timeout, dev_id=" << m_auto_retry_0500_409d_dev_id;
+            m_status_bar->set_status_text(_L("Printer is not ready. Please try again."));
+            stop_auto_retry_0500_409d(true);
+            return;
+        }
+
+        m_auto_retry_0500_409d_wait_left = BMCU_AUTO_RETRY_STEP_SECONDS;
+        m_status_bar->set_status_text(wxString::Format(_L("(%d/%d) BMCU error. Please wait %d s..."), m_auto_retry_0500_409d_round + 1, BMCU_AUTO_RETRY_MAX_ROUNDS, m_auto_retry_0500_409d_wait_left));
+        m_auto_retry_0500_409d_timer->StartOnce(1000);
+        return;
+    }
+
+    const int retry_round = m_auto_retry_0500_409d_round;
+    wxGetApp().begin_bmcu_auto_retry(m_auto_retry_0500_409d_dev_id);
+    BOOST_LOG_TRIVIAL(info) << "BMCU auto retry printer ready, dev_id=" << m_auto_retry_0500_409d_dev_id << ", round=" << retry_round;
+    stop_auto_retry_0500_409d(false);
+    m_status_bar->set_status_text(wxString::Format(_L("(%d/%d) Retrying print..."), retry_round, BMCU_AUTO_RETRY_MAX_ROUNDS));
+    m_is_canceled = false;
+    m_is_auto_retry_0500_409d_invoke = true;
+    prepare_mode();
+    wxCommandEvent evt(wxEVT_BUTTON);
+    on_ok(evt);
 }
 
 void SendToPrinterDialog::on_ok(wxCommandEvent &event)
@@ -837,6 +949,7 @@ void SendToPrinterDialog::on_ok(wxCommandEvent &event)
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", print_job: for send task, current printer id =  " << m_printer_last_select << std::endl;
     if (!m_is_auto_retry_0500_409d_invoke) {
         m_auto_retry_0500_409d_used = false;
+        m_auto_retry_0500_409d_pending = false;
     }
     m_is_auto_retry_0500_409d_invoke = false;
     dev->set_auto_retry_print_ui_callback([token = std::weak_ptr<int>(m_token), this](const std::string& dev_id) {
@@ -846,19 +959,19 @@ void SendToPrinterDialog::on_ok(wxCommandEvent &event)
         if (!dev_id.empty() && dev_id != m_printer_last_select) {
             return false;
         }
+        if (m_auto_retry_0500_409d_pending) {
+            return true;
+        }
         if (m_auto_retry_0500_409d_used) {
             return false;
         }
         m_auto_retry_0500_409d_used = true;
-        m_is_auto_retry_0500_409d_invoke = true;
-        CallAfter([token, this]() {
+        m_auto_retry_0500_409d_pending = true;
+        CallAfter([token, this, dev_id]() {
             if (token.expired()) {
                 return;
             }
-            m_is_canceled = false;
-            prepare_mode();
-            wxCommandEvent evt(wxEVT_BUTTON);
-            on_ok(evt);
+            schedule_auto_retry_0500_409d(dev_id);
         });
         return true;
     });
@@ -1208,6 +1321,11 @@ void SendToPrinterDialog::update_printer_combobox(wxCommandEvent &event)
 
 void SendToPrinterDialog::on_timer(wxTimerEvent &event)
 {
+    if (m_auto_retry_0500_409d_timer && event.GetId() == m_auto_retry_0500_409d_timer->GetId()) {
+        event.Skip();
+        return;
+    }
+
     update_show_status();
 }
 
@@ -2036,6 +2154,7 @@ void SendToPrinterDialog::Reset() {
 
 SendToPrinterDialog::~SendToPrinterDialog()
 {
+    stop_auto_retry_0500_409d(true);
     if (auto* dev = Slic3r::GUI::wxGetApp().getDeviceManager()) {
         dev->set_auto_retry_print_ui_callback(nullptr);
     }
