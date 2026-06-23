@@ -1526,6 +1526,10 @@ void GUI_App::restart_networking()
         m_agent->set_on_http_error_fn([this](CloudEvent event, unsigned int status, std::string body) {
             this->handle_http_error(status, body, event.provider);
         });
+        if (mainframe && preset_bundle) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": switching printer agent after network restart";
+            switch_printer_agent();
+        }
         m_agent->start_discovery(true, false);
         if (mainframe)
             mainframe->refresh_plugin_tips();
