@@ -410,7 +410,7 @@ void wxMediaCtrl3::PlayThread()
             }
             lk.unlock();
         }
-#else
+#elif defined(_WIN32)
         if (!Bambu_Create) {
             BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Create function is not available";
         } else {
@@ -418,6 +418,18 @@ void wxMediaCtrl3::PlayThread()
                 int init_error = Bambu_Init();
                 BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Init error=" << init_error;
             }
+            error = Bambu_Create(&tunnel, uri_utf8.data());
+            BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Create error=" << error << ", tunnel=" << (tunnel ? 1 : 0);
+            if (error != 0) {
+                std::string last_error = wxmedia_bambu_last_error(*this);
+                if (!last_error.empty())
+                    BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Create last_error=" << wxmedia_safe_log_text(last_error);
+            }
+        }
+#else
+        if (!Bambu_Create) {
+            BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Create function is not available";
+        } else {
             error = Bambu_Create(&tunnel, uri_utf8.data());
             BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_Create error=" << error << ", tunnel=" << (tunnel ? 1 : 0);
             if (error != 0) {
@@ -477,6 +489,10 @@ void wxMediaCtrl3::PlayThread()
         Bambu_StreamInfo info{};
         int video_stream_index = 0;
         int stream_count = 0;
+#if !defined(_WIN32) && !defined(__WXMAC__) && !defined(__APPLE__)
+        if (error == 0)
+            error = Bambu_GetStreamInfo ? Bambu_GetStreamInfo(tunnel, 0, &info) : -2;
+#else
         if (error == 0) {
             stream_count = Bambu_GetStreamCount ? Bambu_GetStreamCount(tunnel) : 0;
             BOOST_LOG_TRIVIAL(info) << "wxMediaCtrl3: Bambu_GetStreamCount returned " << stream_count;
@@ -503,6 +519,7 @@ void wxMediaCtrl3::PlayThread()
                 error = Bambu_GetStreamInfo(tunnel, 0, &info);
             }
         }
+#endif
         if (error == 0 && info.type != VIDE) {
             BOOST_LOG_TRIVIAL(warning) << "wxMediaCtrl3: selected stream is not video, type=" << info.type;
             error = -1;
