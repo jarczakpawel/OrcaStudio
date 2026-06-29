@@ -41,3 +41,8 @@ Thumbs.db
 
 .vscode/
 .idea/
+
+# Build artifacts
+deps/DL_CACHE/
+resources/i18n/
+tools/slicer_linux_runtime_host/runtime/

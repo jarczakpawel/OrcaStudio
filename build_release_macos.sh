@@ -99,7 +99,7 @@ if [ -z "$OSX_DEPLOYMENT_TARGET" ]; then
 fi
 
 if [ -z "$CMAKE_IGNORE_PREFIX_PATH" ]; then
-  export CMAKE_IGNORE_PREFIX_PATH="/opt/local:/usr/local:/opt/homebrew"
+  export CMAKE_IGNORE_PREFIX_PATH="/opt/local:/usr/local:/opt/homebrew:/nix/store:/nix"
 fi
 
 is_gnu_m4() {
