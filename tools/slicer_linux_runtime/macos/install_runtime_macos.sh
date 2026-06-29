@@ -317,7 +317,7 @@ select_lima_mode() {
     LIMA_CREATE_ARGS=(start "--name=${INSTANCE}" --tty=false --mount-writable --containerd=none)
 
     if [[ "$host_arch" == "arm64" ]]; then
-        if [[ "$major" -ge 13 && "${SLICER_LINUX_RUNTIME_MAC_USE_ROSETTA:-}" == "1" && portable_x86_loader_available ]]; then
+        if [[ "$major" -ge 13 && "${SLICER_LINUX_RUNTIME_MAC_NO_ROSETTA:-}" != "1" && portable_x86_loader_available ]]; then
             LIMA_MODE="vz-aarch64-rosetta"
             LIMA_CREATE_ARGS+=(--vm-type=vz --arch=aarch64 --mount-type=virtiofs --rosetta)
         else

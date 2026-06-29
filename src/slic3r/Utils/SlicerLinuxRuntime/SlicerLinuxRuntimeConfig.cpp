@@ -118,7 +118,14 @@ bool use_linux_runtime()
 #if defined(_MSC_VER) || defined(_WIN32)
     return true;
 #elif defined(__WXMAC__) || defined(__APPLE__)
-    return true;
+    // macOS has native .dylib plugins served by the Bambu API when
+    // X-BBL-OS-Type is set to "macos". The Linux runtime (Lima/QEMU VM)
+    // is unnecessary and causes significant CPU overhead from x86 emulation.
+    // Only force the Linux runtime if explicitly requested via env var.
+    bool force_linux = false;
+    if (env_flag("SLICER_LINUX_RUNTIME_MAC_FORCE_LINUX", force_linux) && force_linux)
+        return true;
+    return false;
 #else
     return false;
 #endif
