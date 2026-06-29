@@ -73,9 +73,9 @@ Install and run normally.
 
 ### macOS
 
-Nothing needs to be installed manually.
+Nothing needs to be installed manually. Native macOS networking plugins are downloaded automatically on first use. No VM or Linux runtime is required.
 
-On first use, the application will ask to install the local Linux runtime.
+To force the legacy Linux runtime (Lima/QEMU) instead of native plugins, set `SLICER_LINUX_RUNTIME_MAC_FORCE_LINUX=1` before launching.
 
 ## Removing the runtime
 
@@ -111,7 +111,7 @@ rm -rf ~/.config/BambuStudio_OrcaSlicer ~/.cache/BambuStudio_OrcaSlicer ~/.local
 
 ### macOS
 
-To remove the local Lima runtime:
+Native plugins require no runtime to remove. If you previously used the Lima runtime or have `SLICER_LINUX_RUNTIME_MAC_FORCE_LINUX=1` set:
 
 ```bash
 LIMACTL="$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime/lima/bin/limactl"
@@ -123,6 +123,7 @@ elif command -v limactl >/dev/null 2>&1; then
     limactl delete -f slicer-linux-runtime 2>/dev/null || true
 fi
 rm -rf "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime"
+unset SLICER_LINUX_RUNTIME_MAC_FORCE_LINUX
 ```
 
 ## What was done
@@ -130,7 +131,8 @@ rm -rf "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-ru
 * Updated to OrcaSlicer as of June 14, 2026, up to commit [`9bcee518f859205fbcf3455c4f89fce5c606049c`](https://github.com/SoftFever/OrcaSlicer/commit/9bcee518f859205fbcf3455c4f89fce5c606049c) + added OrcaSlicer commits [`e700113b39f39b837175c680929538aa9655a9f9`](https://github.com/SoftFever/OrcaSlicer/commit/e700113b39f39b837175c680929538aa9655a9f9) and [`5ed8f5ef258898a4006677bab8a3f2e412adedec`](https://github.com/SoftFever/OrcaSlicer/commit/5ed8f5ef258898a4006677bab8a3f2e412adedec).
 * Restored BambuNetwork support through the Linux `bambu_networking` path.
 * Added Windows WSL2 runtime support.
-* Added macOS Lima runtime support.
+* Added native macOS networking plugin support (no VM required).
+* Legacy Lima/QEMU runtime still available via `SLICER_LINUX_RUNTIME_MAC_FORCE_LINUX=1`.
 * Fixed macOS runtime integration, including printer connection, file browsing and camera preview.
 * Added experimental Bambu Lab A2L printer support - it has not been tested.
 * Fixed the issue that appears when using BMCU with A1 / A1-mini printers on firmware `01.08.01.00` and `01.08.00.00`.

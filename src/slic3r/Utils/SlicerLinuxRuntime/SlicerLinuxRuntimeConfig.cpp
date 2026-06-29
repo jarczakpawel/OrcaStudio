@@ -107,7 +107,12 @@ bool enabled()
 #if defined(_MSC_VER) || defined(_WIN32)
     return true;
 #elif defined(__WXMAC__) || defined(__APPLE__)
-    return true;
+    // macOS uses native plugins; Lima runtime is unnecessary.
+    // Allow override via env var for debugging.
+    bool force_enable = false;
+    if (env_flag("SLICER_LINUX_RUNTIME_MAC_FORCE_ENABLE", force_enable) && force_enable)
+        return true;
+    return false;
 #else
     return false;
 #endif
