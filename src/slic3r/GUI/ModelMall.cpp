@@ -4,17 +4,21 @@
 #include <wx/wx.h>
 #include <wx/sizer.h>
 #include <wx/statbox.h>
+#include <wx/uri.h>
 #include "wx/evtloop.h"
 
 #include "libslic3r/Model.hpp"
 #include "MainFrame.hpp"
 #include "GUI_App.hpp"
 #include "Plater.hpp"
+#include "slic3r/Utils/BBLNetworkPlugin.hpp"
+#include "slic3r/Utils/SlicerLinuxRuntime/SlicerLinuxRuntimeConfig.hpp"
 
 namespace Slic3r {
 namespace GUI {
     ModelMallDialog::ModelMallDialog(Plater* plater /*= nullptr*/)
-        :DPIFrame(nullptr, wxID_ANY, _L("3D Models"), wxDefaultPosition, wxDefaultSize, wxCLOSE_BOX|wxDEFAULT_DIALOG_STYLE|wxMAXIMIZE_BOX|wxMINIMIZE_BOX|wxRESIZE_BORDER)
+        :DPIFrame(nullptr, wxID_ANY, _L("3D Models"), wxDefaultPosition, wxDefaultSize, wxCLOSE_BOX|wxDEFAULT_DIALOG_STYLE|wxMAXIMIZE_BOX|wxMINIMIZE_BOX|wxRESIZE_BORDER),
+         m_linux_browser_timer(this)
     {
         SetSize(MODEL_MALL_PAGE_SIZE);
         SetMinSize(wxSize(MODEL_MALL_PAGE_SIZE.x / 4, MODEL_MALL_PAGE_SIZE.y / 4));
@@ -98,6 +102,8 @@ namespace GUI {
         m_browser->SetSize(MODEL_MALL_PAGE_WEB_SIZE);
         m_browser->SetMinSize(MODEL_MALL_PAGE_WEB_SIZE);
         m_browser->Bind(wxEVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, &ModelMallDialog::OnScriptMessage, this, m_browser->GetId());
+        m_browser->Bind(wxEVT_WEBVIEW_NAVIGATING, &ModelMallDialog::on_linux_viewer_navigation, this, m_browser->GetId());
+        m_browser->Bind(wxEVT_WEBVIEW_NEWWINDOW, &ModelMallDialog::on_linux_viewer_new_window, this, m_browser->GetId());
 
         m_sizer_main->Add(m_web_control_panel, 0, wxEXPAND, 0);
         m_sizer_main->Add(m_browser, 1, wxEXPAND, 0);
@@ -107,8 +113,10 @@ namespace GUI {
 
         Centre(wxBOTH);
         Bind(wxEVT_SHOW, &ModelMallDialog::on_show, this);
+        Bind(wxEVT_TIMER, &ModelMallDialog::on_linux_browser_timer, this, m_linux_browser_timer.GetId());
 
         Bind(wxEVT_CLOSE_WINDOW, [this](auto& e) {
+            stop_linux_browser();
             this->Hide();
         });
     }
@@ -116,6 +124,7 @@ namespace GUI {
 
     ModelMallDialog::~ModelMallDialog()
     {
+        stop_linux_browser();
     }
 
     void ModelMallDialog::OnScriptMessage(wxWebViewEvent& evt)
@@ -154,29 +163,189 @@ namespace GUI {
 
     void ModelMallDialog::on_refresh(wxMouseEvent& evt)
     {
-        if (!m_browser->GetCurrentURL().empty()) {
+        if (m_linux_browser_active) {
+            send_linux_browser_command({{"command", "reload"}});
+        } else if (!m_browser->GetCurrentURL().empty()) {
             m_browser->Reload();
         }
     }
 
     void ModelMallDialog::on_back(wxMouseEvent& evt)
     {
-        if (m_browser->CanGoBack()) {
+        if (m_linux_browser_active) {
+            send_linux_browser_command({{"command", "back"}});
+        } else if (m_browser->CanGoBack()) {
             m_browser->GoBack();
         }
     }
 
     void ModelMallDialog::on_forward(wxMouseEvent& evt)
     {
-        if (m_browser->CanGoForward()) {
+        if (m_linux_browser_active) {
+            send_linux_browser_command({{"command", "forward"}});
+        } else if (m_browser->CanGoForward()) {
             m_browser->GoForward();
         }
     }
 
-    void ModelMallDialog::go_to_url(wxString url)
+    void ModelMallDialog::go_to_url(wxString url, bool bind_ticket)
     {
-        //m_browser->LoadURL(url);
+        if (Slic3r::SlicerLinuxRuntime::use_linux_runtime()) {
+            const std::string target = into_u8(url);
+            if (m_linux_browser_active) {
+                if (!send_linux_browser_command({{"command", "load_url"}, {"url", target}}))
+                    stop_linux_browser();
+                else
+                    return;
+            }
+
+            std::string start_reply;
+            bool browser_available = false;
+            {
+                auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+                auto& plugin = BBLNetworkPlugin::instance();
+                auto start = plugin.get_linux_browser_start();
+                auto status = plugin.get_linux_browser_status();
+                auto command = plugin.get_linux_browser_command();
+                auto cancel = plugin.get_linux_browser_cancel();
+                browser_available = start && status && command && cancel;
+                if (browser_available)
+                    start_reply = start(plugin.get_agent(), target, bind_ticket);
+            }
+            if (!browser_available) {
+                show_error(this, _L("Linux Bambu browser is not available in the installed runtime."));
+                return;
+            }
+            try {
+                const json reply = json::parse(start_reply);
+                if (!reply.value("ok", false)) {
+                    show_error(this, from_u8(reply.value("error", std::string("Linux Bambu browser failed to start"))));
+                    return;
+                }
+                const std::string viewer_url = reply.value("viewer_url", std::string());
+                if (viewer_url.empty()) {
+                    show_error(this, _L("Linux Bambu browser returned no viewer URL."));
+                    return;
+                }
+                const wxURI viewer_uri(from_u8(viewer_url));
+                long viewer_port = 0;
+                if (!viewer_uri.GetPort().ToLong(&viewer_port) || viewer_port <= 0 || viewer_port > 65535) {
+                    show_error(this, _L("Linux Bambu browser returned an invalid viewer URL."));
+                    return;
+                }
+                m_linux_viewer_port = static_cast<int>(viewer_port);
+                m_linux_browser_active = true;
+                m_linux_browser_timer.Start(250);
+                m_browser->LoadURL(from_u8(viewer_url));
+                return;
+            } catch (const std::exception& e) {
+                show_error(this, from_u8(std::string("Linux Bambu browser error: ") + e.what()));
+                return;
+            }
+        }
         WebView::LoadUrl(m_browser, url);
+    }
+
+    bool ModelMallDialog::send_linux_browser_command(const json& command)
+    {
+        std::string raw_reply;
+        {
+            auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+            auto fn = BBLNetworkPlugin::instance().get_linux_browser_command();
+            if (!fn)
+                return false;
+            raw_reply = fn(command.dump());
+        }
+        try {
+            const json reply = json::parse(raw_reply);
+            return reply.value("ok", false);
+        } catch (...) {
+            return false;
+        }
+    }
+
+    void ModelMallDialog::stop_linux_browser()
+    {
+        m_linux_browser_timer.Stop();
+        if (!m_linux_browser_active)
+            return;
+        m_linux_browser_active = false;
+        m_linux_viewer_port = 0;
+        auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+        if (auto cancel = BBLNetworkPlugin::instance().get_linux_browser_cancel())
+            (void) cancel();
+    }
+
+    void ModelMallDialog::on_linux_browser_timer(wxTimerEvent&)
+    {
+        if (!m_linux_browser_active)
+            return;
+        std::string raw_status;
+        bool status_available = false;
+        {
+            auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+            auto status_fn = BBLNetworkPlugin::instance().get_linux_browser_status();
+            status_available = status_fn != nullptr;
+            if (status_available)
+                raw_status = status_fn();
+        }
+        if (!status_available) {
+            stop_linux_browser();
+            return;
+        }
+        try {
+            const json status = json::parse(raw_status);
+            if (status.contains("events") && status["events"].is_array()) {
+                for (const auto& event : status["events"]) {
+                    if (event.value("kind", std::string()) != "script_message" || !event.contains("message"))
+                        continue;
+                    const auto& message = event["message"];
+                    if (message.is_object() && message.value("command", std::string()) == "request_close_publish_window") {
+                        stop_linux_browser();
+                        Hide();
+                        return;
+                    }
+                }
+            }
+            const std::string state = status.value("state", std::string("error"));
+            if (state != "running") {
+                m_linux_browser_timer.Stop();
+                m_linux_browser_active = false;
+                m_linux_viewer_port = 0;
+                if (state == "error")
+                    show_error(this, from_u8(status.value("error", std::string("Linux Bambu browser stopped unexpectedly"))));
+            }
+        } catch (const std::exception& e) {
+            stop_linux_browser();
+            show_error(this, from_u8(std::string("Linux Bambu browser status error: ") + e.what()));
+        }
+    }
+
+
+    void ModelMallDialog::on_linux_viewer_navigation(wxWebViewEvent& evt)
+    {
+        if (!m_linux_browser_active)
+            return;
+        const wxString url = evt.GetURL().Lower();
+        const wxString loopback_v4 = wxString::Format("http://127.0.0.1:%d/", m_linux_viewer_port);
+        const wxString loopback_name = wxString::Format("http://localhost:%d/", m_linux_viewer_port);
+        if (m_linux_viewer_port <= 0 || !(url.StartsWith(loopback_v4) || url.StartsWith(loopback_name) || url.StartsWith("about:blank")))
+            evt.Veto();
+    }
+
+    void ModelMallDialog::on_linux_viewer_new_window(wxWebViewEvent& evt)
+    {
+        if (!m_linux_browser_active)
+            return;
+        const wxString url = evt.GetURL().Lower();
+        const wxString loopback_v4 = wxString::Format("http://127.0.0.1:%d/", m_linux_viewer_port);
+        const wxString loopback_name = wxString::Format("http://localhost:%d/", m_linux_viewer_port);
+        if (m_linux_viewer_port <= 0 || !(url.StartsWith(loopback_v4) || url.StartsWith(loopback_name) || url.StartsWith("about:blank"))) {
+            evt.Veto();
+            return;
+        }
+        evt.Veto();
+        m_browser->LoadURL(evt.GetURL());
     }
 
     void ModelMallDialog::show_control(bool show)

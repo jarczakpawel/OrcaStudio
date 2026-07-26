@@ -33,7 +33,6 @@ int invoke_on_all_cloud_agents(const std::map<std::string, std::shared_ptr<IClou
 
 } // namespace
 
-bool NetworkAgent::use_legacy_network = false;
 
 // ============================================================================
 // Static methods - delegate to BBLNetworkPlugin
@@ -64,7 +63,23 @@ int NetworkAgent::initialize_network_module(bool using_backup, const std::string
 
 int NetworkAgent::unload_network_module() { return BBLNetworkPlugin::instance().unload(); }
 
-bool NetworkAgent::is_network_module_loaded() { return BBLNetworkPlugin::instance().is_loaded(); }
+bool NetworkAgent::is_network_module_loaded()
+{
+    auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+    return BBLNetworkPlugin::instance().is_loaded();
+}
+
+int NetworkAgent::active_source_tunnels()
+{
+    auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+    return BBLNetworkPlugin::instance().active_source_tunnels();
+}
+
+int NetworkAgent::active_forwarder_callbacks()
+{
+    auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+    return BBLNetworkPlugin::instance().active_forwarder_callbacks();
+}
 
 #if defined(_MSC_VER) || defined(_WIN32)
 HMODULE NetworkAgent::get_bambu_source_entry() { return BBLNetworkPlugin::instance().get_bambu_source_entry(); }
@@ -72,7 +87,11 @@ HMODULE NetworkAgent::get_bambu_source_entry() { return BBLNetworkPlugin::instan
 void* NetworkAgent::get_bambu_source_entry() { return BBLNetworkPlugin::instance().get_bambu_source_entry(); }
 #endif
 
-std::string NetworkAgent::get_version() { return BBLNetworkPlugin::instance().get_version(); }
+std::string NetworkAgent::get_version()
+{
+    auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+    return BBLNetworkPlugin::instance().get_version();
+}
 
 void* NetworkAgent::get_network_function(const char* name) { return BBLNetworkPlugin::instance().get_network_function(name); }
 
@@ -118,21 +137,20 @@ void NetworkAgent::add_cloud_agent(const std::string& provider, std::shared_ptr<
 
 void NetworkAgent::set_printer_agent(std::shared_ptr<IPrinterAgent> printer_agent)
 {
-    if (!printer_agent) {
-        return;
-    }
-
     // Disconnect all callbacks from the old agent
     auto old_printer_agent = m_printer_agent;
 
     m_printer_agent    = std::move(printer_agent);
-    m_printer_agent_id = m_printer_agent->get_agent_info().id;
+    m_printer_agent_id = m_printer_agent ? m_printer_agent->get_agent_info().id : "";
 
     // Disconnect the old agent's connections/threads.
     if (old_printer_agent && old_printer_agent != m_printer_agent) {
         old_printer_agent->disconnect_printer();
         apply_printer_callbacks(old_printer_agent, {});
     }
+
+    if (!m_printer_agent)
+        return;
 
     apply_printer_callbacks(m_printer_agent, m_printer_callbacks);
 }
@@ -827,10 +845,10 @@ int NetworkAgent::bind_detect(std::string dev_ip, std::string sec_link, detectRe
 }
 
 int NetworkAgent::bind(
-    std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn)
+    std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn)
 {
     if (m_printer_agent)
-        return m_printer_agent->bind(dev_ip, dev_id, sec_link, timezone, improved, update_fn);
+        return m_printer_agent->bind(dev_ip, dev_id, dev_model, sec_link, timezone, improved, update_fn);
     return -1;
 }
 
@@ -946,6 +964,13 @@ int NetworkAgent::request_bind_ticket(std::string* ticket)
 {
     if (m_printer_agent)
         return m_printer_agent->request_bind_ticket(ticket);
+    return -1;
+}
+
+int NetworkAgent::get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback)
+{
+    if (m_printer_agent)
+        return m_printer_agent->get_hms_snapshot(dev_id, file_name, callback);
     return -1;
 }
 

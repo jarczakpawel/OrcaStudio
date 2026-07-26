@@ -19,6 +19,7 @@ jobs:
     env:
       DIST_ID: ubuntu24.04
       EVENT_TAG: ${{ github.event.release.tag_name }}
+      ORCA_BUNDLE_DESKTOP_STACK: '0'
 
     steps:
       - name: Checkout
@@ -55,6 +56,23 @@ jobs:
       - name: Apt-Install Dependencies
         uses: ./.github/actions/apt-install-deps
 
+      - name: Install Linux portable build and smoke-test inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus-x11 \
+            libgtk-3-dev \
+            libjavascriptcoregtk-4.1-0 \
+            libwebkit2gtk-4.1-dev \
+            openssl \
+            xvfb
+
+          pkg-config --exists webkit2gtk-4.1
+          ldconfig -p | grep -F 'libwebkit2gtk-4.1.so.0'
+          ldconfig -p | grep -F 'libjavascriptcoregtk-4.1.so.0'
+
       - name: Linux - cache deps
         id: cache_linux_deps
         uses: actions/cache@v5
@@ -79,11 +97,11 @@ jobs:
           done
           exit 1
 
-      - name: Linux - build + install
+      - name: Linux - build portable package
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf build install-dir out
+          rm -rf build out
           mkdir -p out
 
           cmake -S . -B build -G "Ninja Multi-Config" \
@@ -93,55 +111,58 @@ jobs:
             -DBBL_RELEASE_TO_PUBLIC=1 \
             -DBBL_INTERNAL_TESTING=0 \
             -DSLIC3R_PCH=ON \
-            -DORCA_TOOLS=ON \
-            -DCMAKE_INSTALL_PREFIX="${PWD}/install-dir"
+            -DORCA_TOOLS=ON
 
-          cmake --build build --config Release --target install -j"$(nproc)"
-
+          cmake --build build --config Release --target OrcaSlicer -j"$(nproc)"
           ./scripts/run_gettext.sh
-          mkdir -p install-dir/resources/i18n
-          cp -a resources/i18n/. install-dir/resources/i18n/
+          (
+            cd build
+            ORCA_BUNDLE_DESKTOP_STACK=0 bash ./src/build_linux_image.sh -R Release
+          )
 
-          app_bin=""
-          for candidate in \
-            "install-dir/bin/bambu-studio" \
-            "install-dir/bin/OrcaSlicer" \
-            "install-dir/bin/orca-slicer" \
-            "install-dir/bambu-studio" \
-            "install-dir/OrcaSlicer" \
-            "install-dir/orca-slicer"; do
-            if [ -x "$candidate" ]; then
-              app_bin="${candidate#install-dir/}"
-              break
-            fi
-          done
+          ./scripts/check_appimage_libs.sh build/package build/package/bin/orca-studio.bin
+          test ! -e build/package/share/orca-bundled-desktop-runtime
+          test -z "$(find build/package -type f \( -name 'libwebkit2gtk-*.so*' -o -name 'libjavascriptcoregtk-*.so*' \) -print -quit)"
+          grep -F 'missing host WebKitGTK 4.1 runtime libraries' build/package/libexec/orca-studio-env
+          grep -F 'locale charmap' build/package/orca-studio
 
-          if [ -z "$app_bin" ]; then
-            echo "ERROR: installed application binary not found"
-            find install-dir -maxdepth 3 -type f | sort
+          smoke_root="$(mktemp -d)"
+          mkdir -p "$smoke_root/home" "$smoke_root/config" "$smoke_root/cache" "$smoke_root/runtime"
+          chmod 0700 "$smoke_root/runtime"
+          smoke_log="$smoke_root/portable-smoke.log"
+          set +e
+          timeout --signal=TERM --kill-after=5s 20s \
+            xvfb-run -a dbus-run-session -- \
+            env \
+              HOME="$smoke_root/home" \
+              XDG_CONFIG_HOME="$smoke_root/config" \
+              XDG_CACHE_HOME="$smoke_root/cache" \
+              XDG_RUNTIME_DIR="$smoke_root/runtime" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              build/package/orca-studio >"$smoke_log" 2>&1
+          smoke_rc=$?
+          set -e
+          if [[ "$smoke_rc" -ne 0 && "$smoke_rc" -ne 124 && "$smoke_rc" -ne 143 ]]; then
+            echo "ERROR: portable startup smoke test exited unexpectedly: $smoke_rc" >&2
+            cat "$smoke_log" >&2
+            exit "$smoke_rc"
+          fi
+          if grep -Fq 'Unable to spawn a new child process' "$smoke_log" || \
+             grep -Fq 'Switching Orca Slicer to language' "$smoke_log" || \
+             grep -Fq 'dumped core' "$smoke_log"; then
+            echo "ERROR: portable startup smoke test found a fatal runtime diagnostic" >&2
+            cat "$smoke_log" >&2
             exit 1
           fi
+          echo "Portable startup smoke test passed (process remained healthy until timeout)."
+          rm -rf "$smoke_root"
 
-          echo "APP_BIN=$app_bin" >> "$GITHUB_ENV"
-          tar -C install-dir -czf "out/BambuStudio-OrcaSlicer_LinuxDir_${DIST_ID}_amd64_${VER}.tar.gz" .
+          echo "APP_BIN=orca-studio" >> "$GITHUB_ENV"
+          echo "APP_ELF=bin/orca-studio.bin" >> "$GITHUB_ENV"
+          tar -C build/package -czf "out/OrcaStudio_LinuxDir_${DIST_ID}_amd64_${VER}.tar.gz" .
 
-      - name: Linux - build AppImage (best-effort)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -x "build/src/build_linux_image.sh" ]; then
-            (cd build && ./src/build_linux_image.sh -i -R Release) || true
-          fi
-
-          appimage="$(find build -maxdepth 3 -type f -name '*.AppImage' | head -n 1 || true)"
-          if [ -n "$appimage" ]; then
-            mv "$appimage" "out/BambuStudio-OrcaSlicer_${DIST_ID}_amd64_${VER}.AppImage"
-            chmod +x "out/BambuStudio-OrcaSlicer_${DIST_ID}_amd64_${VER}.AppImage"
-          else
-            echo "WARN: no AppImage produced"
-          fi
-
-      - name: Linux - build .deb from install-dir
+      - name: Linux - build .deb from portable package
         shell: bash
         run: |
           set -euo pipefail
@@ -149,14 +170,16 @@ jobs:
           sudo apt-get install -y dpkg-dev fakeroot binutils
 
           rm -rf pkgroot debian
-          mkdir -p pkgroot/DEBIAN pkgroot/opt/bambustudio-orcaslicer pkgroot/usr/bin
-          cp -a install-dir/. pkgroot/opt/bambustudio-orcaslicer/
+          mkdir -p pkgroot/DEBIAN pkgroot/opt/orcastudio pkgroot/usr/bin
+          cp -a build/package/. pkgroot/opt/orcastudio/
 
-          cat > pkgroot/usr/bin/bambu-studio <<EOF
+          cat > pkgroot/usr/bin/orca-studio <<EOF
           #!/bin/sh
-          exec /opt/bambustudio-orcaslicer/${APP_BIN} "$@"
+          exec "/opt/orcastudio/${APP_BIN}" "\$@"
           EOF
-          chmod 0755 pkgroot/usr/bin/bambu-studio
+          chmod 0755 pkgroot/usr/bin/orca-studio
+          ln -s orca-studio pkgroot/usr/bin/bambu-studio
+          ln -s orca-studio pkgroot/usr/bin/orca-slicer
 
           if [[ "${EVENT_TAG:-${GITHUB_REF_NAME:-}}" == v* ]]; then
             deb_ver="${VER}~${DIST_ID}"
@@ -166,53 +189,173 @@ jobs:
 
           mkdir -p debian
           cat > debian/control <<'EOF'
-          Source: bambustudio-orcaslicer
+          Source: orcastudio
           Section: utils
           Priority: optional
           Maintainer: PJARCZAK CI <ci@invalid>
           Standards-Version: 4.6.2
 
-          Package: bambustudio-orcaslicer
+          Package: orcastudio
           Architecture: amd64
           Description: dummy control for dpkg-shlibdeps
           EOF
 
-          depends=""
-          if [ -x "pkgroot/opt/bambustudio-orcaslicer/${APP_BIN}" ]; then
-            set +e
-            out="$(dpkg-shlibdeps --ignore-missing-info -O \
-              -lpkgroot/opt/bambustudio-orcaslicer/bin \
-              -lpkgroot/opt/bambustudio-orcaslicer/lib \
-              -lpkgroot/opt/bambustudio-orcaslicer/lib64 \
-              pkgroot/opt/bambustudio-orcaslicer/${APP_BIN} 2>&1)"
-            rc=$?
-            set -e
-
-            if [ $rc -eq 0 ]; then
-              depends="$(printf "%s\n" "$out" | sed -n 's/^shlibs:Depends=//p' | tail -n 1)"
-            else
-              echo "WARN: dpkg-shlibdeps failed:"
-              echo "$out"
-            fi
+          if [ ! -x "pkgroot/opt/orcastudio/${APP_ELF}" ]; then
+            echo "ERROR: package ELF not found: ${APP_ELF}" >&2
+            exit 1
           fi
 
+          package_elfs=()
+          while IFS= read -r -d '' candidate; do
+            if [[ "$(file -b "$candidate" 2>/dev/null || true)" == ELF\ * ]]; then
+              package_elfs+=("$candidate")
+            fi
+          done < <(find pkgroot/opt/orcastudio -type f -print0)
+          if (( ${#package_elfs[@]} == 0 )); then
+            echo "ERROR: no ELF files found in portable package" >&2
+            exit 1
+          fi
+
+          # dpkg-shlibdeps is also run over bundled shared libraries so that
+          # external system dependencies used only by one of those libraries are
+          # not missed. Libraries already present in the portable bundle must
+          # not generate dependencies on the Ubuntu packages they were copied
+          # from. Besides producing redundant dependencies, symbols files for
+          # same-source libraries may contain ${binary:Version}; writing that
+          # unresolved substvar directly to DEBIAN/control makes dpkg-deb reject
+          # the package. Build a deterministic -x list for providers of every
+          # bundled SONAME, as documented by dpkg-shlibdeps.
+          find_provider_package() {
+            local lookup_path="$1"
+            local provider=""
+            local basename_pattern=""
+
+            if [[ -z "$lookup_path" ]]; then
+              return 0
+            fi
+
+            # dpkg-query legitimately exits 1 when a resolved symlink or a
+            # locally generated path is not recorded verbatim in dpkg's file
+            # database. Provider discovery is best-effort, so that condition
+            # must not terminate this set -euo pipefail step.
+            provider="$(
+              dpkg-query -S "$lookup_path" 2>/dev/null |
+                awk -F: 'NR == 1 { print $1 }' || true
+            )"
+
+            if [[ -z "$provider" ]]; then
+              basename_pattern="*/$(basename "$lookup_path")"
+              provider="$(
+                dpkg-query -S "$basename_pattern" 2>/dev/null |
+                  awk -F: 'NR == 1 { print $1 }' || true
+              )"
+            fi
+
+            printf '%s' "$provider"
+          }
+
+          declare -A bundled_provider_packages=()
+          for candidate in "${package_elfs[@]}"; do
+            soname="$(
+              objdump -p "$candidate" 2>/dev/null |
+                awk '$1 == "SONAME" { print $2; exit }' || true
+            )"
+            if [[ -z "$soname" ]]; then
+              continue
+            fi
+
+            host_library="$(
+              ldconfig -p 2>/dev/null |
+                awk -v name="$soname" '$1 == name && $NF ~ /^\// { print $NF; exit }' || true
+            )"
+            if [[ -z "$host_library" ]]; then
+              continue
+            fi
+
+            host_library_real="$(readlink -f "$host_library" 2>/dev/null || true)"
+            provider=""
+            for lookup_path in "$host_library_real" "$host_library"; do
+              provider="$(find_provider_package "$lookup_path")"
+              if [[ -n "$provider" ]]; then
+                break
+              fi
+            done
+
+            if [[ -n "$provider" ]]; then
+              bundled_provider_packages["$provider"]=1
+            else
+              printf 'dpkg-shlibdeps: no dpkg provider found for bundled SONAME %s (%s); continuing\n' \
+                "$soname" "$host_library"
+            fi
+          done
+
+          exclude_args=()
+          if (( ${#bundled_provider_packages[@]} > 0 )); then
+            mapfile -t sorted_bundled_providers < <(
+              printf '%s\n' "${!bundled_provider_packages[@]}" | LC_ALL=C sort
+            )
+            for provider in "${sorted_bundled_providers[@]}"; do
+              exclude_args+=("-x${provider}")
+            done
+            printf 'dpkg-shlibdeps: excluding providers of bundled SONAMEs:\n'
+            printf '  %s\n' "${sorted_bundled_providers[@]}"
+          fi
+
+          set +e
+          out="$(dpkg-shlibdeps --ignore-missing-info -O \
+            "${exclude_args[@]}" \
+            -lpkgroot/opt/orcastudio/bin \
+            -lpkgroot/opt/orcastudio/lib \
+            -lpkgroot/opt/orcastudio/lib64 \
+            -lpkgroot/opt/orcastudio/lib/orca-runtime \
+            "${package_elfs[@]}" 2>&1)"
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "ERROR: dpkg-shlibdeps failed:" >&2
+            echo "$out" >&2
+            exit $rc
+          fi
+
+          depends="$(printf "%s\n" "$out" | sed -n 's/^shlibs:Depends=//p' | tail -n 1)"
           if [[ -z "$depends" ]]; then
-            depends="libc6, libstdc++6, libgcc-s1"
+            echo "ERROR: dpkg-shlibdeps produced an empty dependency set" >&2
+            exit 1
+          fi
+          if [[ "$depends" == *'${'* ]]; then
+            echo "ERROR: dpkg-shlibdeps left an unresolved Debian substvar:" >&2
+            echo "$depends" >&2
+            exit 1
           fi
 
           cat > pkgroot/DEBIAN/control <<EOF
-          Package: bambustudio-orcaslicer
+          Package: orcastudio
           Version: ${deb_ver}
           Section: utils
           Priority: optional
           Architecture: amd64
           Maintainer: PJARCZAK CI <ci@invalid>
           Depends: ${depends}
-          Description: BambuStudio-OrcaSlicer build (installed in /opt/bambustudio-orcaslicer)
+          Provides: bambustudio-orcaslicer
+          Replaces: bambustudio-orcaslicer
+          Conflicts: bambustudio-orcaslicer
+          Description: OrcaStudio build (installed in /opt/orcastudio)
            Wrapper: /usr/bin/bambu-studio
           EOF
 
-          fakeroot dpkg-deb --build pkgroot "out/BambuStudio-OrcaSlicer_${DIST_ID}_amd64_${VER}.deb"
+          deb_path="out/OrcaStudio_${DIST_ID}_amd64_${VER}.deb"
+          fakeroot dpkg-deb --build pkgroot "$deb_path"
+
+          built_depends="$(dpkg-deb -f "$deb_path" Depends)"
+          if [[ -z "$built_depends" ]]; then
+            echo "ERROR: built .deb has an empty Depends field" >&2
+            exit 1
+          fi
+          if [[ "$built_depends" == *'${'* ]]; then
+            echo "ERROR: built .deb still contains an unresolved Debian substvar:" >&2
+            echo "$built_depends" >&2
+            exit 1
+          fi
 
       - name: Linux - checksums
         shell: bash
@@ -223,6 +366,6 @@ jobs:
       - name: Upload artifacts (Linux Portable ubuntu24.04)
         uses: actions/upload-artifact@v7
         with:
-          name: bambustudio-orcaslicer-linux-${{ env.DIST_ID }}-${{ github.sha }}
+          name: orcastudio-linux-${{ env.DIST_ID }}-${{ github.sha }}
           path: out/
           if-no-files-found: error

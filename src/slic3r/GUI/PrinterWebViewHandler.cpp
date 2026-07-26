@@ -123,7 +123,7 @@ public:
         if (method == "open" || method == "common_openurl") {
             const std::string url = json_string(params, "url").empty() ? json_string(root, "url") : json_string(params, "url");
             if (!url.empty())
-                wxLaunchDefaultBrowser(url);
+                wxGetApp().open_browser_with_warning_dialog(url);
             if (!request_id.empty())
                 send_ipc_message("response", request_id, method, 0, "success");
             return;

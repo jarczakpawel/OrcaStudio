@@ -131,7 +131,7 @@ void PrivacyUpdateDialog::OnNavigating(wxWebViewEvent& event)
     wxString jump_url = event.GetURL();
     if (jump_url != m_host_url) {
         event.Veto();
-        wxLaunchDefaultBrowser(jump_url);
+        wxGetApp().open_browser_with_warning_dialog(jump_url);
     }
     else {
         event.Skip();

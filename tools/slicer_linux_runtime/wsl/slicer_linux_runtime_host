@@ -2,73 +2,337 @@
 set -eu
 
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-CACHE_FILE="$DIR/.selected_host_abi"
 LOADER="$DIR/ld-linux-x86-64.so.2"
+CACHE_FILE="$DIR/.selected_host_abi"
+ROSETTA_SPLITLOCK_SHIM="$DIR/liborcastudio_rosetta_splitlock_compat.so"
 
-library_path() {
+export SLICER_LINUX_RUNTIME_COMPONENT_DIR="${SLICER_LINUX_RUNTIME_COMPONENT_DIR:-$DIR}"
+export SLICER_LINUX_RUNTIME_COMPONENT_SO="${SLICER_LINUX_RUNTIME_COMPONENT_SO:-$SLICER_LINUX_RUNTIME_COMPONENT_DIR/libbambu_networking.so}"
+export SLICER_LINUX_RUNTIME_SOURCE_SO="${SLICER_LINUX_RUNTIME_SOURCE_SO:-$SLICER_LINUX_RUNTIME_COMPONENT_DIR/libBambuSource.so}"
+if [ -z "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}" ]; then
+    unset SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION
+fi
+if [ -s "$DIR/ca-certificates.crt" ]; then
+    export SLICER_LINUX_RUNTIME_CA_BUNDLE="${SLICER_LINUX_RUNTIME_CA_BUNDLE:-$DIR/ca-certificates.crt}"
+    export SSL_CERT_FILE="${SSL_CERT_FILE:-$SLICER_LINUX_RUNTIME_CA_BUNDLE}"
+    export CURL_CA_BUNDLE="${CURL_CA_BUNDLE:-$SLICER_LINUX_RUNTIME_CA_BUNDLE}"
+fi
+
+system_interpreter_available() {
+    [ -x /lib64/ld-linux-x86-64.so.2 ] || \
+    [ -x /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ] || \
+    [ -x /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 ]
+}
+
+system_library_path() {
+    out=""
+    for path in \
+        /lib/x86_64-linux-gnu \
+        /usr/lib/x86_64-linux-gnu \
+        /usr/lib/x86_64-linux-gnu/pulseaudio \
+        /lib64 \
+        /usr/lib64; do
+        [ -d "$path" ] || continue
+        if [ -n "$out" ]; then out="$out:$path"; else out="$path"; fi
+    done
+    if [ -n "${SLICER_LINUX_RUNTIME_COMPONENT_DIR:-}" ] && [ "$SLICER_LINUX_RUNTIME_COMPONENT_DIR" != "$DIR" ]; then
+        if [ -n "$out" ]; then out="$out:$SLICER_LINUX_RUNTIME_COMPONENT_DIR"; else out="$SLICER_LINUX_RUNTIME_COMPONENT_DIR"; fi
+    fi
+    if [ -n "$out" ]; then out="$out:$DIR"; else out="$DIR"; fi
+    printf '%s' "$out"
+}
+
+private_library_path() {
     printf '%s' "$DIR"
+    if [ -n "${SLICER_LINUX_RUNTIME_COMPONENT_DIR:-}" ] && [ "$SLICER_LINUX_RUNTIME_COMPONENT_DIR" != "$DIR" ]; then
+        printf ':%s' "$SLICER_LINUX_RUNTIME_COMPONENT_DIR"
+    fi
     if [ -n "${LD_LIBRARY_PATH:-}" ]; then
         printf ':%s' "$LD_LIBRARY_PATH"
     fi
 }
 
+prefer_system_only() {
+    [ "${SLICER_LINUX_RUNTIME_PREFER_SYSTEM_LOADER:-0}" = "1" ]
+}
+
+rosetta_translation_active() {
+    [ "${SLICER_LINUX_RUNTIME_FORCE_ROSETTA_SPLITLOCK_COMPAT:-0}" = "1" ] && return 0
+    case "$(uname -m 2>/dev/null || true)" in
+        aarch64|arm64) ;;
+        *) return 1 ;;
+    esac
+    [ -x /mnt/lima-rosetta/rosetta ] || return 1
+    if [ -r /proc/sys/fs/binfmt_misc/rosetta ]; then
+        grep -Fq '/mnt/lima-rosetta/rosetta' /proc/sys/fs/binfmt_misc/rosetta || return 1
+    fi
+    return 0
+}
+
+system_host_command() {
+    library_path=$(system_library_path)
+    if rosetta_translation_active; then
+        if [ ! -r "$ROSETTA_SPLITLOCK_SHIM" ]; then
+            echo "Rosetta unaligned-atomic compatibility library is missing: $ROSETTA_SPLITLOCK_SHIM" >&2
+            return 126
+        fi
+        env \
+            LD_LIBRARY_PATH="$library_path" \
+            LD_PRELOAD="$ROSETTA_SPLITLOCK_SHIM" \
+            SLICER_LINUX_RUNTIME_ROSETTA_SPLITLOCK_COMPAT=1 \
+            "$@"
+    else
+        env LD_LIBRARY_PATH="$library_path" "$@"
+    fi
+}
+
+exec_system_host() {
+    library_path=$(system_library_path)
+    if rosetta_translation_active; then
+        if [ ! -r "$ROSETTA_SPLITLOCK_SHIM" ]; then
+            echo "Rosetta unaligned-atomic compatibility library is missing: $ROSETTA_SPLITLOCK_SHIM" >&2
+            exit 126
+        fi
+        exec env \
+            LD_LIBRARY_PATH="$library_path" \
+            LD_PRELOAD="$ROSETTA_SPLITLOCK_SHIM" \
+            SLICER_LINUX_RUNTIME_ROSETTA_SPLITLOCK_COMPAT=1 \
+            "$@"
+    fi
+    exec env LD_LIBRARY_PATH="$library_path" "$@"
+}
+
+is_rosetta_aot_failure() {
+    probe_error_file="$1"
+    grep -Fq 'AOT header specified too many segments' "$probe_error_file" 2>/dev/null &&
+        grep -Fq 'ImageInfo.cpp' "$probe_error_file" 2>/dev/null
+}
+
+is_rosetta_plugin_sigbus() {
+    probe_error_file="$1"
+    probe_rc="$2"
+    [ "$probe_rc" -eq 135 ] || return 1
+    grep -Eqi 'bus error|core dumped' "$probe_error_file" 2>/dev/null
+}
+
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -n "$@"
+    else
+        return 1
+    fi
+}
+
+disable_rosetta_aot_cache() {
+    case "$(uname -m 2>/dev/null || true)" in
+        aarch64|arm64) ;;
+        *) return 1 ;;
+    esac
+
+    rosetta_cache_dir="${SLICER_LINUX_RUNTIME_ROSETTA_CACHE_DIR:-/var/cache/rosettad}"
+    rosetta_disable_marker="${SLICER_LINUX_RUNTIME_ROSETTA_DISABLE_MARKER:-/etc/orcastudio-rosetta-aot-disabled}"
+    rosetta_dropin_dir="${SLICER_LINUX_RUNTIME_ROSETTA_DROPIN_DIR:-/etc/systemd/system/rosettad.service.d}"
+    [ -d "$rosetta_cache_dir" ] || return 1
+
+    # This dedicated VM deliberately uses Rosetta without optional AOT caching.
+    # Protected vendor ELF files may contain more PT_LOAD mappings than the AOT
+    # cache format accepts. Rosetta itself continues to work when rosettad is not
+    # running; only the optional cached-translation path is disabled.
+    marker_tmp=$(mktemp "${TMPDIR:-/tmp}/rosetta-aot-marker.XXXXXX") || return 1
+    dropin_tmp=$(mktemp "${TMPDIR:-/tmp}/rosetta-aot-dropin.XXXXXX") || { rm -f "$marker_tmp"; return 1; }
+    printf '%s\n' 'disabled-for-protected-vendor-elf' > "$marker_tmp"
+    printf '%s\n' '[Unit]' 'ConditionPathExists=!/etc/orcastudio-rosetta-aot-disabled' > "$dropin_tmp"
+    run_privileged install -m 0644 "$marker_tmp" "$rosetta_disable_marker" || { rm -f "$marker_tmp" "$dropin_tmp"; return 1; }
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat rosettad.service >/dev/null 2>&1; then
+        run_privileged install -d -m 0755 "$rosetta_dropin_dir" || { rm -f "$marker_tmp" "$dropin_tmp"; return 1; }
+        run_privileged install -m 0644 "$dropin_tmp" "$rosetta_dropin_dir/10-orcastudio-disable-aot.conf" || { rm -f "$marker_tmp" "$dropin_tmp"; return 1; }
+        run_privileged systemctl daemon-reload || { rm -f "$marker_tmp" "$dropin_tmp"; return 1; }
+        run_privileged systemctl stop rosettad.service || { rm -f "$marker_tmp" "$dropin_tmp"; return 1; }
+        if systemctl is-active --quiet rosettad.service 2>/dev/null; then
+            rm -f "$marker_tmp" "$dropin_tmp"
+            return 1
+        fi
+    fi
+    rm -f "$marker_tmp" "$dropin_tmp"
+
+    run_privileged rm -f \
+        /run/rosettad/rosetta.sock \
+        "$rosetta_cache_dir/uds/rosetta.sock" || return 1
+    run_privileged find "$rosetta_cache_dir" -xdev -mindepth 1 -delete || return 1
+
+    [ ! -S /run/rosettad/rosetta.sock ] || return 1
+    [ ! -S "$rosetta_cache_dir/uds/rosetta.sock" ] || return 1
+    return 0
+}
+
+probe_bare_host() {
+    probe_bin="$1"
+    probe_error_file="$2"
+    : > "$probe_error_file"
+    printf x | system_host_command \
+        "$probe_bin" --probe-stdio-roundtrip >/dev/null 2>"$probe_error_file"
+}
+
 run_host() {
     bin="$1"
     shift
-    if [ -x "$LOADER" ]; then
-        LD_LIBRARY_PATH=$(library_path) exec "$LOADER" --library-path "$(library_path)" "$bin" "$@"
+
+    if system_interpreter_available; then
+        # Normal ELF execution is required for Apple Rosetta's binfmt handler.
+        # It is also the preferred WSL path because the guest owns a coherent
+        # loader/libc hierarchy. Keep the proprietary plug-in directory last so
+        # only its own .so files are resolved from there.
+        exec_system_host "$bin" "$@"
     fi
-    LD_LIBRARY_PATH=$(library_path) exec "$bin" "$@"
+
+    if prefer_system_only; then
+        echo "x86_64 system interpreter is unavailable in the Linux guest" >&2
+        exit 127
+    fi
+
+    if [ -x "$LOADER" ]; then
+        exec "$LOADER" --library-path "$(private_library_path)" "$bin" "$@"
+    fi
+
+    echo "no usable x86_64 ELF loader found" >&2
+    exit 127
 }
 
 probe_host() {
     bin="$1"
     [ -x "$bin" ] || return 1
-    if [ -x "$LOADER" ]; then
-        LD_LIBRARY_PATH=$(library_path) \
-        SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
-        SLICER_LINUX_RUNTIME_COUNTRY_CODE="${SLICER_LINUX_RUNTIME_COUNTRY_CODE:-PL}" \
-        "$LOADER" --library-path "$(library_path)" "$bin" --probe-load >/dev/null 2>&1
-        return $?
+    error_file=$(mktemp "${TMPDIR:-/tmp}/slicer-host-probe.XXXXXX") || return 1
+
+    if system_interpreter_available; then
+        probe_rc=0
+        if SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
+           system_host_command "$bin" --probe-load >/dev/null 2>"$error_file"; then
+            rm -f "$error_file"
+            return 0
+        else
+            probe_rc=$?
+        fi
+
+        aot_failure=0
+        plugin_sigbus=0
+        is_rosetta_aot_failure "$error_file" && aot_failure=1
+        is_rosetta_plugin_sigbus "$error_file" "$probe_rc" && plugin_sigbus=1
+        if [ "$aot_failure" -eq 1 ] || [ "$plugin_sigbus" -eq 1 ]; then
+            bare_error=$(mktemp "${TMPDIR:-/tmp}/slicer-host-bare-probe.XXXXXX") || bare_error=""
+            bare_ok=0
+            if [ -n "$bare_error" ]; then
+                if probe_bare_host "$bin" "$bare_error"; then
+                    bare_ok=1
+                    echo "Rosetta executable probe passed; translation failed while loading a plug-in or one of its dependencies" >&2
+                else
+                    echo "Rosetta executable probe also failed before plug-in loading" >&2
+                    sed -n '1,20p' "$bare_error" >&2 || true
+                fi
+                rm -f "$bare_error"
+            fi
+
+            # An explicit AOT header failure is sufficient evidence even when the
+            # executable-only probe also hits the same broken cached translation.
+            # A plain SIGBUS is retried only when the bare host itself is healthy.
+            if [ "$aot_failure" -eq 1 ] || [ "$bare_ok" -eq 1 ]; then
+                echo "Rosetta AOT path is incompatible with this protected ELF; disabling optional AOT caching and retrying once" >&2
+                if disable_rosetta_aot_cache; then
+                    : > "$error_file"
+                    if SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
+                       system_host_command "$bin" --probe-load >/dev/null 2>"$error_file"; then
+                        echo "Rosetta uncached translation probe succeeded" >&2
+                        rm -f "$error_file"
+                        return 0
+                    fi
+                else
+                    echo "Rosetta AOT caching could not be disabled automatically" >&2
+                fi
+            fi
+        fi
+
+        if prefer_system_only; then
+            echo "host ABI system-loader probe failed: $(basename "$bin")" >&2
+            sed -n '1,80p' "$error_file" >&2 || true
+            rm -f "$error_file"
+            return 1
+        fi
     fi
-    LD_LIBRARY_PATH=$(library_path) \
-    SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
-    SLICER_LINUX_RUNTIME_COUNTRY_CODE="${SLICER_LINUX_RUNTIME_COUNTRY_CODE:-PL}" \
-    "$bin" --probe-load >/dev/null 2>&1
+
+    if [ -x "$LOADER" ]; then
+        if SLICER_LINUX_RUNTIME_PROBE_LOG_DIR="${SLICER_LINUX_RUNTIME_PROBE_LOG_DIR:-$DIR}" \
+           "$LOADER" --library-path "$(private_library_path)" "$bin" --probe-load >/dev/null 2>"$error_file"; then
+            rm -f "$error_file"
+            return 0
+        fi
+    fi
+
+    echo "host ABI probe failed: $(basename "$bin")" >&2
+    sed -n '1,40p' "$error_file" >&2 || true
+    rm -f "$error_file"
+    return 1
+}
+
+component_probe_required() {
+    [ "${SLICER_LINUX_RUNTIME_REQUIRE_COMPATIBLE_HOST:-0}" = "1" ] || \
+    [ -f "$SLICER_LINUX_RUNTIME_COMPONENT_SO" ] || \
+    [ -f "$SLICER_LINUX_RUNTIME_SOURCE_SO" ]
+}
+
+candidate_is_usable() {
+    bin="$1"
+    if component_probe_required; then
+        probe_host "$bin"
+    else
+        [ -x "$bin" ]
+    fi
 }
 
 choose_bin() {
     requested_abi="${SLICER_LINUX_RUNTIME_ABI:-}"
     if [ -n "$requested_abi" ] && [ -x "$DIR/slicer_linux_runtime_host_${requested_abi}" ]; then
-        printf '%s\n' "$DIR/slicer_linux_runtime_host_${requested_abi}"
-        return 0
+        if candidate_is_usable "$DIR/slicer_linux_runtime_host_${requested_abi}"; then
+            printf '%s\n' "$DIR/slicer_linux_runtime_host_${requested_abi}"
+            return 0
+        fi
     fi
 
+    # A cached ABI is only a hint. Re-probe it against the current downloaded
+    # component and loader environment instead of blindly executing stale data.
     if [ -f "$CACHE_FILE" ]; then
         cached=$(cat "$CACHE_FILE" 2>/dev/null || true)
-        if [ -n "$cached" ] && [ -x "$DIR/slicer_linux_runtime_host_$cached" ]; then
+        if [ -n "$cached" ] && [ -x "$DIR/slicer_linux_runtime_host_$cached" ] && \
+           candidate_is_usable "$DIR/slicer_linux_runtime_host_$cached"; then
             printf '%s\n' "$DIR/slicer_linux_runtime_host_$cached"
             return 0
         fi
+        rm -f "$CACHE_FILE"
     fi
 
-    for abi in abi1 abi0; do
-        if probe_host "$DIR/slicer_linux_runtime_host_$abi"; then
-            printf '%s' "$abi" > "$CACHE_FILE"
-            printf '%s\n' "$DIR/slicer_linux_runtime_host_$abi"
-            return 0
-        fi
-    done
-
-    if [ -x "$DIR/slicer_linux_runtime_host_abi1" ]; then
+    if candidate_is_usable "$DIR/slicer_linux_runtime_host_abi1"; then
+        printf '%s' abi1 > "$CACHE_FILE"
         printf '%s\n' "$DIR/slicer_linux_runtime_host_abi1"
         return 0
     fi
-    if [ -x "$DIR/slicer_linux_runtime_host_abi0" ]; then
+
+    # ABI0 crashes with the current real 02.08.00.55 Linux component even on a
+    # native x86_64 host. It is retained for explicitly requested legacy tests,
+    # but never used as an automatic production fallback.
+    if [ "${SLICER_LINUX_RUNTIME_DISABLE_ABI0_FALLBACK:-0}" != "1" ] && \
+       [ "${SLICER_LINUX_RUNTIME_ENABLE_ABI0_FALLBACK:-0}" = "1" ] && \
+       candidate_is_usable "$DIR/slicer_linux_runtime_host_abi0"; then
+        printf '%s' abi0 > "$CACHE_FILE"
         printf '%s\n' "$DIR/slicer_linux_runtime_host_abi0"
         return 0
     fi
-    return 1
+
+    if [ "${SLICER_LINUX_RUNTIME_REQUIRE_COMPATIBLE_HOST:-0}" = "1" ]; then
+        return 1
+    fi
+
+    [ -x "$DIR/slicer_linux_runtime_host_abi1" ] || return 1
+    printf '%s\n' "$DIR/slicer_linux_runtime_host_abi1"
 }
 
 BIN=$(choose_bin) || {

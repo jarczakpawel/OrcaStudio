@@ -5,11 +5,13 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <memory>
+#include <unordered_set>
 #include <cstdlib>
 #include <cctype>
 #include <filesystem>
 #include <boost/filesystem/path.hpp>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 #include <nlohmann/json.hpp>
 #include "../bambu_networking.hpp"
 
@@ -100,15 +102,14 @@ const nlohmann::json* find_manifest_entry(const nlohmann::json& root, const std:
 
 bool enabled()
 {
-    bool configured_value = false;
-    if (env_flag("SLICER_LINUX_RUNTIME_ENABLED", configured_value))
-        return configured_value;
-
 #if defined(_MSC_VER) || defined(_WIN32)
     return true;
 #elif defined(__WXMAC__) || defined(__APPLE__)
     return true;
 #else
+    bool configured_value = false;
+    if (env_flag("SLICER_LINUX_RUNTIME_ENABLED", configured_value))
+        return configured_value;
     return false;
 #endif
 }
@@ -248,7 +249,7 @@ bool is_linux_component_package_filename(const std::string& file_name)
 
 bool is_overlay_runtime_filename(const std::string& file_name)
 {
-    if (file_name == "network_plugins.json")
+    if (file_name == "network_plugins.json" || file_name == "runtime-files.sha256")
         return true;
 
     if (file_name.size() >= 3 && file_name.compare(file_name.size() - 3, 3, ".so") == 0)
@@ -262,6 +263,10 @@ bool is_overlay_runtime_filename(const std::string& file_name)
            file_name == host_executable_file_name() ||
            file_name == "slicer_linux_runtime_host_abi1" ||
            file_name == "slicer_linux_runtime_host_abi0" ||
+           file_name == "slicer_linux_auth_browser" ||
+           file_name == "slicer_linux_auth_browser_x86_64" ||
+           file_name == "slicer_linux_auth_browser_aarch64" ||
+           file_name == "run_auth_browser.sh" ||
            file_name == mac_host_wrapper_file_name() ||
            file_name == mac_lima_instance_file_name() ||
            file_name == mac_runtime_install_script_file_name() ||
@@ -344,35 +349,55 @@ std::string sha256_file_hex(const std::string& file_path, std::string* reason)
         set_reason(reason, "file open failed");
         return {};
     }
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+        set_reason(reason, "SHA-256 initialization failed");
+        return {};
+    }
     std::array<char, 1 << 15> buf{};
     while (in) {
         in.read(buf.data(), std::streamsize(buf.size()));
         const auto n = in.gcount();
-        if (n > 0)
-            SHA256_Update(&ctx, buf.data(), std::size_t(n));
+        if (n > 0 && EVP_DigestUpdate(ctx.get(), buf.data(), std::size_t(n)) != 1) {
+            set_reason(reason, "SHA-256 update failed");
+            return {};
+        }
     }
-    unsigned char md[SHA256_DIGEST_LENGTH]{};
-    SHA256_Final(md, &ctx);
+    if (in.bad()) {
+        set_reason(reason, "file read failed");
+        return {};
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> md{};
+    unsigned int md_size = 0;
+    if (EVP_DigestFinal_ex(ctx.get(), md.data(), &md_size) != 1 || md_size != 32) {
+        set_reason(reason, "SHA-256 finalization failed");
+        return {};
+    }
     std::ostringstream oss;
     oss << std::hex << std::setfill('0');
-    for (unsigned char b : md)
-        oss << std::setw(2) << static_cast<unsigned>(b);
+    for (unsigned int i = 0; i < md_size; ++i)
+        oss << std::setw(2) << static_cast<unsigned>(md[i]);
     set_reason(reason, "ok");
     return oss.str();
 }
 
 std::string expected_component_abi_version()
 {
-    return env_or("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION", BAMBU_NETWORK_AGENT_VERSION);
+    if (const char* configured = std::getenv("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION");
+        configured != nullptr && *configured != '\0')
+        return configured;
+    return {};
 }
 
 bool abi_version_matches_expected(const std::string& actual_version, std::string* reason)
 {
     const auto expected = expected_component_abi_version();
-    if (expected.empty() || actual_version.empty()) {
-        set_reason(reason, expected.empty() ? "expected ABI version empty" : "actual ABI version empty");
+    if (expected.empty()) {
+        set_reason(reason, "ok (ABI version selected from downloaded plug-in)");
+        return true;
+    }
+    if (actual_version.empty()) {
+        set_reason(reason, "actual ABI version empty");
         return false;
     }
     if (actual_version == expected) {
@@ -439,11 +464,55 @@ bool validate_linux_component_file_against_manifest(const std::string& file_path
 bool validate_linux_component_set_against_manifest(const std::filesystem::path& component_folder, std::string* reason)
 {
     const auto manifest = linux_component_manifest_path(component_folder);
-    if (!std::filesystem::exists(manifest)) {
+    std::ifstream in(manifest);
+    if (!in) {
         set_reason(reason, "manifest missing");
         return false;
     }
-    for (const auto& name : {linux_component_library_name(), linux_source_library_name()}) {
+
+    nlohmann::json root;
+    try {
+        in >> root;
+    } catch (...) {
+        set_reason(reason, "manifest parse failed");
+        return false;
+    }
+
+    if (!root.is_object() || root.value("schema", 0) != 1) {
+        set_reason(reason, "manifest schema invalid");
+        return false;
+    }
+
+    const auto files_it = root.find("files");
+    if (files_it == root.end() || !files_it->is_array()) {
+        set_reason(reason, "manifest files invalid");
+        return false;
+    }
+
+    const std::unordered_set<std::string> allowed_names = {
+        linux_component_library_name(),
+        linux_source_library_name(),
+        "liblive555.so",
+        "libagora_rtc_sdk.so",
+        "libagora-fdkaac.so"
+    };
+    std::unordered_set<std::string> manifest_names;
+
+    for (const auto& entry : *files_it) {
+        if (!entry.is_object()) {
+            set_reason(reason, "manifest entry invalid");
+            return false;
+        }
+        const auto name = entry.value("name", std::string());
+        if (name.empty() || std::filesystem::path(name).filename().string() != name || !allowed_names.count(name)) {
+            set_reason(reason, "manifest filename invalid");
+            return false;
+        }
+        if (!manifest_names.insert(name).second) {
+            set_reason(reason, "manifest filename duplicated: " + name);
+            return false;
+        }
+
         const auto path = (component_folder / name).string();
         std::string local_reason;
         if (!validate_linux_component_file_against_manifest(path, manifest, &local_reason)) {
@@ -451,6 +520,17 @@ bool validate_linux_component_set_against_manifest(const std::filesystem::path& 
             return false;
         }
     }
+
+    for (const auto& name : allowed_names) {
+        const bool required = name == linux_component_library_name() || name == linux_source_library_name();
+        const bool present = std::filesystem::is_regular_file(component_folder / name);
+        const bool listed = manifest_names.count(name) != 0;
+        if ((required || present) && !listed) {
+            set_reason(reason, name + ": missing from manifest");
+            return false;
+        }
+    }
+
     set_reason(reason, "ok");
     return true;
 }

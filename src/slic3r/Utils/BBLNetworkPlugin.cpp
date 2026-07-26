@@ -3,6 +3,9 @@
 #include "SlicerLinuxRuntime/SlicerLinuxRuntimeConfig.hpp"
 
 #include <stdio.h>
+#include <nlohmann/json.hpp>
+#include <set>
+#include <shared_mutex>
 #include <stdlib.h>
 #include <boost/log/trivial.hpp>
 #include <boost/format.hpp>
@@ -20,6 +23,10 @@ namespace Slic3r {
 
 namespace {
 
+std::shared_mutex g_network_module_lifetime_mutex;
+thread_local unsigned g_network_module_call_depth = 0;
+std::mutex g_runtime_environment_mutex;
+
 void set_runtime_preflight_reason(std::string* detail, const std::string& value)
 {
     if (detail)
@@ -33,6 +40,8 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
         Slic3r::SlicerLinuxRuntime::host_executable_file_name(),
         "slicer_linux_runtime_host_abi1",
         "slicer_linux_runtime_host_abi0",
+        "slicer_linux_auth_browser",
+        "run_auth_browser.sh",
         Slic3r::SlicerLinuxRuntime::linux_component_library_name(),
         Slic3r::SlicerLinuxRuntime::linux_source_library_name(),
         "ca-certificates.crt",
@@ -48,7 +57,7 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
     }
 
 #if defined(_MSC_VER) || defined(_WIN32)
-    const std::string platform_required_files[] = {
+    const std::vector<std::string> platform_required_files = {
         Slic3r::SlicerLinuxRuntime::windows_wsl_distro_file_name(),
         Slic3r::SlicerLinuxRuntime::windows_wsl_import_script_file_name(),
         Slic3r::SlicerLinuxRuntime::windows_wsl_validate_script_file_name(),
@@ -57,11 +66,14 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
         Slic3r::SlicerLinuxRuntime::windows_component_cache_subdir_file_name()
     };
 #elif defined(__WXMAC__) || defined(__APPLE__)
-    const std::string platform_required_files[] = {
+    const std::vector<std::string> platform_required_files = {
         Slic3r::SlicerLinuxRuntime::mac_host_wrapper_file_name(),
         Slic3r::SlicerLinuxRuntime::mac_runtime_install_script_file_name(),
         Slic3r::SlicerLinuxRuntime::mac_runtime_verify_script_file_name(),
         Slic3r::SlicerLinuxRuntime::mac_lima_instance_file_name(),
+        "liborcastudio_rosetta_splitlock_compat.so",
+        "slicer_linux_auth_browser_x86_64",
+        "slicer_linux_auth_browser_aarch64",
         "ld-linux-x86-64.so.2",
         "libc.so.6",
         "libm.so.6",
@@ -73,7 +85,7 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
         "libz.so.1"
     };
 #else
-    const std::string platform_required_files[] = {};
+    const std::vector<std::string> platform_required_files = {};
 #endif
 
     for (const auto& file_name : platform_required_files) {
@@ -128,33 +140,207 @@ std::string list_runtime_component_dir_files(const boost::filesystem::path& comp
 // Singleton Implementation
 // ============================================================================
 
-// Static pointer initialization (null by default, created on first access)
-BBLNetworkPlugin* BBLNetworkPlugin::s_instance = nullptr;
-
 BBLNetworkPlugin& BBLNetworkPlugin::instance()
 {
-    static std::once_flag flag;
-    std::call_once(flag, [] {
-        s_instance = new BBLNetworkPlugin();
-    });
-    return *s_instance;
+    static BBLNetworkPlugin* plugin = new BBLNetworkPlugin();
+    return *plugin;
+}
+
+BBLNetworkPlugin::ModuleCallGuard::ModuleCallGuard(std::shared_mutex& mutex)
+    : m_mutex(&mutex), m_active(true)
+{
+    if (g_network_module_call_depth == 0)
+        mutex.lock_shared();
+    ++g_network_module_call_depth;
+}
+
+BBLNetworkPlugin::ModuleCallGuard::~ModuleCallGuard()
+{
+    if (!m_active || g_network_module_call_depth == 0)
+        return;
+    --g_network_module_call_depth;
+    if (g_network_module_call_depth == 0 && m_mutex)
+        m_mutex->unlock_shared();
+}
+
+BBLNetworkPlugin::ModuleCallGuard BBLNetworkPlugin::lock_module_for_call()
+{
+    return ModuleCallGuard(g_network_module_lifetime_mutex);
 }
 
 void BBLNetworkPlugin::shutdown()
 {
-    // Note: Do not call instance() after shutdown() - the singleton is destroyed.
-    if (s_instance) {
-        delete s_instance;
-        s_instance = nullptr;
-    }
+    (void) instance().unload();
 }
 
 BBLNetworkPlugin::BBLNetworkPlugin() = default;
 
 BBLNetworkPlugin::~BBLNetworkPlugin()
 {
-    destroy_agent();
-    unload();
+    (void) unload();
+}
+
+int BBLNetworkPlugin::linux_runtime_http_request(
+    const std::string& method,
+    const std::string& url,
+    const std::vector<std::string>& header_lines,
+    const std::string& request_body,
+    const std::string& multipart_json,
+    const std::string& range,
+    std::size_t max_bytes,
+    long connect_timeout_ms,
+    long timeout_ms,
+    func_linux_http_progress progress_cb,
+    func_linux_http_cancel cancel_cb,
+    void* callback_user,
+    unsigned int* http_status,
+    std::string* response_body,
+    std::string* response_headers,
+    std::string* primary_ip,
+    std::string* error)
+{
+    if (!Slic3r::SlicerLinuxRuntime::use_linux_runtime()) {
+        if (error)
+            *error = "Linux runtime is not used on this platform";
+        return -1;
+    }
+
+#if defined(_MSC_VER) || defined(_WIN32)
+    using module_handle = HMODULE;
+#else
+    using module_handle = void*;
+#endif
+
+    const auto invoke = [&](module_handle module) -> int {
+        if (!module) {
+            if (error && error->empty())
+                *error = "Linux runtime forwarder is not loaded";
+            return -1;
+        }
+#if defined(_MSC_VER) || defined(_WIN32)
+        auto fn = reinterpret_cast<func_linux_http_request>(::GetProcAddress(module, "slicer_linux_runtime_http_request"));
+#else
+        auto fn = reinterpret_cast<func_linux_http_request>(dlsym(module, "slicer_linux_runtime_http_request"));
+#endif
+        if (!fn) {
+            if (error)
+                *error = "Linux runtime forwarder does not export slicer_linux_runtime_http_request";
+            return -1;
+        }
+
+        nlohmann::json headers = nlohmann::json::array();
+        for (const auto& line : header_lines)
+            headers.push_back(line);
+        return fn(method, url, headers.dump(), request_body, multipart_json, range,
+            static_cast<unsigned long long>(max_bytes), connect_timeout_ms, timeout_ms,
+            progress_cb, cancel_cb, callback_user,
+            http_status, response_body, response_headers, primary_ip, error);
+    };
+
+    BBLNetworkPlugin& plugin = instance();
+    {
+        auto module_lock = lock_module_for_call();
+        if (plugin.m_networking_module)
+            return invoke(plugin.m_networking_module);
+    }
+
+    std::lock_guard<std::mutex> environment_lock(g_runtime_environment_mutex);
+
+    {
+        auto module_lock = lock_module_for_call();
+        if (plugin.m_networking_module)
+            return invoke(plugin.m_networking_module);
+    }
+
+    const boost::filesystem::path component_folder = boost::filesystem::path(data_dir()) / "plugins";
+    const std::string component_dir = component_folder.string();
+
+    auto set_env = [](const char* name, const std::string& value) {
+#if defined(_MSC_VER) || defined(_WIN32)
+        _putenv_s(name, value.c_str());
+#else
+        setenv(name, value.c_str(), 1);
+#endif
+    };
+    auto get_env = [](const char* name) -> std::pair<bool, std::string> {
+        const char* value = std::getenv(name);
+        return {value != nullptr, value ? std::string(value) : std::string()};
+    };
+    auto restore_env = [](const char* name, const std::pair<bool, std::string>& previous) {
+#if defined(_MSC_VER) || defined(_WIN32)
+        _putenv_s(name, previous.first ? previous.second.c_str() : "");
+#else
+        if (previous.first)
+            setenv(name, previous.second.c_str(), 1);
+        else
+            unsetenv(name);
+#endif
+    };
+
+    const auto old_component_dir = get_env("SLICER_LINUX_RUNTIME_COMPONENT_DIR");
+    const auto old_componentless = get_env("SLICER_LINUX_RUNTIME_ALLOW_COMPONENTLESS");
+    set_env("SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_dir);
+    set_env("SLICER_LINUX_RUNTIME_ALLOW_COMPONENTLESS", "1");
+
+    std::string module_path = Slic3r::SlicerLinuxRuntime::runtime_library_path(component_folder);
+#if defined(_MSC_VER) || defined(_WIN32)
+    if (!boost::filesystem::exists(module_path))
+        module_path = get_libpath_in_current_directory(Slic3r::SlicerLinuxRuntime::runtime_module_stem());
+    wchar_t module_w[32768] = {0};
+    module_handle module = nullptr;
+    const int converted = ::MultiByteToWideChar(CP_UTF8, 0, module_path.c_str(), -1, module_w, static_cast<int>(std::size(module_w)));
+    if (converted > 0)
+        module = ::LoadLibraryW(module_w);
+#else
+    module_handle module = dlopen(module_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+
+    if (!module && error) {
+#if defined(_MSC_VER) || defined(_WIN32)
+        *error = "Failed to load Linux runtime forwarder: " + module_path + ", error=" + std::to_string(::GetLastError());
+#else
+        const char* dl_error = dlerror();
+        *error = "Failed to load Linux runtime forwarder: " + module_path + ": " + (dl_error ? dl_error : "unknown error");
+#endif
+    }
+
+    const int result = invoke(module);
+    if (module) {
+#if defined(_MSC_VER) || defined(_WIN32)
+        ::FreeLibrary(module);
+#else
+        dlclose(module);
+#endif
+    }
+
+    restore_env("SLICER_LINUX_RUNTIME_ALLOW_COMPONENTLESS", old_componentless);
+    restore_env("SLICER_LINUX_RUNTIME_COMPONENT_DIR", old_component_dir);
+    return result;
+}
+
+int BBLNetworkPlugin::linux_runtime_http_get(
+    const std::string& url,
+    const std::map<std::string, std::string>& headers,
+    unsigned int* http_status,
+    std::string* body,
+    std::string* error)
+{
+    std::vector<std::string> header_lines;
+    header_lines.reserve(headers.size());
+    for (const auto& [name, value] : headers)
+        header_lines.push_back(name + ": " + value);
+    std::string response_headers;
+    std::string primary_ip;
+    const int rc = linux_runtime_http_request("GET", url, header_lines, {}, {}, {},
+        512ULL * 1024ULL * 1024ULL, 15000, 600000,
+        nullptr, nullptr, nullptr,
+        http_status, body, &response_headers, &primary_ip, error);
+    if (rc == 0 && http_status && (*http_status < 200 || *http_status >= 300)) {
+        if (error)
+            *error = "HTTP status " + std::to_string(*http_status);
+        return -1;
+    }
+    return rc;
 }
 
 // ============================================================================
@@ -163,7 +349,15 @@ BBLNetworkPlugin::~BBLNetworkPlugin()
 
 int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
 {
+    std::unique_lock<std::shared_mutex> module_lock(g_network_module_lifetime_mutex);
     clear_load_error();
+
+    if (m_networking_module) {
+        load_all_function_pointers();
+        if (!IsFTModuleInitialized())
+            InitFTModule(m_networking_module, 1);
+        return 0;
+    }
 
     std::string library;
     std::string data_dir_str = data_dir();
@@ -177,15 +371,17 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
     const bool linux_runtime = Slic3r::SlicerLinuxRuntime::enabled();
 
     if (linux_runtime) {
-        const std::string runtime_expected_abi = BAMBU_NETWORK_AGENT_VERSION;
+        {
+            std::lock_guard<std::mutex> environment_lock(g_runtime_environment_mutex);
 #if defined(_MSC_VER) || defined(_WIN32)
-        _putenv_s("SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_folder.string().c_str());
-        _putenv_s("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION", runtime_expected_abi.c_str());
+            _putenv_s("SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_folder.string().c_str());
+            _putenv_s("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION", "");
 #else
-        setenv("SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_folder.string().c_str(), 1);
-        setenv("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION", runtime_expected_abi.c_str(), 1);
+            setenv("SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_folder.string().c_str(), 1);
+            unsetenv("SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION");
 #endif
-        BOOST_LOG_TRIVIAL(info) << "BBLNetworkPlugin::initialize: Linux runtime expected ABI=" << runtime_expected_abi
+        }
+        BOOST_LOG_TRIVIAL(info) << "BBLNetworkPlugin::initialize: Linux runtime will use the ABI reported by the downloaded plug-in"
                                 << ", requested plugin version=" << version;
         std::string preflight_reason;
         if (!runtime_component_preflight(component_folder, &preflight_reason)) {
@@ -210,32 +406,49 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
         return -1;
     }
 
+    if (!linux_runtime && is_legacy_version(version)) {
+        boost::filesystem::path versioned_path;
+        boost::filesystem::path legacy_path;
+#if defined(_MSC_VER) || defined(_WIN32)
+        versioned_path = component_folder / (std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + ".dll");
+        legacy_path = component_folder / (std::string(BAMBU_NETWORK_LIBRARY) + ".dll");
+#elif defined(__WXMAC__)
+        versioned_path = component_folder / (std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + ".dylib");
+        legacy_path = component_folder / (std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + ".dylib");
+#else
+        versioned_path = component_folder / (std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + ".so");
+        legacy_path = component_folder / (std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + ".so");
+#endif
+        if (!boost::filesystem::exists(versioned_path) && boost::filesystem::exists(legacy_path)) {
+            try {
+                boost::filesystem::copy_file(legacy_path, versioned_path);
+            } catch (const std::exception& e) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": failed to migrate legacy library: " << e.what();
+            }
+        }
+    }
+
 #if defined(_MSC_VER) || defined(_WIN32)
     if (linux_runtime) {
         library = Slic3r::SlicerLinuxRuntime::runtime_library_path(component_folder);
-        wchar_t lib_wstr[512];
-        memset(lib_wstr, 0, sizeof(lib_wstr));
-        ::MultiByteToWideChar(CP_UTF8, 0, library.c_str(), int(library.size()) + 1, lib_wstr, int(sizeof(lib_wstr) / sizeof(lib_wstr[0])));
-        m_networking_module = LoadLibrary(lib_wstr);
+        wchar_t lib_wstr[512] = {0};
+        ::MultiByteToWideChar(CP_UTF8, 0, library.c_str(), -1, lib_wstr, static_cast<int>(std::size(lib_wstr)));
+        m_networking_module = LoadLibraryW(lib_wstr);
     } else {
-        library = component_folder.string() + "\\" + std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + ".dll";
-        wchar_t lib_wstr[256];
-        memset(lib_wstr, 0, sizeof(lib_wstr));
-        ::MultiByteToWideChar(CP_UTF8, NULL, library.c_str(), strlen(library.c_str()) + 1, lib_wstr, sizeof(lib_wstr) / sizeof(lib_wstr[0]));
-        m_networking_module = LoadLibrary(lib_wstr);
+        const std::string versioned_name = std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + ".dll";
+        library = using_backup ? (component_folder / versioned_name).string() : resolve_library_path(version);
+        wchar_t lib_wstr[512] = {0};
+        ::MultiByteToWideChar(CP_UTF8, 0, library.c_str(), -1, lib_wstr, static_cast<int>(std::size(lib_wstr)));
+        m_networking_module = LoadLibraryW(lib_wstr);
         if (!m_networking_module) {
-            std::string library_path = get_libpath_in_current_directory(std::string(BAMBU_NETWORK_LIBRARY));
-            if (library_path.empty()) {
-                set_load_error(
-                    "Network library not found",
-                    "Could not locate versioned library: " + library,
-                    library
-                );
-                return -1;
+            const std::string library_path = get_libpath_in_current_directory(std::string(BAMBU_NETWORK_LIBRARY));
+            if (!library_path.empty()) {
+                memset(lib_wstr, 0, sizeof(lib_wstr));
+                ::MultiByteToWideChar(CP_UTF8, 0, library_path.c_str(), -1, lib_wstr, static_cast<int>(std::size(lib_wstr)));
+                m_networking_module = LoadLibraryW(lib_wstr);
+                if (m_networking_module)
+                    library = library_path;
             }
-            memset(lib_wstr, 0, sizeof(lib_wstr));
-            ::MultiByteToWideChar(CP_UTF8, NULL, library_path.c_str(), strlen(library_path.c_str()) + 1, lib_wstr, sizeof(lib_wstr) / sizeof(lib_wstr[0]));
-            m_networking_module = LoadLibrary(lib_wstr);
         }
     }
 #else
@@ -248,12 +461,12 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
     #else
         const std::string lib_ext = ".so";
     #endif
-        library = component_folder.string() + "/" + std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + lib_ext;
+        const std::string versioned_name = std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + "_" + version + lib_ext;
+        library = using_backup ? (component_folder / versioned_name).string() : resolve_library_path(version);
         m_networking_module = dlopen(library.c_str(), RTLD_LAZY);
 
         if (!m_networking_module) {
-            const std::string fallback_library = component_folder.string() + "/" + std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + lib_ext;
-
+            const std::string fallback_library = (component_folder / (std::string("lib") + std::string(BAMBU_NETWORK_LIBRARY) + lib_ext)).string();
             if (boost::filesystem::exists(fallback_library)) {
                 BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": versioned component missing, trying fallback " << fallback_library;
                 dlerror();
@@ -288,15 +501,29 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
         return -1;
     }
 
-    InitFTModule(m_networking_module);
+    try {
+        InitFTModule(m_networking_module, 1);
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "BBLNetworkPlugin::initialize: file-transfer initialization failed: " << e.what();
+        set_load_error(
+            "Network plug-in is incompatible",
+            e.what(),
+            library
+        );
+        unload_unlocked();
+        return -1;
+    }
 
     load_all_function_pointers();
 
-    m_use_legacy_network = NetworkAgent::use_legacy_network;
+    m_use_legacy_network = is_legacy_version(version);
 
     std::string loaded_version;
     if (m_get_version) {
         loaded_version = m_get_version();
+        if (!loaded_version.empty()) {
+            m_use_legacy_network = is_legacy_version(loaded_version);
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << "BBLNetworkPlugin::initialize: legacy_mode="
@@ -328,7 +555,7 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
             detail,
             library
         );
-        unload();
+        unload_unlocked();
         return -1;
     }
 
@@ -337,7 +564,40 @@ int BBLNetworkPlugin::initialize(bool using_backup, const std::string& version)
 
 int BBLNetworkPlugin::unload()
 {
-    UnloadFTModule();
+    std::unique_lock<std::shared_mutex> module_lock(g_network_module_lifetime_mutex);
+    return unload_unlocked();
+}
+
+int BBLNetworkPlugin::unload_unlocked()
+{
+    if (active_source_tunnels() != 0) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": BambuSource tunnels are still active";
+        return -3;
+    }
+
+    destroy_agent_unlocked();
+
+    if (active_forwarder_callbacks() != 0) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": main-thread callbacks are still queued";
+        return -4;
+    }
+    if (!UnloadFTModule()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": file-transfer objects are still active";
+        return -2;
+    }
+
+    if (m_networking_module) {
+        using forwarder_shutdown_fn = void (*)();
+#if defined(_MSC_VER) || defined(_WIN32)
+        auto shutdown_forwarder = reinterpret_cast<forwarder_shutdown_fn>(
+            GetProcAddress(m_networking_module, "slicer_linux_runtime_forwarder_shutdown"));
+#else
+        auto shutdown_forwarder = reinterpret_cast<forwarder_shutdown_fn>(
+            dlsym(m_networking_module, "slicer_linux_runtime_forwarder_shutdown"));
+#endif
+        if (shutdown_forwarder)
+            shutdown_forwarder();
+    }
 
 #if defined(_MSC_VER) || defined(_WIN32)
     const bool same_handles = m_source_module && (m_source_module == m_networking_module);
@@ -364,12 +624,40 @@ int BBLNetworkPlugin::unload()
     m_source_module = NULL;
     clear_all_function_pointers();
 
+    m_use_legacy_network = false;
+
     return 0;
 }
 
 bool BBLNetworkPlugin::is_loaded() const
 {
     return m_networking_module != nullptr;
+}
+
+int BBLNetworkPlugin::active_source_tunnels() const
+{
+    if (!m_networking_module)
+        return 0;
+    using active_tunnels_fn = int (*)();
+#if defined(_MSC_VER) || defined(_WIN32)
+    auto fn = reinterpret_cast<active_tunnels_fn>(GetProcAddress(m_networking_module, "slicer_linux_runtime_forwarder_active_tunnels"));
+#else
+    auto fn = reinterpret_cast<active_tunnels_fn>(dlsym(m_networking_module, "slicer_linux_runtime_forwarder_active_tunnels"));
+#endif
+    return fn ? fn() : 0;
+}
+
+int BBLNetworkPlugin::active_forwarder_callbacks() const
+{
+    if (!m_networking_module)
+        return 0;
+    using active_callbacks_fn = int (*)();
+#if defined(_MSC_VER) || defined(_WIN32)
+    auto fn = reinterpret_cast<active_callbacks_fn>(GetProcAddress(m_networking_module, "slicer_linux_runtime_forwarder_active_callbacks"));
+#else
+    auto fn = reinterpret_cast<active_callbacks_fn>(dlsym(m_networking_module, "slicer_linux_runtime_forwarder_active_callbacks"));
+#endif
+    return fn ? fn() : 0;
 }
 
 std::string BBLNetworkPlugin::get_version() const
@@ -400,23 +688,31 @@ std::string BBLNetworkPlugin::get_version() const
 
 void* BBLNetworkPlugin::create_agent(const std::string& log_dir)
 {
-    if (m_agent) {
+    std::unique_lock<std::shared_mutex> module_lock(g_network_module_lifetime_mutex);
+    return create_agent_unlocked(log_dir);
+}
+
+void* BBLNetworkPlugin::create_agent_unlocked(const std::string& log_dir)
+{
+    if (m_agent)
         return m_agent;
-    }
-
-    if (m_create_agent) {
+    if (m_create_agent)
         m_agent = m_create_agent(log_dir);
-    }
-
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": created agent " << m_agent;
     return m_agent;
 }
 
 int BBLNetworkPlugin::destroy_agent()
 {
+    std::unique_lock<std::shared_mutex> module_lock(g_network_module_lifetime_mutex);
+    return destroy_agent_unlocked();
+}
+
+int BBLNetworkPlugin::destroy_agent_unlocked()
+{
     int ret = 0;
-    if (m_agent && m_destroy_agent) {
+    if (m_agent && m_destroy_agent)
         ret = m_destroy_agent(m_agent);
-    }
     m_agent = nullptr;
     return ret;
 }
@@ -528,14 +824,35 @@ std::string BBLNetworkPlugin::get_versioned_library_path(const std::string& vers
 #endif
 }
 
+std::string BBLNetworkPlugin::resolve_library_path(const std::string& version)
+{
+    std::string exact = get_versioned_library_path(version);
+    if (boost::filesystem::exists(exact))
+        return exact;
+
+    // A bare series (02.08.01) is physically present only as a specific build (02.08.01.53) when
+    // the startup file-rename was skipped or failed. Resolve to the newest same-series build
+    // actually on disk. Custom and legacy names are exact and never resolved.
+    if (is_series_managed_version(version)) {
+        const std::string series = network_plugin_series(version);
+        std::string best;
+        for (const auto& v : scan_plugin_versions())
+            if (is_series_managed_version(v) && network_plugin_series(v) == series && (best.empty() || v > best))
+                best = v;
+        if (!best.empty())
+            return get_versioned_library_path(best);
+    }
+
+    return exact; // nonexistent -> caller downloads
+}
+
 bool BBLNetworkPlugin::versioned_library_exists(const std::string& version)
 {
     if (version.empty()) return false;
-    std::string path = get_versioned_library_path(version);
 
-    if (boost::filesystem::exists(path)) return true;
+    if (boost::filesystem::exists(resolve_library_path(version))) return true;
 
-    if (version == BAMBU_NETWORK_AGENT_VERSION_LEGACY) {
+    if (is_legacy_version(version)) {
         return legacy_library_exists();
     }
 
@@ -802,6 +1119,16 @@ void BBLNetworkPlugin::load_all_function_pointers()
     m_get_mw_user_preference = reinterpret_cast<func_get_mw_user_preference>(get_function("bambu_network_get_mw_user_preference"));
     m_get_mw_user_4ulist = reinterpret_cast<func_get_mw_user_4ulist>(get_function("bambu_network_get_mw_user_4ulist"));
     m_get_hms_snapshot = reinterpret_cast<func_get_hms_snapshot>(get_function("bambu_network_get_hms_snapshot"));
+    m_sync_ams_filaments = reinterpret_cast<func_sync_ams_filaments>(get_function("bambu_network_sync_ams_filaments"));
+    m_linux_auth_start = reinterpret_cast<func_linux_auth_start>(get_function("slicer_linux_runtime_auth_start"));
+    m_linux_auth_start_v2 = reinterpret_cast<func_linux_auth_start_v2>(get_function("slicer_linux_runtime_auth_start_v2"));
+    m_linux_auth_status = reinterpret_cast<func_linux_auth_status>(get_function("slicer_linux_runtime_auth_status"));
+    m_linux_auth_cancel = reinterpret_cast<func_linux_auth_cancel>(get_function("slicer_linux_runtime_auth_cancel"));
+    m_linux_auth_capabilities = reinterpret_cast<func_linux_auth_capabilities>(get_function("slicer_linux_runtime_auth_capabilities"));
+    m_linux_browser_start = reinterpret_cast<func_linux_browser_start>(get_function("slicer_linux_runtime_browser_start"));
+    m_linux_browser_status = reinterpret_cast<func_linux_browser_status>(get_function("slicer_linux_runtime_browser_status"));
+    m_linux_browser_command = reinterpret_cast<func_linux_browser_command>(get_function("slicer_linux_runtime_browser_command"));
+    m_linux_browser_cancel = reinterpret_cast<func_linux_browser_cancel>(get_function("slicer_linux_runtime_browser_cancel"));
 }
 
 void BBLNetworkPlugin::clear_all_function_pointers()
@@ -914,64 +1241,86 @@ void BBLNetworkPlugin::clear_all_function_pointers()
     m_get_mw_user_preference = nullptr;
     m_get_mw_user_4ulist = nullptr;
     m_get_hms_snapshot = nullptr;
+    m_sync_ams_filaments = nullptr;
+    m_linux_auth_start = nullptr;
+    m_linux_auth_start_v2 = nullptr;
+    m_linux_auth_status = nullptr;
+    m_linux_auth_cancel = nullptr;
+    m_linux_auth_capabilities = nullptr;
+    m_linux_browser_start = nullptr;
+    m_linux_browser_status = nullptr;
+    m_linux_browser_command = nullptr;
+    m_linux_browser_cancel = nullptr;
 }
 
 std::vector<NetworkLibraryVersionInfo> get_all_available_versions()
 {
+    // get_version() reports the "00.00.00.00" sentinel when nothing is loaded; resolve
+    // that here so the list builder only ever sees a real version or an empty string.
+    const BBLNetworkPlugin& plugin = BBLNetworkPlugin::instance();
+    return get_all_available_versions(plugin.is_loaded() ? plugin.get_version() : std::string());
+}
+
+std::vector<NetworkLibraryVersionInfo> get_all_available_versions(const std::string& loaded_version)
+{
     std::vector<NetworkLibraryVersionInfo> result;
-    std::set<std::string> known_base_versions;
     std::set<std::string> all_known_versions;
 
     for (size_t i = 0; i < AVAILABLE_NETWORK_VERSIONS_COUNT; ++i) {
         result.push_back(NetworkLibraryVersionInfo::from_static(AVAILABLE_NETWORK_VERSIONS[i]));
-        known_base_versions.insert(AVAILABLE_NETWORK_VERSIONS[i].version);
         all_known_versions.insert(AVAILABLE_NETWORK_VERSIONS[i].version);
     }
 
     std::vector<std::string> discovered = BBLNetworkPlugin::scan_plugin_versions();
 
-    std::vector<std::pair<std::string, std::string>> suffixed_versions;
-
+    // A managed build (pure dotted-numeric AA.BB.CC[.DD]) is represented by its series entry
+    // above - the OTA-installed 02.08.01.53 and a bare 02.08.01 both collapse into the single
+    // 02.08.01 row. Only a custom-named build a user dropped in (02.08.01_custom, ..-dev) earns
+    // its own row, and only when its series is one this build can actually load. The part past
+    // the series is stored as the "suffix" so the entry sorts and renders nested under it.
     for (const auto& version : discovered) {
         if (all_known_versions.count(version) > 0)
             continue;
-
-        std::string base = extract_base_version(version);
-        std::string suffix = extract_suffix(version);
-
-        if (suffix.empty())
+        if (is_series_managed_version(version))
             continue;
-
-        if (known_base_versions.count(base) == 0)
+        if (!is_supported_network_version(version))
             continue;
-
-        suffixed_versions.emplace_back(base, version);
+        const std::string series = network_plugin_series(version);
+        const std::string sfx    = version.size() > series.size() ? version.substr(series.size()) : version;
+        result.push_back(NetworkLibraryVersionInfo::from_discovered(version, series, sfx));
         all_known_versions.insert(version);
     }
 
-    std::sort(suffixed_versions.begin(), suffixed_versions.end(),
-              [](const auto& a, const auto& b) {
-                  if (a.first != b.first) return a.first > b.first;
-                  return a.second < b.second;
+    // Newest first. Version components are fixed-width and zero-padded, so a plain
+    // string compare orders them numerically, and the legacy series sorts last on its
+    // own. Suffixed dev builds sort directly under the base version they build on.
+    std::sort(result.begin(), result.end(),
+              [](const NetworkLibraryVersionInfo& a, const NetworkLibraryVersionInfo& b) {
+                  if (a.base_version != b.base_version) return a.base_version > b.base_version;
+                  return a.suffix < b.suffix;
               });
 
-    for (const auto& [base, full] : suffixed_versions) {
-        size_t insert_pos = 0;
-        for (size_t i = 0; i < result.size(); ++i) {
-            if (result[i].base_version == base) {
-                insert_pos = i + 1;
-                while (insert_pos < result.size() &&
-                       result[insert_pos].base_version == base) {
-                    ++insert_pos;
-                }
-                break;
-            }
-        }
-
-        std::string sfx = extract_suffix(full);
-        result.insert(result.begin() + insert_pos,
-                      NetworkLibraryVersionInfo::from_discovered(full, base, sfx));
+    const std::string loaded_series = network_plugin_series(loaded_version);
+    for (auto& info : result) {
+        // A managed (series) entry matches when a managed build of the same series is loaded -
+        // the loaded plug-in reports its full build (02.08.01.53) but the row is the series.
+        // Custom and legacy entries match their exact reported version.
+        info.is_loaded = !loaded_version.empty() &&
+            (info.version == loaded_version ||
+             (is_series_managed_version(info.version) && is_series_managed_version(loaded_version) &&
+              network_plugin_series(info.version) == loaded_series));
+        info.is_latest = false;
     }
+
+    // "(Latest)" goes on the highest full version in the list, which after the sort is
+    // simply the first entry without a dev suffix - an OTA-installed build can be newer
+    // than the newest whitelisted entry. get_latest_network_version() intentionally
+    // keeps returning the static whitelist default, which drives the download and
+    // update-check decisions.
+    auto latest = std::find_if(result.begin(), result.end(),
+                               [](const NetworkLibraryVersionInfo& info) { return info.suffix.empty(); });
+    if (latest != result.end())
+        latest->is_latest = true;
 
     return result;
 }

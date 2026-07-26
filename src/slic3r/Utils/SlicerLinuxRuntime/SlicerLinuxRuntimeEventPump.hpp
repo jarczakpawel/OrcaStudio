@@ -6,6 +6,7 @@ class EventPump {
 public:
     static EventPump& instance();
     void ensure_started();
+    void request_stop();
     void stop();
 
 private:

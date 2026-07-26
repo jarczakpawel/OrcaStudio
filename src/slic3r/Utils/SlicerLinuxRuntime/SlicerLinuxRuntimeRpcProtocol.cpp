@@ -10,6 +10,7 @@ namespace {
 
 constexpr std::uint32_t k_magic = 0x52424a50u;
 constexpr std::size_t k_header_size = 16;
+constexpr std::size_t k_max_frame_size = 1024ULL * 1024ULL * 1024ULL;
 
 void write_u32_le(unsigned char* dst, std::uint32_t value)
 {
@@ -37,7 +38,7 @@ bool read_exact(std::istream& in, void* data, std::size_t size)
 
 bool write_raw_frame(std::ostream& out, RpcFrameType type, int id, const void* data, std::size_t size)
 {
-    if (size > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()))
+    if (size > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) || size > k_max_frame_size)
         return false;
 
     std::array<unsigned char, k_header_size> header{};
@@ -76,6 +77,10 @@ bool read_raw_frame(std::istream& in, RawRpcFrame& frame, std::string& error)
     frame.type = static_cast<RpcFrameType>(read_u32_le(header.data() + 4));
     frame.id = static_cast<int>(read_u32_le(header.data() + 8));
     const auto size = static_cast<std::size_t>(read_u32_le(header.data() + 12));
+    if (size > k_max_frame_size) {
+        error = "frame payload exceeds runtime limit";
+        return false;
+    }
 
     frame.payload.assign(size, 0);
     if (size != 0 && !read_exact(in, frame.payload.data(), size)) {
@@ -123,8 +128,12 @@ bool read_request_frame(const RawRpcFrame& raw, RpcFrame& frame, std::string& er
     if (!read_json_frame(raw, payload, error))
         return false;
 
+    if (!payload.is_object() || !payload.contains("method") || !payload["method"].is_string()) {
+        error = "invalid request payload";
+        return false;
+    }
     frame.id = raw.id;
-    frame.method = payload.value("method", std::string());
+    frame.method = payload["method"].get<std::string>();
     frame.payload = payload.contains("payload") ? payload["payload"] : nlohmann::json::object();
     return true;
 }

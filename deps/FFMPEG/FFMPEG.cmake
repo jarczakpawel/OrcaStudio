@@ -26,9 +26,13 @@ else ()
     string(APPEND _extra_cmd "--enable-nonfree")
 
     if (APPLE)
-        set(_minos_cmd
-            "CFLAGS=-mmacosx-version-min=${DEP_OSX_TARGET}"
-            "LDFLAGS=-mmacosx-version-min=${DEP_OSX_TARGET}"
+        # Build relocatable dylibs at the source instead of relying on
+        # install_name_tool to grow fixed-size Mach-O load-command tables later.
+        # The deployment flag applies to both native arm64 and cross-built x86_64.
+        set(_darwin_cmd
+            --install-name-dir=@rpath
+            "--extra-cflags=-mmacosx-version-min=${DEP_OSX_TARGET}"
+            "--extra-ldflags=-mmacosx-version-min=${DEP_OSX_TARGET} -Wl,-headerpad_max_install_names"
         )
         if (IS_CROSS_COMPILE)
             set(_cross_cmd --enable-cross-compile)
@@ -57,6 +61,7 @@ else ()
             ${_pic_cmd}
             ${_arch_cmd}
             ${_cc_cmd}
+            ${_darwin_cmd}
             --prefix="${DESTDIR}"
             --enable-shared
             --disable-doc

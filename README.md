@@ -73,9 +73,24 @@ Install and run normally.
 
 ### macOS
 
-Nothing needs to be installed manually.
+1. Open the downloaded DMG.
+2. Drag `OrcaStudio.app` to the `Applications` folder.
+3. Start OrcaStudio from `Applications`.
 
 On first use, the application will ask to install the local Linux runtime.
+
+The public macOS builds are currently ad-hoc signed because this project does not have an Apple Developer ID certificate and Apple notarization credentials. macOS may therefore display a message that Apple cannot verify the application.
+
+First try Control-clicking `OrcaStudio.app`, selecting **Open**, and confirming **Open**. You can also use **System Settings -> Privacy & Security -> Open Anyway**.
+
+If macOS still blocks the application after it has been copied to `Applications`, run this once in Terminal:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/OrcaStudio.app"
+open "/Applications/OrcaStudio.app"
+```
+
+This removes quarantine only from OrcaStudio. Do not disable Gatekeeper globally.
 
 ## Removing the runtime
 
@@ -127,13 +142,15 @@ rm -rf "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-ru
 
 ## What was done
 
-* Updated to OrcaSlicer as of June 14, 2026, up to commit [`9bcee518f859205fbcf3455c4f89fce5c606049c`](https://github.com/SoftFever/OrcaSlicer/commit/9bcee518f859205fbcf3455c4f89fce5c606049c) + added OrcaSlicer commits [`e700113b39f39b837175c680929538aa9655a9f9`](https://github.com/SoftFever/OrcaSlicer/commit/e700113b39f39b837175c680929538aa9655a9f9) and [`5ed8f5ef258898a4006677bab8a3f2e412adedec`](https://github.com/SoftFever/OrcaSlicer/commit/5ed8f5ef258898a4006677bab8a3f2e412adedec).
+* Updated to OrcaSlicer through [commit `d6cb667b894f71f68a180861b549f49258cf3a2a`](https://github.com/OrcaSlicer/OrcaSlicer/commit/d6cb667b894f71f68a180861b549f49258cf3a2a).
 * Restored BambuNetwork support through the Linux `bambu_networking` path.
 * Added Windows WSL2 runtime support.
 * Added macOS Lima runtime support.
 * Fixed macOS runtime integration, including printer connection, file browsing and camera preview.
+* Removed non-portable macOS build-runner `LC_RPATH` entries and added distribution checks for packaged Mach-O files.
 * Added experimental Bambu Lab A2L printer support - it has not been tested.
 * Fixed the issue that appears when using BMCU with A1 / A1-mini printers on firmware `01.08.01.00` and `01.08.00.00`.
+* HMS notifications remain dismissible and never use modal retry-failure dialogs; BMCU print retries can be started again without restarting OrcaStudio.
 * Fixed the known integration issues from this fork.
 
 ## **Special thanks**

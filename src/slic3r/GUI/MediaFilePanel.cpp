@@ -538,7 +538,7 @@ void MediaFilePanel::fetchUrl(boost::weak_ptr<PrinterFileSystem> wfs)
         return;
     }
     if (!m_remote_proto && m_local_proto) { // not support tutk
-        m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the IP of printer to connect."));
+        m_image_grid->SetStatus(m_bmp_failed, _L("Please enter the IP of the printer to connect."));
         fs->SetUrl("0");
         fs.reset();
         if (wxGetApp().show_modal_ip_address_enter_dialog(false, _L("LAN Connection Failed (Failed to view sdcard)"))) {
@@ -607,6 +607,7 @@ void MediaFilePanel::fetchUrl(boost::weak_ptr<PrinterFileSystem> wfs)
         if (ret != 0) {
             (*apply_url)("[" + std::to_string(ret) + "]");
         }
+
     }
 }
 
@@ -642,7 +643,7 @@ void MediaFilePanel::doAction(size_t index, int action)
     } else if (action == 1) {
         if (fs->GetFileType() == PrinterFileSystem::F_MODEL) {
             if (index != -1) {
-                auto dlg = new MediaProgressDialog(_L("Print"), this, [fs] { fs->FetchModelCancel(); });
+                auto dlg = new MediaProgressDialog(_L_CONTEXT("Print", "Verb"), this, [fs] { fs->FetchModelCancel(); });
                 dlg->Update(0, _L("Fetching model information..."));
                 fs->FetchModel(index, [this, fs, dlg, index](int result, std::string const &data) {
                     dlg->Destroy();
@@ -652,7 +653,7 @@ void MediaFilePanel::doAction(size_t index, int action)
                         wxString msg = data.empty() ? _L("Failed to fetch model information from printer.") :
                                                       from_u8(data);
                         CallAfter([this, msg] {
-                            MessageDialog(this, msg, _L("Print"), wxOK).ShowModal();
+                            MessageDialog(this, msg, _L_CONTEXT("Print", "Verb"), wxOK).ShowModal();
                         });
                         return;
                     }
@@ -665,7 +666,7 @@ void MediaFilePanel::doAction(size_t index, int action)
                             || plate_data_list.empty()) {
                         MessageDialog(this,
                             _L("Failed to parse model information."),
-                            _L("Print"), wxOK).ShowModal();
+                            _L_CONTEXT("Print", "Verb"), wxOK).ShowModal();
                         return;
                     }
 

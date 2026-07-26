@@ -8,4 +8,4 @@ grep -q org.freedesktop.Platform.GL.nvidia /.flatpak-info && export WEBKIT_DISAB
 # while preserving the user's language/locale for translations.
 export LC_NUMERIC=C
 
-exec /app/bin/bambu-studio "$@"
+exec /app/bin/orca-studio "$@"

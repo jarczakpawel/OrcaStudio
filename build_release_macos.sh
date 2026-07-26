@@ -59,7 +59,7 @@ while getopts ":dpa:snt:xbc:i:1Tuh" opt; do
         echo "   -c: Set CMake build configuration, default is Release"
         echo "   -i: Add a prefix to ignore during CMake dependency discovery (repeatable), defaults to /opt/local:/usr/local:/opt/homebrew"
         echo "   -1: Use single job for building"
-        echo "   -T: Build and run tests"
+        echo "   -T: Build and run tests (set ORCA_TESTS_BUILD_ONLY=1 to build without running)"
         exit 0
         ;;
     * )
@@ -149,7 +149,8 @@ if [ "$BUILD_TARGET" = "all" ] || [ "$BUILD_TARGET" = "deps" ]; then
   echo " - M4: $M4"
 fi
 
-CMAKE_VERSION=$(cmake --version | head -1 | sed 's/[^0-9]*\([0-9]*\).*/\1/')
+CMAKE_VERSION_OUTPUT=$(cmake --version)
+CMAKE_VERSION=$(awk 'NR == 1 { line=$0; sub(/^[^0-9]*/, "", line); sub(/[^0-9].*$/, "", line); print line }' <<< "$CMAKE_VERSION_OUTPUT")
 if [ "$CMAKE_VERSION" -ge 4 ] 2>/dev/null; then
   export CMAKE_POLICY_VERSION_MINIMUM=3.5
   export CMAKE_POLICY_COMPAT="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
@@ -183,8 +184,10 @@ echo
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_BUILD_DIR="$PROJECT_DIR/build/$ARCH"
 DEPS_DIR="$PROJECT_DIR/deps"
-APP_BUNDLE_NAME="BambuStudio.app"
-LEGACY_APP_BUNDLE_NAME="OrcaSlicer.app"
+APP_BUNDLE_NAME="OrcaStudio.app"
+PACKAGE_OUTPUT_DIR_NAME="OrcaStudio"
+LEGACY_APP_BUNDLE_NAME="BambuStudio.app"
+SECONDARY_LEGACY_APP_BUNDLE_NAME="OrcaSlicer.app"
 
 # For Multi-config generators like Ninja and Xcode
 export BUILD_DIR_CONFIG_SUBDIR="/$BUILD_CONFIG"
@@ -228,6 +231,66 @@ function pack_deps() {
     )
 }
 
+# codesign cannot seal the runtime's dotted directories (include/python3.12,
+# lib/python3.12) anywhere under Contents/MacOS -- it mistakes any dotted
+# directory there for a nested bundle and fails with "bundle format
+# unrecognized" -- so packaged apps ship the runtime under Contents/Resources
+# with a compatibility symlink that keeps every Contents/MacOS/python path and
+# the @executable_path/python/lib rpath resolving unchanged.
+function relocate_python_runtime() {
+    local app="$1"
+    local pydir="$app/Contents/MacOS/python"
+    if [ -d "$pydir" ] && [ ! -L "$pydir" ]; then
+        rm -rf "$app/Contents/Resources/python"
+        mv "$pydir" "$app/Contents/Resources/python"
+        ln -s ../Resources/python "$pydir"
+    fi
+}
+
+# --- Bundled Python runtime verification --------------------------------------
+# Relocation is handled at the source: deps/python3/python3.cmake stamps
+# libpython with an @rpath id and src/CMakeLists.txt gives the app a matching
+# rpath. This gate catches regressions that would otherwise only surface as
+# launch failures on end users' machines (the absolute deps path still exists
+# on the build host, so a plain run can pass while relocation is broken --
+# hence the otool checks). The x86_64 leg runs under Rosetta on arm64 hosts.
+function verify_python_runtime() {
+    local app="$1"
+    local pydir="$app/Contents/MacOS/python"
+    [ -d "$pydir" ] || return 0  # app doesn't bundle Python (e.g. profile validator)
+    if [ ! -L "$pydir" ]; then
+        echo "ERROR: Contents/MacOS/python must be a symlink into Contents/Resources" >&2
+        echo "       (see relocate_python_runtime in this script)" >&2
+        exit 1
+    fi
+    # Version-agnostic interpreter name so a CPython version bump cannot
+    # silently skip the gate; if the dir exists the interpreter must too.
+    local pybin="$pydir/bin/python3"
+    if [ ! -x "$pybin" ]; then
+        echo "ERROR: bundled python/ present but no interpreter at $pybin" >&2
+        exit 1
+    fi
+    echo "  Verifying bundled Python runtime in $(basename "$app")..."
+    local bad
+    bad=$(otool -arch all -L "$pybin" "$app/Contents/MacOS/OrcaStudio" | grep "libpython" | grep -v "@rpath/" || true)
+    if [ -n "$bad" ]; then
+        echo "ERROR: a bundled binary references libpython by absolute path (relocation regression):" >&2
+        echo "$bad" >&2
+        exit 1
+    fi
+    # otool -L shows load commands only; assert the consumer rpath separately.
+    # Its loss is masked on the build host by CMake's absolute build-tree rpath.
+    if ! otool -arch all -l "$app/Contents/MacOS/OrcaStudio" | grep -q "path @executable_path/python/lib "; then
+        echo "ERROR: OrcaStudio lacks the @executable_path/python/lib rpath (relocation regression)" >&2
+        exit 1
+    fi
+    if ! "$pybin" -c "import ssl"; then
+        echo "ERROR: bundled Python failed to start (libpython relocation broken," >&2
+        echo "       or missing Rosetta 2 for the x86_64 leg?)" >&2
+        exit 1
+    fi
+}
+
 function build_slicer() {
     # iterate over two architectures: x86_64 and arm64
     for _ARCH in x86_64 arm64; do
@@ -261,13 +324,10 @@ function build_slicer() {
             cmake --build . --config "$BUILD_CONFIG" --target "$SLICER_BUILD_TARGET"
         )
 
-        if [ "1." == "$BUILD_TESTS". ]; then
-            echo "Running tests for $_ARCH..."
-            (
-                set -x
-                cd "$PROJECT_BUILD_DIR"
-                ctest --build-config "$BUILD_CONFIG" --output-on-failure
-            )
+        # -T also runs the tests; ORCA_TESTS_BUILD_ONLY=1 builds them without
+        # running, so CI can build here and run them in a dedicated job.
+        if [ "1." == "$BUILD_TESTS". ] && [ "1." != "$ORCA_TESTS_BUILD_ONLY". ]; then
+            "$PROJECT_DIR/scripts/run_unit_tests.sh" "build/$_ARCH/tests" "$BUILD_CONFIG"
         fi
 
         echo "Verify localization with gettext..."
@@ -279,23 +339,31 @@ function build_slicer() {
         echo "Fix macOS app package..."
         (
             cd "$PROJECT_BUILD_DIR"
-            mkdir -p OrcaSlicer
-            cd OrcaSlicer
+            mkdir -p "$PACKAGE_OUTPUT_DIR_NAME"
+            cd "$PACKAGE_OUTPUT_DIR_NAME"
             built_app="../src$BUILD_DIR_CONFIG_SUBDIR/$APP_BUNDLE_NAME"
             if [ ! -d "$built_app" ]; then
                 built_app="../src$BUILD_DIR_CONFIG_SUBDIR/$LEGACY_APP_BUNDLE_NAME"
             fi
             if [ ! -d "$built_app" ]; then
-                echo "Built app bundle not found: $APP_BUNDLE_NAME or $LEGACY_APP_BUNDLE_NAME"
+                built_app="../src$BUILD_DIR_CONFIG_SUBDIR/$SECONDARY_LEGACY_APP_BUNDLE_NAME"
+            fi
+            if [ ! -d "$built_app" ]; then
+                echo "Built app bundle not found: $APP_BUNDLE_NAME, $LEGACY_APP_BUNDLE_NAME or $SECONDARY_LEGACY_APP_BUNDLE_NAME"
                 exit 1
             fi
-            rm -rf ./$APP_BUNDLE_NAME ./$LEGACY_APP_BUNDLE_NAME
+            rm -rf ./$APP_BUNDLE_NAME ./$LEGACY_APP_BUNDLE_NAME ./$SECONDARY_LEGACY_APP_BUNDLE_NAME
             cp -pR "$built_app" ./$APP_BUNDLE_NAME
             resources_path=$(readlink ./$APP_BUNDLE_NAME/Contents/Resources)
             rm ./$APP_BUNDLE_NAME/Contents/Resources
             cp -R "$resources_path" ./$APP_BUNDLE_NAME/Contents/Resources
+            relocate_python_runtime "./$APP_BUNDLE_NAME"
 
-            runtime_dst="./$APP_BUNDLE_NAME/Contents/MacOS/plugins"
+            runtime_dst="./$APP_BUNDLE_NAME/Contents/Resources/plugins"
+            runtime_compat_link="./$APP_BUNDLE_NAME/Contents/MacOS/plugins"
+            rm -rf "$runtime_dst" "$runtime_compat_link"
+            mkdir -p "$runtime_dst"
+            ln -s ../Resources/plugins "$runtime_compat_link"
             runtime_marker=""
             runtime_candidates=(
                 "../src/slic3r/Utils/SlicerLinuxRuntime$BUILD_DIR_CONFIG_SUBDIR/libslicer_linux_runtime.dylib"
@@ -330,6 +398,11 @@ function build_slicer() {
                 "slicer_linux_runtime_host"
                 "slicer_linux_runtime_host_abi1"
                 "slicer_linux_runtime_host_abi0"
+                "slicer_linux_auth_browser"
+                "slicer_linux_auth_browser_x86_64"
+                "slicer_linux_auth_browser_aarch64"
+                "run_auth_browser.sh"
+                "runtime-files.sha256"
                 "ca-certificates.crt"
                 "slicer_base64.cer"
                 "ld-linux-x86-64.so.2"
@@ -378,6 +451,10 @@ function build_slicer() {
                 "$runtime_dst/slicer_linux_runtime_host" \
                 "$runtime_dst/slicer_linux_runtime_host_abi1" \
                 "$runtime_dst/slicer_linux_runtime_host_abi0" \
+                "$runtime_dst/slicer_linux_auth_browser" \
+                "$runtime_dst/slicer_linux_auth_browser_x86_64" \
+                "$runtime_dst/slicer_linux_auth_browser_aarch64" \
+                "$runtime_dst/run_auth_browser.sh" \
                 "$runtime_dst/ld-linux-x86-64.so.2"
 
             resources_cert_dst="./$APP_BUNDLE_NAME/Contents/Resources/cert"
@@ -425,15 +502,39 @@ function build_slicer() {
                 file "$target" | grep -q "Mach-O"
             }
 
+            list_macho_rpaths() {
+                local target="$1"
+                otool -l "$target" | awk '
+                    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+                    in_rpath && $1 == "path" {
+                        line = $0
+                        sub(/^[[:space:]]*path /, "", line)
+                        sub(/ \(offset [0-9]+\)$/, "", line)
+                        print line
+                        in_rpath = 0
+                    }
+                '
+            }
+
             add_rpath_if_missing() {
                 local target="$1"
                 local rpath="$2"
                 is_macho_file "$target" || return 0
-                otool -l "$target" | awk '
-                    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
-                    in_rpath && $1 == "path" { print $2; in_rpath = 0 }
-                ' | grep -Fx "$rpath" >/dev/null 2>&1 && return 0
-                install_name_tool -add_rpath "$rpath" "$target" 2>/dev/null || true
+                list_macho_rpaths "$target" | grep -Fx "$rpath" >/dev/null 2>&1 && return 0
+                install_name_tool -add_rpath "$rpath" "$target"
+            }
+
+            remove_nonportable_rpaths() {
+                local target="$1"
+                local rpath
+                is_macho_file "$target" || return 0
+                while IFS= read -r rpath; do
+                    [ -n "$rpath" ] || continue
+                    case "$rpath" in
+                        @*) continue ;;
+                    esac
+                    install_name_tool -delete_rpath "$rpath" "$target"
+                done < <(list_macho_rpaths "$target" | awk '!seen[$0]++')
             }
 
             is_system_macos_dependency() {
@@ -456,9 +557,27 @@ function build_slicer() {
                 fi
             }
 
+            is_macho_rewrite_exempt() {
+                local target="$1"
+                case "$target" in
+                    */Contents/MacOS/tools/uv/uv|*/Contents/Resources/tools/uv/uv)
+                        return 0
+                        ;;
+                esac
+                return 1
+            }
+
             normalize_macho_file() {
                 local target="$1"
                 is_macho_file "$target" || return 0
+
+                # The pinned uv release binary is already self-contained and has
+                # no Mach-O header padding for additional LC_RPATH commands.
+                # Leave its load commands intact; later gates still inspect its
+                # dependencies/rpaths and sign it as a nested executable.
+                if is_macho_rewrite_exempt "$target"; then
+                    return 0
+                fi
 
                 case "$(basename "$target")" in
                     *.dylib)
@@ -466,6 +585,7 @@ function build_slicer() {
                         ;;
                 esac
 
+                remove_nonportable_rpaths "$target"
                 add_rpath_if_missing "$target" "@executable_path/../Frameworks"
                 add_rpath_if_missing "$target" "@loader_path"
                 add_rpath_if_missing "$target" "@loader_path/../Frameworks"
@@ -487,6 +607,10 @@ function build_slicer() {
 
                     while IFS= read -r -d '' macho_file; do
                         is_macho_file "$macho_file" || continue
+                        if is_macho_rewrite_exempt "$macho_file"; then
+                            echo "Preserving prebuilt Mach-O load commands: $macho_file"
+                            continue
+                        fi
                         normalize_macho_file "$macho_file"
 
                         while IFS= read -r dep; do
@@ -519,11 +643,42 @@ function build_slicer() {
                 done
 
                 while IFS= read -r -d '' macho_file; do
+                    is_macho_rewrite_exempt "$macho_file" && continue
                     normalize_macho_file "$macho_file"
                 done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
             }
 
             bundle_transitive_framework_deps
+
+            echo "Verifying that packaged Mach-O files do not reference build-host libraries..."
+            unresolved_macos_deps=0
+            while IFS= read -r -d '' candidate; do
+                is_macho_file "$candidate" || continue
+                while IFS= read -r dep; do
+                    [ -n "$dep" ] || continue
+                    case "$dep" in
+                        @rpath/*|@loader_path/*|@executable_path/*|/usr/lib/*|/System/Library/*)
+                            ;;
+                        *)
+                            echo "ERROR: unresolved external macOS dependency for $candidate: $dep" >&2
+                            unresolved_macos_deps=1
+                            ;;
+                    esac
+                done < <(otool -L "$candidate" | awk 'NR > 1 {print $1}')
+                while IFS= read -r rpath; do
+                    [ -n "$rpath" ] || continue
+                    case "$rpath" in
+                        @*) ;;
+                        *)
+                            echo "ERROR: non-portable macOS LC_RPATH for $candidate: $rpath" >&2
+                            unresolved_macos_deps=1
+                            ;;
+                    esac
+                done < <(list_macho_rpaths "$candidate")
+            done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
+            if [ "$unresolved_macos_deps" -ne 0 ]; then
+                exit 1
+            fi
 
             echo "macOS media/runtime dylib references after packaging:"
             while IFS= read -r -d '' candidate; do
@@ -534,6 +689,7 @@ function build_slicer() {
             done < <(find "./$APP_BUNDLE_NAME" -type f -print0)
 
             find ./$APP_BUNDLE_NAME/ -name '.DS_Store' -delete
+            verify_python_runtime "./$APP_BUNDLE_NAME"
             
             # Copy OrcaSlicer_profile_validator.app if it exists
             if [ -f "../src$BUILD_DIR_CONFIG_SUBDIR/OrcaSlicer_profile_validator.app/Contents/MacOS/OrcaSlicer_profile_validator" ]; then
@@ -542,23 +698,27 @@ function build_slicer() {
                 cp -pR "../src$BUILD_DIR_CONFIG_SUBDIR/OrcaSlicer_profile_validator.app" ./OrcaSlicer_profile_validator.app
                 # delete .DS_Store file
                 find ./OrcaSlicer_profile_validator.app/ -name '.DS_Store' -delete
+                verify_python_runtime ./OrcaSlicer_profile_validator.app
             fi
 
             sign_identity="${MACOS_CODESIGN_IDENTITY:-${CERTIFICATE_ID:-}}"
-            sign_args=(--force --deep --verbose)
             if [ -n "$sign_identity" ]; then
-                sign_args+=(--options runtime --timestamp --entitlements "$PROJECT_DIR/scripts/disable_validation.entitlements" --sign "$sign_identity")
-                echo "Signing macOS app with identity: $sign_identity"
+                echo "Signing macOS applications with identity: $sign_identity"
             else
-                sign_args+=(--sign -)
-                echo "Signing macOS app with ad-hoc identity"
+                sign_identity="-"
+                echo "Signing macOS applications with ad-hoc identity"
             fi
 
             if [ -d ./OrcaSlicer_profile_validator.app ]; then
-                codesign "${sign_args[@]}" ./OrcaSlicer_profile_validator.app
+                "$PROJECT_DIR/scripts/sign_macos_app.sh" \
+                    ./OrcaSlicer_profile_validator.app \
+                    "$sign_identity"
             fi
-            codesign "${sign_args[@]}" ./$APP_BUNDLE_NAME
-            codesign --verify --deep --strict --verbose=4 ./$APP_BUNDLE_NAME
+            "$PROJECT_DIR/scripts/sign_macos_app.sh" \
+                ./$APP_BUNDLE_NAME \
+                "$sign_identity" \
+                "$PROJECT_DIR/scripts/disable_validation.entitlements"
+            "$PROJECT_DIR/scripts/verify_macos_app_launch.sh" ./$APP_BUNDLE_NAME
         )
 
         # extract version
@@ -602,24 +762,25 @@ function build_universal() {
     echo "Building universal binary..."
 
     PROJECT_BUILD_DIR="$PROJECT_DIR/build/$ARCH"
-    ARM64_APP="$PROJECT_DIR/build/arm64/OrcaSlicer/$APP_BUNDLE_NAME"
-    X86_64_APP="$PROJECT_DIR/build/x86_64/OrcaSlicer/$APP_BUNDLE_NAME"
+    ARM64_APP="$PROJECT_DIR/build/arm64/$PACKAGE_OUTPUT_DIR_NAME/$APP_BUNDLE_NAME"
+    X86_64_APP="$PROJECT_DIR/build/x86_64/$PACKAGE_OUTPUT_DIR_NAME/$APP_BUNDLE_NAME"
 
-    mkdir -p "$PROJECT_BUILD_DIR/OrcaSlicer"
-    UNIVERSAL_APP="$PROJECT_BUILD_DIR/OrcaSlicer/$APP_BUNDLE_NAME"
+    mkdir -p "$PROJECT_BUILD_DIR/$PACKAGE_OUTPUT_DIR_NAME"
+    UNIVERSAL_APP="$PROJECT_BUILD_DIR/$PACKAGE_OUTPUT_DIR_NAME/$APP_BUNDLE_NAME"
     rm -rf "$UNIVERSAL_APP"
     cp -R "$ARM64_APP" "$UNIVERSAL_APP"
 
     echo "Creating universal binaries for $APP_BUNDLE_NAME..."
     lipo_dir "$UNIVERSAL_APP" "$X86_64_APP"
     echo "Universal $APP_BUNDLE_NAME created at $UNIVERSAL_APP"
+    verify_python_runtime "$UNIVERSAL_APP"
 
     # Create universal binary for profile validator if it exists
-    ARM64_VALIDATOR="$PROJECT_DIR/build/arm64/OrcaSlicer/OrcaSlicer_profile_validator.app"
-    X86_64_VALIDATOR="$PROJECT_DIR/build/x86_64/OrcaSlicer/OrcaSlicer_profile_validator.app"
+    ARM64_VALIDATOR="$PROJECT_DIR/build/arm64/$PACKAGE_OUTPUT_DIR_NAME/OrcaSlicer_profile_validator.app"
+    X86_64_VALIDATOR="$PROJECT_DIR/build/x86_64/$PACKAGE_OUTPUT_DIR_NAME/OrcaSlicer_profile_validator.app"
     if [ -d "$ARM64_VALIDATOR" ] && [ -d "$X86_64_VALIDATOR" ]; then
         echo "Creating universal binaries for OrcaSlicer_profile_validator.app..."
-        UNIVERSAL_VALIDATOR_APP="$PROJECT_BUILD_DIR/OrcaSlicer/OrcaSlicer_profile_validator.app"
+        UNIVERSAL_VALIDATOR_APP="$PROJECT_BUILD_DIR/$PACKAGE_OUTPUT_DIR_NAME/OrcaSlicer_profile_validator.app"
         rm -rf "$UNIVERSAL_VALIDATOR_APP"
         cp -R "$ARM64_VALIDATOR" "$UNIVERSAL_VALIDATOR_APP"
         lipo_dir "$UNIVERSAL_VALIDATOR_APP" "$X86_64_VALIDATOR"

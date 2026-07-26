@@ -5,15 +5,62 @@ on:
   workflow_dispatch:
 
 jobs:
-  prepare_slicer_linux_runtime:
-    name: Prepare Slicer Linux runtime
-    runs-on: ubuntu-24.04
+  prepare_linux_auth_browser_arm64:
+    name: Build native Linux arm64 auth browser
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           lfs: 'false'
+
+      - name: Install native arm64 browser dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build file \
+            libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+
+      - name: Build and test native arm64 browser
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S tools/slicer_linux_auth_helper -B build-auth-browser-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-auth-browser-arm64 --parallel
+          browser="$GITHUB_WORKSPACE/build-auth-browser-arm64/slicer_linux_auth_browser"
+          test -x "$browser"
+          file "$browser" | grep -Eq 'ELF 64-bit.*(ARM aarch64|aarch64)'
+          "$browser" --probe
+          xvfb-run -a "$browser" --self-test
+          cp "$browser" "$GITHUB_WORKSPACE/slicer_linux_auth_browser_aarch64"
+
+
+      - name: Upload native arm64 browser
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux_auth_browser_arm64_${{ github.sha }}
+          path: ${{ github.workspace }}/slicer_linux_auth_browser_aarch64
+          if-no-files-found: error
+
+  prepare_slicer_linux_runtime:
+    name: Prepare Slicer Linux runtime
+    runs-on: ubuntu-24.04
+    needs: prepare_linux_auth_browser_arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          lfs: 'false'
+
+      - name: Download native arm64 browser
+        uses: actions/download-artifact@v8
+        with:
+          name: linux_auth_browser_arm64_${{ github.sha }}
+          path: ${{ runner.temp }}/linux-auth-browser-arm64
 
       - name: Normalize script permissions
         shell: bash
@@ -24,6 +71,16 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
 
 
+      - name: Verify Linux runtime transport logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/slicer_linux_runtime/verify_full_linux_transport.py
+          python3 tools/slicer_linux_runtime/test_runtime_dispatcher.py
+          python3 tools/slicer_linux_runtime/test_macos_runtime_wrapper.py
+          SLICER_LINUX_RUNTIME_ROSETTA_SPLITLOCK_CC=gcc-14 \
+            python3 tools/slicer_linux_runtime/test_rosetta_splitlock_compat.py
+
       - uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~4.3.0"
@@ -32,6 +89,14 @@ jobs:
 
       - name: Apt-Install Dependencies
         uses: ./.github/actions/apt-install-deps
+
+      - name: Install Linux auth browser build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dbus-x11 libasound2t64 libgtk-3-dev libpulse0 libwebkit2gtk-4.1-dev novnc openssl websockify x11vnc xvfb
+
 
       - name: Build Linux deps
         shell: bash
@@ -57,8 +122,15 @@ jobs:
       - name: Build linux host runtime
         shell: bash
         run: |
+          set -euo pipefail
           cmake --build build --config Release --target slicer_linux_runtime_host
-          bash tools/slicer_linux_runtime_host/package_linux_host_runtime.sh build
+          arm_browser="$RUNNER_TEMP/linux-auth-browser-arm64/slicer_linux_auth_browser_aarch64"
+          test -x "$arm_browser" || chmod +x "$arm_browser"
+          SLICER_LINUX_RUNTIME_INCLUDE_ROSETTA_SPLITLOCK_COMPAT=1 \
+          SLICER_LINUX_RUNTIME_ROSETTA_SPLITLOCK_CC=gcc-14 \
+          SLICER_LINUX_AUTH_BROWSER_AARCH64="$arm_browser" \
+            bash tools/slicer_linux_runtime_host/package_linux_host_runtime.sh build
+          (cd tools/slicer_linux_runtime_host/runtime/linux-x86_64 && sha256sum -c runtime-files.sha256)
           tar -czvf linux_host_runtime_${{ github.sha }}.tar.gz -C tools/slicer_linux_runtime_host/runtime linux-x86_64
 
       - name: Upload linux host runtime artifact
@@ -70,7 +142,7 @@ jobs:
 
   build_macos_arm64:
     name: Build macOS arm64
-    runs-on: macos-14
+    runs-on: macos-15
     needs: prepare_slicer_linux_runtime
     env:
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
@@ -96,6 +168,12 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/build_release_macos.sh"
           chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
 
+
+      - name: Verify macOS packaging invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n build_release_macos.sh
 
       - uses: lukka/get-cmake@latest
         with:
@@ -151,7 +229,19 @@ jobs:
       - name: Build macOS arm64 deps
         shell: bash
         run: |
-          ./build_release_macos.sh -dx -1 -a arm64 -t 11.3
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "Build macOS arm64 deps attempt $attempt/3"
+            if ./build_release_macos.sh -dx -1 -a arm64 -t 11.3; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Transient macOS dependency failure; removing empty downloads and retrying"
+              find "$GITHUB_WORKSPACE/deps/DL_CACHE" -type f -size 0 -delete 2>/dev/null || true
+              sleep $((attempt * 20))
+            fi
+          done
+          exit 1
 
       - name: Build macOS arm64 app bundle
         shell: bash
@@ -162,22 +252,78 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          app="$GITHUB_WORKSPACE/build/arm64/OrcaSlicer/BambuStudio.app"
+          app="$GITHUB_WORKSPACE/build/arm64/OrcaStudio/OrcaStudio.app"
           codesign --verify --deep --strict --verbose=4 "$app"
           spctl --assess --type execute --verbose=4 "$app" || true
-          mkdir -p "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg"
-          rm -rf "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg"/*
-          cp -R "$app" "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg/"
-          ln -sfn /Applications "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg/Applications"
+          stage="$RUNNER_TEMP/OrcaStudio_dmg_arm64"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          ditto "$app" "$stage/OrcaStudio.app"
+          sign_identity="${MACOS_CODESIGN_IDENTITY:-}"
+          if [ -z "$sign_identity" ]; then
+            sign_identity="-"
+          fi
+          "$GITHUB_WORKSPACE/scripts/sign_macos_app.sh" \
+            "$stage/OrcaStudio.app" \
+            "$sign_identity" \
+            "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements"
+          "$GITHUB_WORKSPACE/scripts/verify_macos_app_launch.sh" "$stage/OrcaStudio.app"
+          stage_binary_sha="$(shasum -a 256 "$stage/OrcaStudio.app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
+          ln -s /Applications "$stage/Applications"
+          cp "$GITHUB_WORKSPACE/scripts/macos_first_launch.html" "$stage/00 - FIRST LAUNCH - OPEN ME.html"
           ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
           if [ -z "$ver" ]; then
             echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
             exit 1
           fi
-          dmg="$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_arm64_V${ver}.dmg"
-          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/arm64/BambuStudio_dmg" -ov -format UDZO "$dmg"
+          dmg="$GITHUB_WORKSPACE/OrcaStudio_Mac_arm64_V${ver}.dmg"
+          tmp_dmg="$RUNNER_TEMP/OrcaStudio_Mac_arm64_V${ver}.tmp.dmg"
+          volume="/Volumes/OrcaStudio-arm64"
+          mount_dir="$RUNNER_TEMP/OrcaStudio_mounted_arm64"
+          rm -f "$dmg" "$tmp_dmg"
+          hdiutil detach "$volume" -force >/dev/null 2>&1 || true
+          for attempt in 1 2 3; do
+            echo "Creating macOS arm64 DMG (attempt $attempt/3)"
+            if hdiutil create \
+              -volname "OrcaStudio-arm64" \
+              -srcfolder "$stage" \
+              -fs HFS+ \
+              -format UDZO \
+              -ov \
+              "$tmp_dmg"; then
+              mv -f "$tmp_dmg" "$dmg"
+              break
+            fi
+            rm -f "$tmp_dmg"
+            hdiutil detach "$volume" -force >/dev/null 2>&1 || true
+            sync
+            sleep $((attempt * 5))
+          done
+          test -s "$dmg"
+          hdiutil verify "$dmg"
+
+          rm -rf "$mount_dir"
+          mkdir -p "$mount_dir"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
+          mounted_app="$mount_dir/OrcaStudio.app"
+          test -f "$mount_dir/00 - FIRST LAUNCH - OPEN ME.html"
+          cleanup_mounted_dmg() {
+            hdiutil detach "$mount_dir" -force >/dev/null 2>&1 || true
+            rm -rf "$mount_dir"
+          }
+          trap cleanup_mounted_dmg EXIT
+          "$GITHUB_WORKSPACE/scripts/verify_macos_app_launch.sh" "$mounted_app"
+          mounted_binary_sha="$(shasum -a 256 "$mounted_app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
+          if [ "$mounted_binary_sha" != "$stage_binary_sha" ]; then
+            echo "ERROR: OrcaStudio executable changed while creating the DMG" >&2
+            exit 1
+          fi
+          cleanup_mounted_dmg
+          trap - EXIT
+          rm -rf "$stage"
+
           if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ] && [ -n "${APPLE_DEV_ACCOUNT:-}" ] && [ -n "${TEAM_ID:-}" ] && [ -n "${APP_PWD:-}" ]; then
-            codesign --force --deep --verbose --options runtime --timestamp --entitlements "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements" --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
+            codesign --force --verbose --timestamp --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
             xcrun notarytool submit "$dmg" --apple-id "$APPLE_DEV_ACCOUNT" --team-id "$TEAM_ID" --password "$APP_PWD" --wait
             xcrun stapler staple "$dmg"
             xcrun stapler validate "$dmg"
@@ -187,21 +333,17 @@ jobs:
             echo "Users may need Control-click -> Open or Privacy & Security -> Open Anyway on first launch."
           fi
 
-      - name: Explain skipped hosted runtime validation
-        shell: bash
-        run: |
-          echo "Hosted macOS runners do not support nested virtualization, so bundled Lima runtime validation is intentionally skipped here."
 
       - name: Upload macOS arm64 DMG
         uses: actions/upload-artifact@v7
         with:
-          name: BambuStudio-OrcaSlicer_Mac_arm64_${{ github.sha }}
-          path: ${{ github.workspace }}/BambuStudio-OrcaSlicer_Mac_arm64_V*.dmg
+          name: OrcaStudio_Mac_arm64_${{ github.sha }}
+          path: ${{ github.workspace }}/OrcaStudio_Mac_arm64_V*.dmg
           if-no-files-found: error
 
   build_macos_x86_64:
-    name: Build macOS x86_64
-    runs-on: macos-14
+    name: Build macOS x86_64 (cross-compiled on Apple Silicon)
+    runs-on: macos-15
     needs: prepare_slicer_linux_runtime
     env:
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
@@ -228,6 +370,12 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/build_linux.sh"
 
 
+      - name: Verify macOS packaging invariants
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n build_release_macos.sh
+
       - uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~4.3.0"
@@ -243,12 +391,14 @@ jobs:
       - name: Extract linux host runtime artifact on macOS x86_64
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/tools/slicer_linux_runtime_host/runtime"
           tar -xzf "$GITHUB_WORKSPACE/linux_host_runtime_artifact/linux_host_runtime_${{ github.sha }}.tar.gz" -C "$GITHUB_WORKSPACE/tools/slicer_linux_runtime_host/runtime"
 
       - name: Install mac tools
         shell: bash
         run: |
+          set -euo pipefail
           brew install automake texinfo libtool nasm m4
           command -v nasm
           nasm -v
@@ -261,6 +411,17 @@ jobs:
           echo "$(dirname "$m4_path")" >> "$GITHUB_PATH"
           brew list
           mkdir -p "$GITHUB_WORKSPACE/deps/build/x86_64"
+
+      - name: Verify macOS x86_64 cross-compilation host
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_arch="$(uname -m)"
+          if [[ "$host_arch" != "arm64" ]]; then
+            echo "ERROR: x86_64 build must run as a cross-compilation on the macos-15 Apple Silicon runner; host is $host_arch" >&2
+            exit 1
+          fi
+          echo "Cross-compiling macOS x86_64 on Apple Silicon host: $host_arch"
 
       - name: Import macOS signing certificate
         if: ${{ env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != '' && env.KEYCHAIN_PASSWORD != '' && env.MACOS_CODESIGN_IDENTITY != '' }}
@@ -282,33 +443,115 @@ jobs:
       - name: Build macOS x86_64 deps
         shell: bash
         run: |
-          ./build_release_macos.sh -dx -1 -a x86_64 -t 11.3
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            echo "Build macOS x86_64 deps attempt $attempt/3"
+            if ./build_release_macos.sh -dx -1 -a x86_64 -t 11.3; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "Transient macOS dependency failure; removing empty downloads and retrying"
+              find "$GITHUB_WORKSPACE/deps/DL_CACHE" -type f -size 0 -delete 2>/dev/null || true
+              sleep $((attempt * 20))
+            fi
+          done
+          exit 1
 
       - name: Build macOS x86_64 app bundle
         shell: bash
         run: |
+          set -euo pipefail
           ./build_release_macos.sh -s -n -x -1 -a x86_64 -t 11.3
+
+      - name: Verify macOS x86_64 binary architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="$GITHUB_WORKSPACE/build/x86_64/OrcaStudio/OrcaStudio.app/Contents/MacOS/OrcaStudio"
+          test -x "$binary"
+          architectures="$(lipo -archs "$binary")"
+          if [[ " $architectures " != *" x86_64 "* || " $architectures " == *" arm64 "* ]]; then
+            echo "ERROR: expected an x86_64-only macOS executable, got: $architectures" >&2
+            exit 1
+          fi
+          echo "Verified macOS executable architecture: $architectures"
 
       - name: Create macOS x86_64 DMG
         shell: bash
         run: |
           set -euo pipefail
-          app="$GITHUB_WORKSPACE/build/x86_64/OrcaSlicer/BambuStudio.app"
+          app="$GITHUB_WORKSPACE/build/x86_64/OrcaStudio/OrcaStudio.app"
           codesign --verify --deep --strict --verbose=4 "$app"
           spctl --assess --type execute --verbose=4 "$app" || true
-          mkdir -p "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg"
-          rm -rf "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg"/*
-          cp -R "$app" "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg/"
-          ln -sfn /Applications "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg/Applications"
+          stage="$RUNNER_TEMP/OrcaStudio_dmg_x86_64"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          ditto "$app" "$stage/OrcaStudio.app"
+          sign_identity="${MACOS_CODESIGN_IDENTITY:-}"
+          if [ -z "$sign_identity" ]; then
+            sign_identity="-"
+          fi
+          "$GITHUB_WORKSPACE/scripts/sign_macos_app.sh" \
+            "$stage/OrcaStudio.app" \
+            "$sign_identity" \
+            "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements"
+          "$GITHUB_WORKSPACE/scripts/verify_macos_app_launch.sh" "$stage/OrcaStudio.app"
+          stage_binary_sha="$(shasum -a 256 "$stage/OrcaStudio.app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
+          ln -s /Applications "$stage/Applications"
+          cp "$GITHUB_WORKSPACE/scripts/macos_first_launch.html" "$stage/00 - FIRST LAUNCH - OPEN ME.html"
           ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
           if [ -z "$ver" ]; then
             echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
             exit 1
           fi
-          dmg="$GITHUB_WORKSPACE/BambuStudio-OrcaSlicer_Mac_x86_64_V${ver}.dmg"
-          hdiutil create -volname "BambuStudio" -srcfolder "$GITHUB_WORKSPACE/build/x86_64/BambuStudio_dmg" -ov -format UDZO "$dmg"
+          dmg="$GITHUB_WORKSPACE/OrcaStudio_Mac_x86_64_V${ver}.dmg"
+          tmp_dmg="$RUNNER_TEMP/OrcaStudio_Mac_x86_64_V${ver}.tmp.dmg"
+          volume="/Volumes/OrcaStudio-x86_64"
+          mount_dir="$RUNNER_TEMP/OrcaStudio_mounted_x86_64"
+          rm -f "$dmg" "$tmp_dmg"
+          hdiutil detach "$volume" -force >/dev/null 2>&1 || true
+          for attempt in 1 2 3; do
+            echo "Creating macOS x86_64 DMG (attempt $attempt/3)"
+            if hdiutil create \
+              -volname "OrcaStudio-x86_64" \
+              -srcfolder "$stage" \
+              -fs HFS+ \
+              -format UDZO \
+              -ov \
+              "$tmp_dmg"; then
+              mv -f "$tmp_dmg" "$dmg"
+              break
+            fi
+            rm -f "$tmp_dmg"
+            hdiutil detach "$volume" -force >/dev/null 2>&1 || true
+            sync
+            sleep $((attempt * 5))
+          done
+          test -s "$dmg"
+          hdiutil verify "$dmg"
+
+          rm -rf "$mount_dir"
+          mkdir -p "$mount_dir"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "$dmg"
+          mounted_app="$mount_dir/OrcaStudio.app"
+          test -f "$mount_dir/00 - FIRST LAUNCH - OPEN ME.html"
+          cleanup_mounted_dmg() {
+            hdiutil detach "$mount_dir" -force >/dev/null 2>&1 || true
+            rm -rf "$mount_dir"
+          }
+          trap cleanup_mounted_dmg EXIT
+          "$GITHUB_WORKSPACE/scripts/verify_macos_app_launch.sh" "$mounted_app"
+          mounted_binary_sha="$(shasum -a 256 "$mounted_app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
+          if [ "$mounted_binary_sha" != "$stage_binary_sha" ]; then
+            echo "ERROR: OrcaStudio executable changed while creating the DMG" >&2
+            exit 1
+          fi
+          cleanup_mounted_dmg
+          trap - EXIT
+          rm -rf "$stage"
+
           if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ] && [ -n "${APPLE_DEV_ACCOUNT:-}" ] && [ -n "${TEAM_ID:-}" ] && [ -n "${APP_PWD:-}" ]; then
-            codesign --force --deep --verbose --options runtime --timestamp --entitlements "$GITHUB_WORKSPACE/scripts/disable_validation.entitlements" --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
+            codesign --force --verbose --timestamp --sign "$MACOS_CODESIGN_IDENTITY" "$dmg"
             xcrun notarytool submit "$dmg" --apple-id "$APPLE_DEV_ACCOUNT" --team-id "$TEAM_ID" --password "$APP_PWD" --wait
             xcrun stapler staple "$dmg"
             xcrun stapler validate "$dmg"
@@ -318,14 +561,11 @@ jobs:
             echo "Users may need Control-click -> Open or Privacy & Security -> Open Anyway on first launch."
           fi
 
-      - name: Explain skipped hosted runtime validation
-        shell: bash
-        run: |
-          echo "Hosted macOS runners do not support nested virtualization, so bundled Lima runtime validation is intentionally skipped here."
 
       - name: Upload macOS x86_64 DMG
         uses: actions/upload-artifact@v7
         with:
-          name: BambuStudio-OrcaSlicer_Mac_x86_64_${{ github.sha }}
-          path: ${{ github.workspace }}/BambuStudio-OrcaSlicer_Mac_x86_64_V*.dmg
+          name: OrcaStudio_Mac_x86_64_${{ github.sha }}
+          path: ${{ github.workspace }}/OrcaStudio_Mac_x86_64_V*.dmg
           if-no-files-found: error
+

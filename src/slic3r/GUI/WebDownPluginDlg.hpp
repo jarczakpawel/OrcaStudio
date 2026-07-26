@@ -75,6 +75,7 @@ private:
     // Last executed JavaScript snippet, for convenience.
     wxString m_javascript;
     wxString m_response_js;
+    std::string m_downloaded_plugin_version;
 
     // DECLARE_EVENT_TABLE()
 };

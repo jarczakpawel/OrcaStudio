@@ -1,5 +1,6 @@
 #include "HyperLink.hpp"
 #include "Label.hpp"
+#include "../GUI_App.hpp"
 
 namespace Slic3r { namespace GUI {
 
@@ -18,7 +19,7 @@ HyperLink::HyperLink(wxWindow* parent, const wxString& label, const wxString& ur
 
     Bind(wxEVT_LEFT_DOWN, ([this](wxMouseEvent& e) {
              if (!m_url.IsEmpty())
-                 wxLaunchDefaultBrowser(m_url);
+                 wxGetApp().open_browser_with_warning_dialog(m_url);
          }));
 
     Bind(wxEVT_ENTER_WINDOW, ([this](wxMouseEvent& e) {

@@ -7,6 +7,7 @@
 #include <boost/process/windows.hpp>
 #endif
 
+#include <chrono>
 #include <stdexcept>
 
 namespace bp = boost::process;
@@ -29,6 +30,11 @@ RpcClient& RpcClient::instance()
 }
 
 RpcClient::~RpcClient()
+{
+    stop();
+}
+
+void RpcClient::shutdown()
 {
     stop();
 }
@@ -59,7 +65,7 @@ bool RpcClient::start_locked()
             return false;
         }
 
-        auto proc = std::make_unique<Proc>();
+        auto proc = std::make_shared<Proc>();
 #if defined(_WIN32)
         proc->child = bp::child(spec.argv[0], bp::args(args), bp::std_in < proc->in, bp::std_out > proc->out,
                                 bp::windows::create_no_window, bp::windows::hide, env);
@@ -69,6 +75,7 @@ bool RpcClient::start_locked()
         m_proc = std::move(proc);
         m_reader_stop.store(false, std::memory_order_release);
         m_handshake_ok = false;
+        m_reader_failed = false;
         m_reader = std::thread([this] { reader_loop(); });
         m_last_error.clear();
         return true;
@@ -82,13 +89,20 @@ bool RpcClient::start_locked()
 
 void RpcClient::stop()
 {
-    std::unique_ptr<Proc> proc;
+    std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+    stop_locked();
+}
+
+void RpcClient::stop_locked()
+{
+    std::shared_ptr<Proc> proc;
     std::thread reader;
     std::map<int, std::shared_ptr<Pending>> pending;
     {
         std::lock_guard<std::mutex> lock(m_state_mutex);
         m_reader_stop.store(true, std::memory_order_release);
         m_handshake_ok = false;
+        m_reader_failed = false;
         proc = std::move(m_proc);
         reader = std::move(m_reader);
         pending = std::move(m_pending);
@@ -96,12 +110,19 @@ void RpcClient::stop()
     }
 
     if (proc) {
-        try { proc->in.pipe().close(); } catch (...) {}
-        try { proc->out.pipe().close(); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> wlock(m_write_mutex);
+            try { proc->in.pipe().close(); } catch (...) {}
+        }
         try {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (proc->child.running() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
             if (proc->child.running())
                 proc->child.terminate();
+            proc->child.wait();
         } catch (...) {}
+        try { proc->out.pipe().close(); } catch (...) {}
     }
 
     if (reader.joinable())
@@ -119,18 +140,26 @@ void RpcClient::stop()
 
 bool RpcClient::ensure_started()
 {
-    {
-        std::unique_lock<std::mutex> lock(m_state_mutex);
-        if (m_reader.joinable() && (!m_proc || !m_proc->child.running())) {
-            std::thread stale = std::move(m_reader);
-            lock.unlock();
-            stale.join();
-            lock.lock();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+            bool recover = false;
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                recover = m_reader_failed || (m_reader.joinable() && (!m_proc || !m_proc->child.running()));
+            }
+            if (recover)
+                stop_locked();
+            {
+                std::lock_guard<std::mutex> lock(m_state_mutex);
+                if (!start_locked())
+                    return false;
+            }
         }
-        if (!start_locked())
-            return false;
+        if (ensure_handshake())
+            return true;
     }
-    return ensure_handshake();
+    return false;
 }
 
 bool RpcClient::is_started() const
@@ -143,7 +172,7 @@ bool RpcClient::ensure_handshake()
 {
     {
         std::lock_guard<std::mutex> lock(m_state_mutex);
-        if (!m_proc || !m_proc->child.running())
+        if (!m_proc || !m_proc->child.running() || m_reader_failed)
             return false;
         if (m_handshake_ok)
             return true;
@@ -168,19 +197,6 @@ bool RpcClient::ensure_handshake()
         return false;
     }
 
-    const bool component_loaded = reply.payload.value("component_loaded", reply.payload.value("network_loaded", false));
-    const bool source_loaded = reply.payload.value("source_loaded", false);
-    const std::string component_status = reply.payload.value("component_status", reply.payload.value("network_status", std::string("unknown")));
-    const std::string source_status = reply.payload.value("source_status", std::string("unknown"));
-
-    if (!component_loaded || !source_loaded) {
-        {
-            std::lock_guard<std::mutex> lock(m_state_mutex);
-            m_last_error = "Linux runtime host failed to load Linux package: component=" + component_status + ", source=" + source_status;
-        }
-        stop();
-        return false;
-    }
 
     {
         std::lock_guard<std::mutex> lock(m_state_mutex);
@@ -193,12 +209,12 @@ bool RpcClient::ensure_handshake()
 void RpcClient::reader_loop()
 {
     while (!m_reader_stop.load(std::memory_order_acquire)) {
-        Proc* proc = nullptr;
+        std::shared_ptr<Proc> proc;
         {
             std::lock_guard<std::mutex> lock(m_state_mutex);
             if (!m_proc)
                 break;
-            proc = m_proc.get();
+            proc = m_proc;
         }
 
         RawRpcFrame raw;
@@ -211,6 +227,8 @@ void RpcClient::reader_loop()
                 if (m_reader_stop.load(std::memory_order_acquire))
                     break;
                 m_last_error = error.empty() ? "runtime host closed stdout" : error;
+                m_handshake_ok = false;
+                m_reader_failed = true;
                 try {
                     if (proc && proc->child.valid() && !proc->child.running())
                         m_last_error += ", child exit code=" + std::to_string(proc->child.exit_code());
@@ -240,14 +258,23 @@ void RpcClient::reader_loop()
 
         if (raw.type == RpcFrameType::json_response) {
             nlohmann::json payload;
-            if (!read_json_frame(raw, payload, error))
-                payload = make_error_payload(error);
+            if (!read_json_frame(raw, payload, error) || !payload.is_object())
+                payload = make_error_payload(error.empty() ? "invalid runtime JSON response" : error);
 
             bool ready = false;
             {
                 std::lock_guard<std::mutex> plock(pending->mutex);
                 pending->payload = std::move(payload);
                 pending->expects_binary = pending->payload.value("__binary_pending", false);
+                pending->expected_binary_size = pending->payload.value("binary_size", std::size_t(0));
+                if (pending->expected_binary_size > 1024ULL * 1024ULL * 1024ULL) {
+                    pending->payload = make_error_payload("runtime binary response exceeds limit");
+                    pending->expects_binary = false;
+                } else if (pending->binary_received && pending->expects_binary && pending->binary.size() != pending->expected_binary_size) {
+                    pending->payload = make_error_payload("runtime binary response size mismatch");
+                    pending->expects_binary = false;
+                    pending->binary.clear();
+                }
                 pending->json_received = true;
                 ready = !pending->expects_binary || pending->binary_received;
                 pending->ready = ready;
@@ -267,6 +294,11 @@ void RpcClient::reader_loop()
                 std::lock_guard<std::mutex> plock(pending->mutex);
                 pending->binary = std::move(raw.payload);
                 pending->binary_received = true;
+                if (pending->json_received && pending->expects_binary && pending->binary.size() != pending->expected_binary_size) {
+                    pending->payload = make_error_payload("runtime binary response size mismatch");
+                    pending->expects_binary = false;
+                    pending->binary.clear();
+                }
                 ready = pending->json_received;
                 pending->ready = ready;
             }
@@ -278,6 +310,17 @@ void RpcClient::reader_loop()
             }
             continue;
         }
+
+        {
+            std::lock_guard<std::mutex> plock(pending->mutex);
+            pending->payload = make_error_payload("unexpected runtime frame type");
+            pending->ready = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_pending.erase(raw.id);
+        }
+        pending->cv.notify_all();
     }
 }
 
@@ -287,12 +330,14 @@ RpcBinaryReply RpcClient::request_impl(const std::string& method, const nlohmann
         return {make_error_payload(last_error()), {}};
 
     std::shared_ptr<Pending> pending = std::make_shared<Pending>();
+    std::shared_ptr<Proc> proc;
     int id = 0;
 
     {
         std::lock_guard<std::mutex> lock(m_state_mutex);
-        if (!m_proc || !m_proc->child.running())
-            return {make_error_payload("Linux runtime host is not running"), {}};
+        if (!m_proc || !m_proc->child.running() || m_reader_failed)
+            return {make_error_payload(m_last_error.empty() ? "Linux runtime host is not running" : m_last_error), {}};
+        proc = m_proc;
         id = m_next_id++;
         m_pending[id] = pending;
     }
@@ -308,21 +353,36 @@ RpcBinaryReply RpcClient::request_impl(const std::string& method, const nlohmann
         }
 
         std::lock_guard<std::mutex> wlock(m_write_mutex);
-        if (!m_proc || !m_proc->child.running())
+        if (!proc || !proc->child.running())
             throw std::runtime_error("Linux runtime host is not running");
-        if (!write_request_frame(m_proc->in, frame))
+        if (!write_request_frame(proc->in, frame))
             throw std::runtime_error("failed to write request frame");
-        if (!request_binary.empty() && !write_raw_frame(m_proc->in, RpcFrameType::binary_data, id, request_binary.data(), request_binary.size()))
+        if (!request_binary.empty() && !write_raw_frame(proc->in, RpcFrameType::binary_data, id, request_binary.data(), request_binary.size()))
             throw std::runtime_error("failed to write request binary frame");
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(m_state_mutex);
         m_pending.erase(id);
         m_last_error = e.what();
+        m_handshake_ok = false;
+        m_reader_failed = true;
         return {make_error_payload(m_last_error), {}};
     }
 
     std::unique_lock<std::mutex> plock(pending->mutex);
-    pending->cv.wait(plock, [&] { return pending->ready; });
+    const auto timeout = method == "runtime.handshake" ? std::chrono::seconds(30) : std::chrono::hours(2);
+    if (!pending->cv.wait_for(plock, timeout, [&] { return pending->ready; })) {
+        plock.unlock();
+        const std::string error = "Linux runtime request timed out: " + method;
+        {
+            std::lock_guard<std::mutex> lock(m_state_mutex);
+            m_pending.erase(id);
+            m_last_error = error;
+            m_handshake_ok = false;
+            m_reader_failed = true;
+        }
+        stop();
+        return {make_error_payload(error), {}};
+    }
     return {pending->payload, pending->binary};
 }
 

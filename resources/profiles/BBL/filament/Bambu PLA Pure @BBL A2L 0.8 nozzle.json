@@ -17,6 +17,9 @@
 	"fan_min_speed": [
 		"60"
 	],
+	"filament_flush_temp_fast": [
+		"220"
+	],
 	"filament_retract_before_wipe": [
 		"0"
 	],

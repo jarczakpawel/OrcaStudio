@@ -1,6 +1,8 @@
 #include "SlicerLinuxRuntimeLauncher.hpp"
 #include "SlicerLinuxRuntimeConfig.hpp"
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -17,6 +19,41 @@
 namespace Slic3r::SlicerLinuxRuntime {
 
 namespace {
+
+int allocate_loopback_port()
+{
+    WSADATA data{};
+    if (::WSAStartup(MAKEWORD(2, 2), &data) != 0)
+        return 0;
+
+    const SOCKET sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        ::WSACleanup();
+        return 0;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        ::closesocket(sock);
+        ::WSACleanup();
+        return 0;
+    }
+
+    int len = sizeof(addr);
+    if (::getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len) == SOCKET_ERROR) {
+        ::closesocket(sock);
+        ::WSACleanup();
+        return 0;
+    }
+
+    const int port = ntohs(addr.sin_port);
+    ::closesocket(sock);
+    ::WSACleanup();
+    return port;
+}
 
 std::filesystem::path module_dir()
 {
@@ -238,38 +275,6 @@ std::string run_and_capture(const std::wstring& exe_path, const std::vector<std:
     return decode_text_auto(bytes);
 }
 
-DWORD run_powershell_wait(const std::filesystem::path& script_path,
-                          const std::filesystem::path& package_dir,
-                          const std::filesystem::path& component_dir,
-                          const std::string& distro)
-{
-    std::wstring command =
-        L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + script_path.wstring() +
-        L"\" -PackageDir \"" + package_dir.wstring() +
-        L"\" -ComponentDir \"" + component_dir.wstring() +
-        L"\" -DistroName \"" + widen(distro) + L"\"";
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-
-    std::vector<wchar_t> mutable_command(command.begin(), command.end());
-    mutable_command.push_back(L'\0');
-
-    if (!::CreateProcessW(nullptr, mutable_command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
-        return static_cast<DWORD>(-1);
-
-    ::WaitForSingleObject(pi.hProcess, INFINITE);
-
-    DWORD exit_code = static_cast<DWORD>(-1);
-    ::GetExitCodeProcess(pi.hProcess, &exit_code);
-
-    ::CloseHandle(pi.hThread);
-    ::CloseHandle(pi.hProcess);
-
-    return exit_code;
-}
-
 std::string to_wsl_path(const std::filesystem::path& p)
 {
     const std::wstring ws = p.wstring();
@@ -340,12 +345,37 @@ std::filesystem::path configured_component_cache_dir(const std::filesystem::path
 
 std::string wsl_exe_path()
 {
-    std::wstring path(32768, L'\0');
-    const UINT size = ::GetSystemDirectoryW(path.data(), static_cast<UINT>(path.size()));
-    if (size == 0 || size >= path.size())
-        return "wsl.exe";
-    path.resize(size);
-    return narrow((std::filesystem::path(path) / L"wsl.exe").wstring());
+    std::vector<std::filesystem::path> candidates;
+
+    std::wstring system_dir(32768, L'\0');
+    const UINT system_size = ::GetSystemDirectoryW(system_dir.data(), static_cast<UINT>(system_dir.size()));
+    if (system_size > 0 && system_size < system_dir.size()) {
+        system_dir.resize(system_size);
+        candidates.emplace_back(std::filesystem::path(system_dir) / L"wsl.exe");
+    }
+
+    std::wstring windows_dir(32768, L'\0');
+    const UINT windows_size = ::GetWindowsDirectoryW(windows_dir.data(), static_cast<UINT>(windows_dir.size()));
+    if (windows_size > 0 && windows_size < windows_dir.size()) {
+        windows_dir.resize(windows_size);
+        candidates.emplace_back(std::filesystem::path(windows_dir) / L"System32" / L"wsl.exe");
+        candidates.emplace_back(std::filesystem::path(windows_dir) / L"Sysnative" / L"wsl.exe");
+    }
+
+    for (const auto& candidate : candidates) {
+        std::error_code ec;
+        if (std::filesystem::exists(candidate, ec) && !ec)
+            return narrow(candidate.wstring());
+    }
+
+    std::wstring found(32768, L'\0');
+    const DWORD found_size = ::SearchPathW(nullptr, L"wsl.exe", nullptr, static_cast<DWORD>(found.size()), found.data(), nullptr);
+    if (found_size > 0 && found_size < found.size()) {
+        found.resize(found_size);
+        return narrow(found);
+    }
+
+    return {};
 }
 
 std::string legacy_windows_wsl_bootstrap_script_file_name()
@@ -368,12 +398,13 @@ std::filesystem::path resolve_bootstrap_script_path(const std::filesystem::path&
 
 std::string first_missing_runtime_file(const std::filesystem::path& component_dir)
 {
-    const std::array<std::string, 10> required_files = {{
+    const std::array<std::string, 11> required_files = {{
         host_executable_file_name(),
         std::string("slicer_linux_runtime_host_abi1"),
         std::string("slicer_linux_runtime_host_abi0"),
+        std::string("slicer_linux_auth_browser"),
+        std::string("run_auth_browser.sh"),
         windows_wsl_import_script_file_name(),
-        windows_wsl_validate_script_file_name(),
         windows_wsl_distro_file_name(),
         windows_wsl_rootfs_file_name(),
         windows_component_cache_subdir_file_name(),
@@ -395,21 +426,13 @@ std::string first_missing_runtime_file(const std::filesystem::path& component_di
 bool probe_wsl_ready(const std::string& distro, std::string* reason)
 {
     const std::string wsl = wsl_exe_path();
-    if (!std::filesystem::exists(std::filesystem::u8path(wsl))) {
+    if (wsl.empty() || !std::filesystem::exists(std::filesystem::u8path(wsl))) {
         if (reason)
-            *reason = "wsl.exe not found in Windows system directory";
+            *reason = "Windows Subsystem for Linux (wsl.exe) was not found. Run wsl --install as Administrator, restart Windows, then verify with wsl --status and wsl -l -v";
         return false;
     }
 
     const std::wstring wsl_w = widen(wsl);
-
-    DWORD status_code = 0;
-    const std::string status_out = run_and_capture(wsl_w, {L"--status"}, &status_code);
-    if (status_code != 0) {
-        if (reason)
-            *reason = trim_ascii(status_out.empty() ? "wsl --status failed" : status_out);
-        return false;
-    }
 
     if (distro.empty()) {
         if (reason)
@@ -445,47 +468,6 @@ bool probe_wsl_ready(const std::string& distro, std::string* reason)
     return false;
 }
 
-bool ensure_runtime_interactive(const std::filesystem::path& component_dir, const std::string& distro)
-{
-    const std::filesystem::path script = component_dir / windows_wsl_import_script_file_name();
-    if (!std::filesystem::exists(script))
-        return false;
-
-    std::string reason;
-    if (probe_wsl_ready(distro, &reason))
-        return true;
-
-    const std::wstring title = widen("OrcaSlicer Slicer Linux Runtime");
-    std::wstring message =
-        L"WSL2 runtime is not ready for this runtime.\n\n"
-        L"Target host app: OrcaSlicer\n"
-        L"Distro: " + widen(distro) + L"\n\n"
-        L"Reason:\n" + widen(reason.empty() ? std::string("unknown") : reason) + L"\n\n"
-        L"Install or repair it now?\n"
-        L"This may ask for Administrator approval.";
-    const int choice = ::MessageBoxW(nullptr, message.c_str(), title.c_str(), MB_ICONQUESTION | MB_YESNO | MB_SYSTEMMODAL);
-    if (choice != IDYES)
-        return false;
-
-    const DWORD exit_code = run_powershell_wait(script, component_dir, component_dir, distro);
-    if (exit_code == 0)
-        return probe_wsl_ready(distro, nullptr);
-
-    if (exit_code == 1641 || exit_code == 3010) {
-        ::MessageBoxW(nullptr,
-                      L"WSL installation requested a Windows restart.\n\nRestart Windows and launch OrcaSlicer again.",
-                      title.c_str(),
-                      MB_ICONWARNING | MB_OK | MB_SYSTEMMODAL);
-        return false;
-    }
-
-    std::wstring error =
-        L"WSL2 runtime setup failed.\n\nExit code: " + std::to_wstring(exit_code) +
-        L"\n\nRun install_runtime.ps1 manually from the plugin directory for details.";
-    ::MessageBoxW(nullptr, error.c_str(), title.c_str(), MB_ICONERROR | MB_OK | MB_SYSTEMMODAL);
-    return false;
-}
-
 LaunchSpec error_launch_spec(const std::string& message)
 {
     LaunchSpec spec;
@@ -512,8 +494,9 @@ std::string launch_preflight_error()
     if (component_dir.empty())
         return "runtime launcher could not resolve plugin directory";
 
-    if (!std::filesystem::exists(std::filesystem::u8path(wsl_exe_path())))
-        return "wsl.exe not found in Windows system directory";
+    const std::string wsl = wsl_exe_path();
+    if (wsl.empty() || !std::filesystem::exists(std::filesystem::u8path(wsl)))
+        return "Windows Subsystem for Linux (wsl.exe) was not found. Run wsl --install as Administrator, restart Windows, then verify with wsl --status and wsl -l -v";
 
     const auto missing_file = first_missing_runtime_file(component_dir);
     if (!missing_file.empty())
@@ -526,10 +509,6 @@ std::string launch_preflight_error()
     const auto component_cache_dir = configured_component_cache_dir(component_dir);
     if (component_cache_dir.empty())
         return "Windows plugin cache dir is not configured";
-
-    std::string reason;
-    if (!probe_wsl_ready(distro, &reason))
-        return reason.empty() ? "WSL2 runtime is not ready" : reason;
 
     return {};
 }
@@ -553,25 +532,32 @@ LaunchSpec build_default_launch_spec()
         return error_launch_spec("Windows plugin cache dir is not configured");
 
     std::string reason;
-    if (!probe_wsl_ready(distro, &reason) && !ensure_runtime_interactive(component_dir, distro)) {
-        std::string retry_reason;
-        if (!probe_wsl_ready(distro, &retry_reason))
-            return error_launch_spec(retry_reason.empty() ? "WSL2 runtime is not ready" : retry_reason);
-    }
+    if (!probe_wsl_ready(distro, &reason))
+        return error_launch_spec(reason.empty() ? "WSL2 runtime is not ready" : reason);
 
     const auto bootstrap_path = resolve_bootstrap_script_path(component_dir);
     const std::string component_dir_wsl = to_wsl_path(component_dir);
     const std::string plugin_cache_wsl = component_cache_dir.empty() ? std::string() : to_wsl_path(component_cache_dir);
     const std::string bootstrap_wsl = bootstrap_path.empty() ? std::string() : to_wsl_path(bootstrap_path);
 
+    int novnc_port = allocate_loopback_port();
+    int vnc_port = allocate_loopback_port();
+    if (novnc_port <= 0 || vnc_port <= 0 || novnc_port == vnc_port)
+        return error_launch_spec("failed to allocate private loopback ports for Linux browser transport");
+
+    const std::string wsl = wsl_exe_path();
+    if (wsl.empty())
+        return error_launch_spec("Windows Subsystem for Linux (wsl.exe) was not found");
+
     LaunchSpec spec;
     spec.description = "windows via explicit WSL2 distro with linux-local runtime bootstrap";
     spec.argv = {
-        wsl_exe_path(),
+        wsl,
         "-d", distro,
         "--user", "root",
         "--cd", "/",
-        "sh", bootstrap_wsl, component_dir_wsl, plugin_cache_wsl
+        "sh", bootstrap_wsl, component_dir_wsl, plugin_cache_wsl,
+        std::to_string(novnc_port), std::to_string(novnc_port), std::to_string(vnc_port)
     };
     return spec;
 }

@@ -4,9 +4,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="@CMAKE_SOURCE_DIR@"
 
 
-APP_IMAGE="BambuStudio-OrcaSlicer_Linux_V@SoftFever_VERSION@.AppImage"
-APP_ICON_NAME="BambuStudio-OrcaSlicer"
-APP_DESKTOP_ID="com.orcaslicer.BambuStudio-OrcaSlicer"
+APP_IMAGE="OrcaStudio_Linux_V@SoftFever_VERSION@.AppImage"
+APP_ICON_NAME="OrcaStudio"
+APP_DESKTOP_ID="com.orcaslicer.OrcaStudio"
 
 wget ${APPIMAGETOOLURL} -O ../appimagetool.AppImage
 chmod +x ../appimagetool.AppImage
@@ -23,7 +23,7 @@ mkdir -p usr/share/icons/hicolor/192x192/apps
 cp resources/images/BambuStudio_192px.png "usr/share/icons/hicolor/192x192/apps/${APP_ICON_NAME}.png"
 cat <<EOF > "${APP_DESKTOP_ID}.desktop"
 [Desktop Entry]
-Name=BambuStudio-OrcaSlicer
+Name=OrcaStudio
 Exec=AppRun %F
 Icon=${APP_ICON_NAME}
 Type=Application
@@ -38,14 +38,14 @@ mkdir -p usr/share/applications
 cp "${APP_DESKTOP_ID}.desktop" usr/share/applications/
 
 mkdir -p usr/share/metainfo
-cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.BambuStudio.metainfo.xml" \
+cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.OrcaStudio.metainfo.xml" \
   "usr/share/metainfo/${APP_DESKTOP_ID}.metainfo.xml"
-cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.BambuStudio.metainfo.xml" \
+cp "${REPO_ROOT}/scripts/flatpak/com.orcaslicer.OrcaStudio.metainfo.xml" \
   "usr/share/metainfo/${APP_DESKTOP_ID}.appdata.xml"
 
 sed -i \
-  -e "s|<id>com.orcaslicer.BambuStudio</id>|<id>${APP_DESKTOP_ID}</id>|" \
-  -e "s|<launchable type=\"desktop-id\">com.orcaslicer.BambuStudio.desktop</launchable>|<launchable type=\"desktop-id\">${APP_DESKTOP_ID}.desktop</launchable>|" \
+  -e "s|<id>com.orcaslicer.OrcaStudio</id>|<id>${APP_DESKTOP_ID}</id>|" \
+  -e "s|<launchable type=\"desktop-id\">com.orcaslicer.OrcaStudio.desktop</launchable>|<launchable type=\"desktop-id\">${APP_DESKTOP_ID}.desktop</launchable>|" \
   "usr/share/metainfo/${APP_DESKTOP_ID}.metainfo.xml" \
   "usr/share/metainfo/${APP_DESKTOP_ID}.appdata.xml"
 

@@ -15,6 +15,13 @@ jobs:
         with:
           lfs: 'false'
 
+      - name: Verify Linux runtime transport logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/slicer_linux_runtime/verify_full_linux_transport.py
+          python3 tools/slicer_linux_runtime/test_runtime_dispatcher.py
+
       - uses: lukka/get-cmake@latest
         with:
           cmakeVersion: "~4.3.0"
@@ -23,6 +30,13 @@ jobs:
 
       - name: Apt-Install Dependencies
         uses: ./.github/actions/apt-install-deps
+
+      - name: Install Linux auth browser build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 epiphany-browser libasound2t64 libgtk-3-dev libpulse0 libwebkit2gtk-4.1-dev novnc openbox openssl websockify x11vnc xvfb
 
       - name: Build Linux deps
         shell: bash
@@ -49,16 +63,19 @@ jobs:
         uses: actions/cache@v5
         with:
           path: tools/slicer_linux_runtime/rootfs/windows-wsl2-rootfs.tar
-          key: wsl-rootfs-ubuntu-24.04-v1-${{ hashFiles('tools/slicer_linux_runtime/rootfs/build_windows_wsl_rootfs.sh') }}
+          key: wsl-rootfs-ubuntu-24.04-v6-${{ hashFiles('tools/slicer_linux_runtime/rootfs/build_windows_wsl_rootfs.sh', 'tools/slicer_linux_runtime/rootfs/prepare_windows_wsl_rootfs.sh', 'tools/slicer_linux_runtime/rootfs/validate_windows_wsl_rootfs.py') }}
           restore-keys: |
-            wsl-rootfs-ubuntu-24.04-v1-
+            wsl-rootfs-ubuntu-24.04-v6-
 
       - name: Build linux host runtime and WSL rootfs
         shell: bash
         run: |
+          set -euo pipefail
           cmake --build build --config Release --target slicer_linux_runtime_host
           bash tools/slicer_linux_runtime_host/package_linux_host_runtime.sh build
+          (cd tools/slicer_linux_runtime_host/runtime/linux-x86_64 && sha256sum -c runtime-files.sha256)
           bash tools/slicer_linux_runtime/rootfs/build_windows_wsl_rootfs.sh tools/slicer_linux_runtime/rootfs/windows-wsl2-rootfs.tar
+          python3 tools/slicer_linux_runtime/rootfs/validate_windows_wsl_rootfs.py tools/slicer_linux_runtime/rootfs/windows-wsl2-rootfs.tar ubuntu-24.04-linux-auth-v3
           tar -czvf linux_host_runtime_${{ github.sha }}.tar.gz -C tools/slicer_linux_runtime_host/runtime linux-x86_64
           tar -czvf wsl_rootfs_${{ github.sha }}.tar.gz -C tools/slicer_linux_runtime/rootfs windows-wsl2-rootfs.tar
 
@@ -85,6 +102,7 @@ jobs:
   build_windows:
     name: Build Windows
     runs-on: windows-latest
+    timeout-minutes: 360
     needs: prepare_slicer_linux_runtime
     env:
       ORCA_UPDATER_SIG_KEY: ${{ secrets.ORCA_UPDATER_SIG_KEY }}
@@ -152,7 +170,7 @@ jobs:
           tar -xzf "$env:GITHUB_WORKSPACE\wsl_rootfs_artifact\wsl_rootfs_${{ github.sha }}.tar.gz" -C "$env:GITHUB_WORKSPACE\tools\slicer_linux_runtime\rootfs"
 
       - name: setup MSVC
-        uses: microsoft/setup-msbuild@v2
+        uses: microsoft/setup-msbuild@v3
 
       - name: Install nsis
         shell: pwsh
@@ -195,76 +213,77 @@ jobs:
         run: .\build_release_vs.bat slicer
 
 
-      - name: Ensure WSL is available for runtime validation
+      - name: Validate bundled Linux runtime package without requiring nested virtualization
         shell: pwsh
         run: |
-          $wsl = Join-Path $env:WINDIR 'System32\wsl.exe'
-          if (!(Test-Path $wsl)) { throw 'wsl.exe not found' }
-
-          $ready = $false
-          try {
-            & $wsl --status
-            if ($LASTEXITCODE -eq 0) { $ready = $true }
-          } catch {}
-
-          if (-not $ready) {
-            & $wsl --install --no-distribution
-            if ($LASTEXITCODE -ne 0) { throw 'wsl --install --no-distribution failed' }
-          }
-
-          & $wsl --update
-          if ($LASTEXITCODE -ne 0) { throw 'wsl --update failed' }
-
-          & $wsl --status
-          if ($LASTEXITCODE -ne 0) { throw 'WSL is still not ready after install/update' }
-
-      - name: Show packaged Slicer Linux runtime files
-        shell: pwsh
-        run: |
-          Get-ChildItem -Force "$env:GITHUB_WORKSPACE\build\OrcaSlicer" | Format-Table Name, Length -AutoSize
-
-      - name: Install bundled WSL2 Slicer Linux runtime into live plugins dir
-        shell: pwsh
-        run: |
-          & "$env:GITHUB_WORKSPACE\build\OrcaSlicer\install_runtime.ps1" -ReplaceExisting
-
-      - name: Show live component dir after installer
-        shell: pwsh
-        run: |
-          Get-ChildItem -Force "$env:APPDATA\BambuStudio_OrcaSlicer\plugins" | Format-Table Name, Length -AutoSize
-          Write-Host "--- cache dir ---"
-          if (Test-Path "$env:APPDATA\BambuStudio_OrcaSlicer\ota\plugins") {
-            Get-ChildItem -Force "$env:APPDATA\BambuStudio_OrcaSlicer\ota\plugins" | Format-Table Name, Length -AutoSize
-          }
-
-      - name: Validate live component dir bootstrap package
-        shell: pwsh
-        run: |
-          & "$env:APPDATA\BambuStudio_OrcaSlicer\plugins\verify_runtime.ps1" -PackageDir "$env:APPDATA\BambuStudio_OrcaSlicer\plugins" -ComponentCacheDir "$env:APPDATA\BambuStudio_OrcaSlicer\ota\plugins" -AllowMissingComponent
+          & "$env:GITHUB_WORKSPACE\build\OrcaStudio\verify_runtime.ps1" -PackageDir "$env:GITHUB_WORKSPACE\build\OrcaStudio" -PackageOnly
 
       - name: Create installer Win
         working-directory: ${{ github.workspace }}/build
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           cpack -G NSIS
-
-      - name: Pack app
-        working-directory: ${{ github.workspace }}/build
-        shell: cmd
-        run: '"C:/Program Files/7-Zip/7z.exe" a -tzip BambuStudio-OrcaSlicer_Windows_${{ env.ver }}_portable.zip ${{ github.workspace }}/build/OrcaSlicer'
-
-      - name: Upload artifacts Win portable
-        uses: actions/upload-artifact@v7
-        with:
-          name: BambuStudio-OrcaSlicer_Windows_${{ env.ver }}_portable
-          path: ${{ github.workspace }}/build/BambuStudio-OrcaSlicer_Windows_${{ env.ver }}_portable.zip
-          if-no-files-found: error
+          if ($LASTEXITCODE -ne 0) {
+            throw "CPack NSIS failed with exit code $LASTEXITCODE"
+          }
+          $installers = @(Get-ChildItem -LiteralPath . -Filter "OrcaStudio*.exe" -File)
+          if ($installers.Count -eq 0) {
+            throw "CPack did not create an OrcaStudio installer"
+          }
+          $installers | ForEach-Object {
+            Write-Host ("Installer: {0} ({1:N0} bytes)" -f $_.FullName, $_.Length)
+          }
 
       - name: Upload artifacts Win installer
         uses: actions/upload-artifact@v7
         with:
-          name: BambuStudio-OrcaSlicer_Windows_${{ env.ver }}_installer
-          path: |
-            ${{ github.workspace }}/build/BambuStudio-OrcaSlicer*.exe
-            ${{ github.workspace }}/build/OrcaSlicer*.exe
+          name: OrcaStudio_Windows_${{ env.ver }}_installer
+          path: ${{ github.workspace }}/build/OrcaStudio*.exe
           if-no-files-found: error
+          compression-level: 0
+
+      - name: Pack and verify portable app
+        working-directory: ${{ github.workspace }}/build
+        shell: pwsh
+        timeout-minutes: 90
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          $source = Join-Path $env:GITHUB_WORKSPACE "build\OrcaStudio"
+          $archive = Join-Path $env:GITHUB_WORKSPACE "build\OrcaStudio_Windows_${{ env.ver }}_portable.zip"
+          if (!(Test-Path -LiteralPath $sevenZip)) {
+            throw "7-Zip was not found: $sevenZip"
+          }
+          if (!(Test-Path -LiteralPath $source)) {
+            throw "Portable source directory was not found: $source"
+          }
+          $sourceBytes = (Get-ChildItem -LiteralPath $source -Recurse -Force -File | Measure-Object -Property Length -Sum).Sum
+          $rootfs = Join-Path $source "windows-wsl2-rootfs.tar"
+          Write-Host ("Portable source: {0:N0} bytes" -f $sourceBytes)
+          if (Test-Path -LiteralPath $rootfs) {
+            Write-Host ("WSL rootfs: {0:N0} bytes" -f (Get-Item -LiteralPath $rootfs).Length)
+          }
+          Get-PSDrive -Name ($env:GITHUB_WORKSPACE.Substring(0, 1)) | Format-List Name,Used,Free
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          & $sevenZip a -tzip -mx=1 -mmt=on -bso1 -bse1 $archive ".\OrcaStudio"
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip creation failed with exit code $LASTEXITCODE"
+          }
+          if (!(Test-Path -LiteralPath $archive) -or (Get-Item -LiteralPath $archive).Length -le 0) {
+            throw "Portable archive was not created"
+          }
+          & $sevenZip t -bso1 -bse1 $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip verification failed with exit code $LASTEXITCODE"
+          }
+          Write-Host ("Portable archive: {0:N0} bytes" -f (Get-Item -LiteralPath $archive).Length)
+
+      - name: Upload artifacts Win portable
+        uses: actions/upload-artifact@v7
+        with:
+          name: OrcaStudio_Windows_${{ env.ver }}_portable
+          path: ${{ github.workspace }}/build/OrcaStudio_Windows_${{ env.ver }}_portable.zip
+          if-no-files-found: error
+          compression-level: 0
+

@@ -1,10 +1,12 @@
 #include "PrinterFileSystem.h"
+#include "StaticBambuLib.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
 #include "libslic3r/Model.hpp"
 #include "slic3r/GUI/I18N.hpp"
 
 #include "../../Utils/NetworkAgent.hpp"
+#include "../../Utils/BBLNetworkPlugin.hpp"
 #include "../BitmapCache.hpp"
 
 #include <boost/algorithm/hex.hpp>
@@ -19,6 +21,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <mutex>
 
 #ifndef NDEBUG
 //#define PRINTER_FILE_SYSTEM_TEST
@@ -67,28 +70,6 @@ static std::map<int, std::string> error_messages = {
      {PrinterFileSystem::SEND_ERR, L("File upload failed, please try again.")}
 };
 
-struct StaticBambuLib : BambuLib {
-    static StaticBambuLib &get(BambuLib * copy = nullptr);
-    static int Fake_Bambu_Create(Bambu_Tunnel*, char const*) { return -2; }
-    static void reset();
-    static void release();
-private:
-    void add_copy(BambuLib *copy)
-    {
-        if (!copy)
-            return;
-        if (std::find(copies_.begin(), copies_.end(), copy) == copies_.end())
-            copies_.push_back(copy);
-    }
-
-    bool has_real_create() const
-    {
-        return Bambu_Create && Bambu_Create != Fake_Bambu_Create;
-    }
-
-    std::vector<BambuLib *> copies_;
-};
-
 PrinterFileSystem::PrinterFileSystem()
     : BambuLib(StaticBambuLib::get(this))
 {
@@ -125,6 +106,7 @@ PrinterFileSystem::PrinterFileSystem()
 
 PrinterFileSystem::~PrinterFileSystem()
 {
+    StaticBambuLib::remove(this);
     m_recv_thread.detach();
 }
 
@@ -1824,85 +1806,322 @@ static HMODULE module = NULL;
 static void* module = NULL;
 #endif
 
+static std::recursive_mutex static_bambu_mutex;
+static BambuLib real_bambu_lib{};
+static thread_local std::string locked_last_error_message;
+static thread_local const char* real_last_error_message = nullptr;
+static thread_local void* real_last_error_module = nullptr;
+
 static void* get_function(const char* name)
 {
-    void* function = nullptr;
-
     if (!module)
-        return function;
-
+        return nullptr;
 #if defined(_MSC_VER) || defined(_WIN32)
-    function = GetProcAddress(module, name);
+    void* function = reinterpret_cast<void*>(GetProcAddress(module, name));
 #else
-    function = dlsym(module, name);
+    void* function = dlsym(module, name);
 #endif
-
-    if (!function) {
+    if (!function)
         BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", can not find function %1%") % name;
-    }
     return function;
 }
 
-#define GET_FUNC(x) lib.x = reinterpret_cast<decltype(lib.x)>(get_function(#x))
+#define GET_REAL_FUNC(x) real_bambu_lib.x = reinterpret_cast<decltype(real_bambu_lib.x)>(get_function(#x))
 
-StaticBambuLib &StaticBambuLib::get(BambuLib *copy)
+template <class T>
+static T get_real_bambu_function(T BambuLib::*member)
+{
+    std::lock_guard<std::recursive_mutex> lock(static_bambu_mutex);
+    if (!module || module != Slic3r::NetworkAgent::get_bambu_source_entry())
+        return nullptr;
+    return real_bambu_lib.*member;
+}
+
+static int Locked_Bambu_Create(Bambu_Tunnel* tunnel, const char* path)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_Create);
+    if (!fn) {
+        if (tunnel)
+            *tunnel = nullptr;
+        return -2;
+    }
+    return fn(tunnel, path);
+}
+
+static void Locked_Bambu_SetLogger(Bambu_Tunnel tunnel, Logger logger, void* context)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_SetLogger))
+        fn(tunnel, logger, context);
+}
+
+static void Locked_Bambu_SetStreamInfoCallback(Bambu_Tunnel tunnel, StreamInfoCallback callback, void* context)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_SetStreamInfoCallback))
+        fn(tunnel, callback, context);
+}
+
+static void Locked_Bambu_SetTrackReporter(Bambu_Tunnel tunnel, TrackReporter reporter, void* context)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_SetTrackReporter))
+        fn(tunnel, reporter, context);
+}
+
+static int Locked_Bambu_Open(Bambu_Tunnel tunnel)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_Open);
+    return fn ? fn(tunnel) : -2;
+}
+
+static int Locked_Bambu_StartStream(Bambu_Tunnel tunnel, bool video)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_StartStream);
+    return fn ? fn(tunnel, video) : -2;
+}
+
+static int Locked_Bambu_StartStreamEx(Bambu_Tunnel tunnel, int type)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_StartStreamEx);
+    return fn ? fn(tunnel, type) : -2;
+}
+
+static int Locked_Bambu_GetStreamCount(Bambu_Tunnel tunnel)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_GetStreamCount);
+    return fn ? fn(tunnel) : -2;
+}
+
+static int Locked_Bambu_GetStreamInfo(Bambu_Tunnel tunnel, int index, Bambu_StreamInfo* info)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_GetStreamInfo);
+    return fn ? fn(tunnel, index, info) : -2;
+}
+
+static unsigned long Locked_Bambu_GetDuration(Bambu_Tunnel tunnel)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_GetDuration);
+    return fn ? fn(tunnel) : 0;
+}
+
+static int Locked_Bambu_Seek(Bambu_Tunnel tunnel, unsigned long time)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_Seek);
+    return fn ? fn(tunnel, time) : -2;
+}
+
+static int Locked_Bambu_ReadSample(Bambu_Tunnel tunnel, Bambu_Sample* sample)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_ReadSample);
+    return fn ? fn(tunnel, sample) : -2;
+}
+
+static int Locked_Bambu_SendMessage(Bambu_Tunnel tunnel, int ctrl, const char* data, int len)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_SendMessage);
+    return fn ? fn(tunnel, ctrl, data, len) : -2;
+}
+
+static int Locked_Bambu_RecvMessage(Bambu_Tunnel tunnel, int* ctrl, char* data, int* len)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_RecvMessage);
+    return fn ? fn(tunnel, ctrl, data, len) : -2;
+}
+
+static void Locked_Bambu_Close(Bambu_Tunnel tunnel)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_Close))
+        fn(tunnel);
+}
+
+static void Locked_Bambu_Destroy(Bambu_Tunnel tunnel)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_Destroy))
+        fn(tunnel);
+}
+
+static int Locked_Bambu_Init()
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_Init);
+    return fn ? fn() : -2;
+}
+
+static void Locked_Bambu_GetSessionStat(Bambu_Tunnel tunnel, Bambu_SessionStat* stat)
+{
+    if (stat)
+        *stat = {};
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_GetSessionStat))
+        fn(tunnel, stat);
+}
+
+static void Locked_Bambu_Deinit()
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    if (auto fn = get_real_bambu_function(&BambuLib::Bambu_Deinit))
+        fn();
+}
+
+static const char* Locked_Bambu_GetLastErrorMsg()
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto current_module = Slic3r::NetworkAgent::get_bambu_source_entry();
+    auto free_fn = get_real_bambu_function(&BambuLib::Bambu_FreeLogMsg);
+    if (real_last_error_message && free_fn && real_last_error_module == current_module)
+        free_fn(reinterpret_cast<const tchar*>(real_last_error_message));
+    real_last_error_message = nullptr;
+    real_last_error_module = nullptr;
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_GetLastErrorMsg);
+    real_last_error_message = fn ? fn() : nullptr;
+    real_last_error_module = real_last_error_message ? current_module : nullptr;
+    locked_last_error_message = real_last_error_message ? real_last_error_message : "";
+    return locked_last_error_message.c_str();
+}
+
+static void Locked_Bambu_FreeLogMsg(const tchar* msg)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    auto fn = get_real_bambu_function(&BambuLib::Bambu_FreeLogMsg);
+    if (!fn)
+        return;
+    if (reinterpret_cast<const void*>(msg) == reinterpret_cast<const void*>(locked_last_error_message.c_str()) && real_last_error_message) {
+        const char* original = real_last_error_message;
+        const bool same_module = real_last_error_module == Slic3r::NetworkAgent::get_bambu_source_entry();
+        real_last_error_message = nullptr;
+        real_last_error_module = nullptr;
+        if (same_module)
+            fn(reinterpret_cast<const tchar*>(original));
+        return;
+    }
+    fn(msg);
+}
+
+static void install_locked_bambu_functions(BambuLib& lib)
+{
+    lib.Bambu_Create = Locked_Bambu_Create;
+    lib.Bambu_SetLogger = Locked_Bambu_SetLogger;
+    lib.Bambu_SetStreamInfoCallback = Locked_Bambu_SetStreamInfoCallback;
+    lib.Bambu_SetTrackReporter = Locked_Bambu_SetTrackReporter;
+    lib.Bambu_Open = Locked_Bambu_Open;
+    lib.Bambu_StartStream = Locked_Bambu_StartStream;
+    lib.Bambu_StartStreamEx = Locked_Bambu_StartStreamEx;
+    lib.Bambu_GetStreamCount = Locked_Bambu_GetStreamCount;
+    lib.Bambu_GetStreamInfo = Locked_Bambu_GetStreamInfo;
+    lib.Bambu_GetDuration = Locked_Bambu_GetDuration;
+    lib.Bambu_Seek = Locked_Bambu_Seek;
+    lib.Bambu_ReadSample = Locked_Bambu_ReadSample;
+    lib.Bambu_SendMessage = Locked_Bambu_SendMessage;
+    lib.Bambu_RecvMessage = Locked_Bambu_RecvMessage;
+    lib.Bambu_Close = Locked_Bambu_Close;
+    lib.Bambu_Destroy = Locked_Bambu_Destroy;
+    lib.Bambu_Init = Locked_Bambu_Init;
+    lib.Bambu_GetSessionStat = Locked_Bambu_GetSessionStat;
+    lib.Bambu_Deinit = Locked_Bambu_Deinit;
+    lib.Bambu_GetLastErrorMsg = Locked_Bambu_GetLastErrorMsg;
+    lib.Bambu_FreeLogMsg = Locked_Bambu_FreeLogMsg;
+}
+
+static void refresh_real_bambu_functions_locked()
+{
+    auto current = Slic3r::NetworkAgent::get_bambu_source_entry();
+    if (module == current && real_bambu_lib.Bambu_Create)
+        return;
+    module = current;
+    real_bambu_lib = BambuLib{};
+    if (!module)
+        return;
+    GET_REAL_FUNC(Bambu_Create);
+    GET_REAL_FUNC(Bambu_Open);
+    GET_REAL_FUNC(Bambu_StartStream);
+    GET_REAL_FUNC(Bambu_StartStreamEx);
+    GET_REAL_FUNC(Bambu_GetStreamCount);
+    GET_REAL_FUNC(Bambu_GetStreamInfo);
+    GET_REAL_FUNC(Bambu_GetDuration);
+    GET_REAL_FUNC(Bambu_Seek);
+    GET_REAL_FUNC(Bambu_SendMessage);
+    GET_REAL_FUNC(Bambu_RecvMessage);
+    GET_REAL_FUNC(Bambu_ReadSample);
+    GET_REAL_FUNC(Bambu_Close);
+    GET_REAL_FUNC(Bambu_Destroy);
+    GET_REAL_FUNC(Bambu_SetLogger);
+    GET_REAL_FUNC(Bambu_SetStreamInfoCallback);
+    GET_REAL_FUNC(Bambu_SetTrackReporter);
+    GET_REAL_FUNC(Bambu_FreeLogMsg);
+    GET_REAL_FUNC(Bambu_Init);
+    GET_REAL_FUNC(Bambu_GetSessionStat);
+    GET_REAL_FUNC(Bambu_Deinit);
+    GET_REAL_FUNC(Bambu_GetLastErrorMsg);
+}
+
+StaticBambuLib& StaticBambuLib::storage()
 {
     static StaticBambuLib lib;
+    return lib;
+}
+
+void StaticBambuLib::add_copy(BambuLib* copy)
+{
+    if (copy && std::find(copies_.begin(), copies_.end(), copy) == copies_.end())
+        copies_.push_back(copy);
+}
+
+StaticBambuLib& StaticBambuLib::get(BambuLib* copy)
+{
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    std::lock_guard<std::recursive_mutex> lock(static_bambu_mutex);
+    auto& lib = storage();
     lib.add_copy(copy);
-
-    if (lib.has_real_create()) {
-        if (copy)
-            *copy = lib;
-        return lib;
-    }
-
-    if (!module) {
-        module = Slic3r::NetworkAgent::get_bambu_source_entry();
-    }
-
-    if (!module) {
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ", can not Load Library";
-    }
-
-    GET_FUNC(Bambu_Create);
-    GET_FUNC(Bambu_Open);
-    GET_FUNC(Bambu_StartStream);
-    GET_FUNC(Bambu_StartStreamEx);
-    GET_FUNC(Bambu_GetStreamCount);
-    GET_FUNC(Bambu_GetStreamInfo);
-    GET_FUNC(Bambu_SendMessage);
-    GET_FUNC(Bambu_ReadSample);
-    GET_FUNC(Bambu_Close);
-    GET_FUNC(Bambu_Destroy);
-    GET_FUNC(Bambu_SetLogger);
-    GET_FUNC(Bambu_FreeLogMsg);
-    GET_FUNC(Bambu_Init);
-    GET_FUNC(Bambu_Deinit);
-    GET_FUNC(Bambu_GetLastErrorMsg);
-
-    if (!lib.Bambu_Create)
-        lib.Bambu_Create = Fake_Bambu_Create;
-
+    refresh_real_bambu_functions_locked();
+    install_locked_bambu_functions(lib);
     if (copy)
         *copy = lib;
-
     return lib;
 }
 
 void StaticBambuLib::reset()
 {
-    auto &old_lib = get();
-    old_lib.Bambu_Create = nullptr;
-    auto &lib = get();
-    for (auto c : lib.copies_)
-        *c = lib;
+    auto module_lock = Slic3r::BBLNetworkPlugin::lock_module_for_call();
+    std::lock_guard<std::recursive_mutex> lock(static_bambu_mutex);
+    module = NULL;
+    real_bambu_lib = BambuLib{};
+    real_last_error_message = nullptr;
+    real_last_error_module = nullptr;
+    locked_last_error_message.clear();
+    refresh_real_bambu_functions_locked();
+    auto& lib = storage();
+    install_locked_bambu_functions(lib);
+    for (auto* copy : lib.copies_)
+        *copy = lib;
+}
+
+void StaticBambuLib::remove(BambuLib* copy)
+{
+    std::lock_guard<std::recursive_mutex> lock(static_bambu_mutex);
+    auto& copies = storage().copies_;
+    copies.erase(std::remove(copies.begin(), copies.end(), copy), copies.end());
 }
 
 void StaticBambuLib::release()
 {
-    if (auto f = get().Bambu_Deinit)
-        f();
+    Locked_Bambu_Deinit();
 }
 
-extern "C" BambuLib *bambulib_get() {
-    return &StaticBambuLib::get(); }
+extern "C" BambuLib* bambulib_get()
+{
+    return &StaticBambuLib::get();
+}

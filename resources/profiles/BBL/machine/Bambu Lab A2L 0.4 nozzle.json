@@ -17,7 +17,6 @@
 	],
 	"default_print_profile": "0.20mm Standard @BBL A2L",
 	"enable_long_retraction_when_cut": "2",
-	"extruder_clearance_dist_to_rod": "56.5",
 	"extruder_clearance_height_to_lid": "325",
 	"extruder_clearance_height_to_rod": "25",
 	"extruder_clearance_max_radius": "73",
@@ -30,6 +29,7 @@
 		"256x256",
 		"226x256"
 	],
+	"machine_bed_mass_Y": "2700",
 	"machine_load_filament_time": "11",
 	"machine_max_acceleration_extruding": [
 		"12000",
@@ -47,10 +47,12 @@
 		"1500",
 		"1500"
 	],
+	"machine_max_force_Y": "29",
 	"machine_max_jerk_e": [
 		"3",
 		"3"
 	],
+	"machine_max_printed_mass": "2000",
 	"machine_max_speed_x": [
 		"500",
 		"500"
@@ -71,6 +73,9 @@
 	"nozzle_volume": [
 		"92"
 	],
+	"deretract_speed_extruder_change": [
+		"30"
+	],
 	"printable_area": [
 		"0x0",
 		"330x0",
@@ -82,6 +87,7 @@
 	"retract_lift_below": [
 		"326"
 	],
+	"support_fast_purge_mode": "1",
 	"support_object_skip_flush": "1",
 	"upward_compatible_machine": [
 		"Bambu Lab H2S 0.4 nozzle"

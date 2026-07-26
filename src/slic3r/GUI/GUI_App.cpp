@@ -1,6 +1,7 @@
 #include "ExportPresetBundleDialog.hpp"
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
+#include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <map>
 #include <vector>
+#include <slic3r/plugin/PythonPluginInterface.hpp>
 #include <wx/event.h>
 
 // Localization headers: include libslic3r version first so everything in this file
@@ -27,6 +29,7 @@
 #include "slic3r/GUI/I18N.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <iterator>
 #include <exception>
 #include <cstdlib>
@@ -72,12 +75,13 @@
 
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Model.hpp"
-#include "libslic3r/I18N.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/Thread.hpp"
 #include "libslic3r/miniz_extension.hpp"
-#include "libslic3r/Utils.hpp"
 #include "libslic3r/Color.hpp"
+#include "slic3r/plugin/PluginManager.hpp"
+#include "slic3r/plugin/host/PluginHostUi.hpp"
+#include "slic3r/plugin/PythonInterpreter.hpp"
 
 #include "GUI.hpp"
 #include "GUI_Utils.hpp"
@@ -138,8 +142,13 @@
 
 #include "slic3r/Utils/NetworkAgentFactory.hpp"
 #include "slic3r/Utils/BBLNetworkPlugin.hpp"
+#include "slic3r/Utils/FileTransferUtils.hpp"
 #include "slic3r/Utils/SlicerLinuxRuntime/SlicerLinuxRuntimeConfig.hpp"
 #include "slic3r/Utils/bambu_networking.hpp"
+
+#include "PluginsDialog.hpp"
+#include "SpeedDialDialog.hpp"
+#include "TerminalDialog.hpp"
 
 //#ifdef WIN32
 //#include "BaseException.h"
@@ -175,13 +184,14 @@ typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS2)(
 #endif
 
 #if ENABLE_THUMBNAIL_GENERATOR_DEBUG
-#include <boost/beast/core/detail/base64.hpp>
 #include <boost/nowide/fstream.hpp>
 #endif // ENABLE_THUMBNAIL_GENERATOR_DEBUG
 
 #ifdef __WXGTK__
 #include "LinuxDisplayBackend.hpp"
 #endif
+
+#include "Printer/StaticBambuLib.hpp"
 
 // Needed for forcing menu icons back under gtk2 and gtk3
 #if defined(__WXGTK20__) || defined(__WXGTK3__)
@@ -190,12 +200,6 @@ typedef BOOL (WINAPI *LPFN_ISWOW64PROCESS2)(
 
 using namespace std::literals;
 namespace pt = boost::property_tree;
-
-struct StaticBambuLib
-{
-    static void reset();
-    static void release();
-};
 
 namespace Slic3r {
 namespace GUI {
@@ -321,6 +325,9 @@ public:
 
         m_bg_color = StateColor::darkModeColorFor(wxColour("#FFFFFF"));
         m_fg_color = StateColor::darkModeColorFor(wxColour("#6B6A6A"));
+        m_progress_bg_color = StateColor::darkModeColorFor(wxColour("#DFDFDF"));
+        m_progress_fg_color = StateColor::darkModeColorFor(wxColour("#009688"));
+        m_progress_h = FromDIP(6);
         bool dark_mode = m_fg_color != wxColour("#6B6A6A");
         wxSize sz  = m_window->GetClientSize();
         BitmapCache bmp_cache;
@@ -350,20 +357,34 @@ public:
         dc.DrawLabel(m_text_version, rc, wxALIGN_CENTER);
 
         dc.SetFont(m_font_action);
-        rc.y      = c_sz.GetHeight() * 0.88;
+        rc.y      = c_sz.GetHeight() * 0.85;
         rc.height = dc.GetTextExtent(m_text_action).GetHeight();
         dc.DrawLabel(m_text_action, rc, wxALIGN_CENTER);
+
+        const wxRect progress_rc(0, c_sz.GetHeight() - m_progress_h, c_sz.GetWidth(), m_progress_h);
+                
+        dc.SetPen(*wxTRANSPARENT_PEN);
+        dc.SetBrush(wxBrush(m_progress_bg_color));
+        dc.DrawRectangle(progress_rc);
+
+        const int fill_width = progress_rc.GetWidth() * m_progress * 0.01;
+        if (fill_width > 0) {
+            dc.SetBrush(wxBrush(m_progress_fg_color));
+            dc.DrawRectangle(0, progress_rc.GetTop(), fill_width, m_progress_h);
+        }
     }
 
-    void SetText(const wxString& text)
+    void SetText(const wxString& text, int progress)
     {
-        if (!text.empty()) {
+        int calc_progress = std::max(m_progress, std::clamp(progress, 0, 100));
+        if (m_text_action != text || m_progress != calc_progress){
             m_text_action = text;
+            m_progress = calc_progress;
             m_window->Refresh();
             m_window->Update();
 #ifdef __WXOSX__
-            // without this code splash screen wouldn't be updated under OSX
-            wxYield();
+        // without this code splash screen wouldn't be updated under OSX
+        wxYield();
 #endif
         }
     }
@@ -400,9 +421,13 @@ private:
     wxBitmap m_logo_bmp;
     wxColour m_fg_color;
     wxColour m_bg_color;
+    wxColour m_progress_bg_color;
+    wxColour m_progress_fg_color;
 
     wxString m_text_version = GUI_App::format_display_version();
     wxString m_text_action  = _L("Loading configuration") + dots;
+    int      m_progress     = 0;
+    int      m_progress_h   = 6;
 
     wxFont m_font_version = Label::Body_16;
     wxFont m_font_action  = Label::Body_16;
@@ -423,7 +448,7 @@ static void migrate_flatpak_legacy_datadir(const boost::filesystem::path &data_d
     std::cerr << "Migrating Flatpak data dir: " << data_dir_path << std::endl;
 
     std::string legacy_data_dir_str = data_dir_path.string();
-    boost::replace_first(legacy_data_dir_str, "com.orcaslicer.OrcaSlicer", "io.github.orcaslicer.OrcaSlicer");
+    boost::replace_first(legacy_data_dir_str, "com.orcaslicer.OrcaSlicer", "io.github.softfever.OrcaSlicer");
     const fs::path legacy_data_dir(legacy_data_dir_str);
 
     std::cerr << "Legacy Flatpak data dir: " << legacy_data_dir << std::endl;
@@ -489,7 +514,7 @@ static const FileWildcards file_wildcards_by_type[FT_SIZE] = {
     /* FT_OBJ */     { L("OBJ files"),       { ".obj"sv } },
     /* FT_AMF */     { L("AMF files"),       { ".amf"sv, ".zip.amf"sv, ".xml"sv } },
     /* FT_3MF */     { L("3MF files"),       { ".3mf"sv } },
-    /* FT_GCODE_3MF */ {L("Gcode 3MF files"), {".gcode.3mf"sv}},
+    /* FT_GCODE_3MF */ {L("G-code 3MF files"), {".gcode.3mf"sv}},
     /* FT_GCODE */   { L("G-code files"),    { ".gcode"sv} },
 #ifdef __APPLE__
     /* FT_MODEL */
@@ -760,6 +785,15 @@ void GUI_App::post_init()
     if (! this->initialized())
         throw Slic3r::RuntimeError("Calling post_init() while not yet initialized");
 
+#if wxUSE_WEBVIEW_EDGE
+    // Ensure the Microsoft WebView2 runtime is installed before any WebView is
+    // created. The setup wizard and several dialogs render entirely through
+    // WebView2; without the runtime they come up blank. This runs here (not in the
+    // constructor) so that wxWidgets is fully initialized and the event loop is
+    // running, and so it precedes the first WebView creation (the setup wizard).
+    init_webview_runtime();
+#endif
+
     m_open_method = "double_click";
     bool switch_to_3d = false;
 
@@ -949,12 +983,38 @@ void GUI_App::post_init()
                 this->preset_updater->sync(http_url, language, network_ver, sys_preset ? preset_bundle : nullptr);
             }
 
-            this->check_new_version_sf();
             const auto cloud_provider = get_printer_cloud_provider();
             if (is_user_login(cloud_provider) && !app_config->get_stealth_mode()) {
               // this->check_privacy_version(0);
               request_user_handle(0, cloud_provider);
             }
+        });
+    }
+
+    // Orca: notify users upgrading from a pre-2.4.0 version that profile syncing
+    // moved from Bambu Cloud to Orca Cloud.
+    if (is_editor() && m_last_config_version && m_last_config_version->valid()
+        && *m_last_config_version < Semver(2, 4, 0)) {
+        CallAfter([] {
+            const wxString wiki_url = "https://www.orcaslicer.com/wiki/user_profiles/user_profiles.html#profiles-missing-after-updating-from-bambu-cloud";
+            MessageDialog dlg(nullptr,
+                _L("Since version 2.4.0, OrcaSlicer syncs user profiles through Orca Cloud instead of Bambu Cloud.\n\n"
+                   "To migrate your existing profiles, log in to Orca Cloud and they will be transferred automatically. "
+                   "To learn more about how OrcaSlicer stores and syncs your profiles, or to migrate your presets manually, check out our wiki.\n\n"
+                   "If you did not use Bambu Cloud to sync profiles, this change does not affect you and you can safely ignore this message."),
+                _L("Profile syncing change"),
+                wxOK,
+                "",
+                _L("Learn more"),
+                [wiki_url](const wxString &) { wxLaunchDefaultBrowser(wiki_url); });
+            // Hack: the "Learn more" link renders the message in a wxHtmlWindow whose
+            // height is underestimated for multi-paragraph text, leaving a scrollbar.
+            // The html sits in a proportion-1 sizer chain, so grow the dialog (never
+            // shrink it below its content width) to give the text enough room.
+            const wxSize sz = dlg.GetSize();
+            dlg.SetSize(std::max(sz.x, dlg.FromDIP(280)), std::max(sz.y, dlg.FromDIP(200)));
+            dlg.CenterOnParent();
+            dlg.ShowModal();
         });
     }
 
@@ -1048,9 +1108,10 @@ GUI_App::GUI_App()
 	//app config initializes early becasuse it is used in instance checking in OrcaSlicer.cpp
     this->init_app_config();
     this->init_download_path();
-#if wxUSE_WEBVIEW_EDGE
-    this->init_webview_runtime();
-#endif
+    // Note: the WebView2 runtime check (init_webview_runtime) used to run here, but
+    // the constructor executes before wxWidgets is fully initialized and before the
+    // event loop starts, so its modal prompt/installer could silently fail to appear.
+    // It now runs in post_init(), before the first WebView (the setup wizard) is created.
 
     reset_to_active();
 }
@@ -1073,6 +1134,12 @@ void GUI_App::shutdown()
     if (m_is_recreating_gui) return;
     stop_http_server();
     set_closing(true);
+    Slic3r::PluginManager::instance().set_shutting_down();
+
+    if (m_agent)
+        m_agent->set_printer_agent(nullptr);
+    NetworkAgentFactory::clear_printer_agent_cache();
+
     BOOST_LOG_TRIVIAL(info) << "GUI_App::shutdown exit";
 }
 
@@ -1133,8 +1200,21 @@ std::string GUI_App::get_plugin_url(std::string name, std::string country_code)
 {
     std::string url = get_http_url(country_code);
 
-    std::string curr_version = SLIC3R_VERSION;
-    std::string using_version = curr_version.substr(0, 9) + "00";
+    std::string curr_version;
+    if (use_legacy_network_plugin()) {
+        curr_version = BAMBU_NETWORK_AGENT_VERSION_LEGACY;
+    } else if (name == "plugins" && app_config) {
+        std::string user_version = app_config->get_network_plugin_version();
+        curr_version = user_version.empty() ? get_latest_network_version() : user_version;
+    } else {
+        curr_version = get_latest_network_version();
+    }
+
+    // The cloud endpoint is series-keyed and serves the series' newest build: AA.BB.CC.00.
+    // Build it from the series so an 8-char series string (02.08.01) works too.
+    std::string using_version = use_legacy_network_plugin()
+        ? curr_version.substr(0, 9) + "00"
+        : network_plugin_series(curr_version) + ".00";
     if (name == "cameratools")
         using_version = curr_version.substr(0, 6) + "00.00";
     url += (boost::format("?slicer/%1%/cloud=%2%") % name % using_version).str();
@@ -1156,13 +1236,136 @@ static std::string decode(std::string const& extra, std::string const& path = {}
     return Slic3r::decode_path(path.c_str());
 }
 
-int GUI_App::download_plugin(std::string name, std::string package_name, InstallProgressFn pro_fn, WasCancelledFn cancel_fn)
+
+static bool safe_plugin_archive_path(const boost::filesystem::path& input, boost::filesystem::path& output)
+{
+    if (input.empty() || input.is_absolute() || input.has_root_name() || input.has_root_directory())
+        return false;
+    output = input.lexically_normal();
+    if (output.empty() || output == ".")
+        return false;
+    for (const auto& part : output) {
+        if (part == "..")
+            return false;
+    }
+    return true;
+}
+
+static bool copy_plugin_entry(const boost::filesystem::path& source, const boost::filesystem::path& target, std::string& error)
+{
+    try {
+        if (boost::filesystem::is_symlink(source)) {
+            boost::filesystem::create_directories(target.parent_path());
+            boost::filesystem::copy_symlink(source, target);
+            return true;
+        }
+        if (boost::filesystem::is_directory(source)) {
+            boost::filesystem::create_directories(target);
+            for (boost::filesystem::directory_iterator it(source); it != boost::filesystem::directory_iterator(); ++it) {
+                if (!copy_plugin_entry(it->path(), target / it->path().filename(), error))
+                    return false;
+            }
+            return true;
+        }
+        if (!boost::filesystem::is_regular_file(source)) {
+            error = "unsupported filesystem entry: " + source.string();
+            return false;
+        }
+        boost::filesystem::create_directories(target.parent_path());
+        return copy_file(source.string(), target.string(), error, false) == CopyFileResult::SUCCESS;
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+}
+
+static bool copy_plugin_contents(const boost::filesystem::path& source, const boost::filesystem::path& target,
+                                 const boost::filesystem::path& skipped, std::string& error)
+{
+    try {
+        boost::filesystem::create_directories(target);
+        if (!boost::filesystem::is_directory(source))
+            return true;
+        for (boost::filesystem::directory_iterator it(source); it != boost::filesystem::directory_iterator(); ++it) {
+            if (!skipped.empty() && it->path() == skipped)
+                continue;
+            if (!copy_plugin_entry(it->path(), target / it->path().filename(), error))
+                return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+}
+
+static bool restore_plugin_backup(const boost::filesystem::path& component_folder,
+                                  const boost::filesystem::path& backup_folder, std::string& error)
+{
+    try {
+        for (boost::filesystem::directory_iterator it(component_folder); it != boost::filesystem::directory_iterator();) {
+            const auto current = it->path();
+            ++it;
+            if (current == backup_folder)
+                continue;
+            boost::filesystem::remove_all(current);
+        }
+        return copy_plugin_contents(backup_folder, component_folder, {}, error);
+    } catch (const std::exception& e) {
+        error = e.what();
+        return false;
+    }
+}
+
+static void remove_or_retire_plugin_entry(const boost::filesystem::path& path)
+{
+    if (!boost::filesystem::exists(path) && !boost::filesystem::is_symlink(path))
+        return;
+
+    boost::system::error_code remove_error;
+    boost::filesystem::remove_all(path, remove_error);
+    if (!remove_error)
+        return;
+
+    boost::filesystem::path retired = path;
+    retired += ".old";
+    boost::system::error_code retired_error;
+    boost::filesystem::remove_all(retired, retired_error);
+    retired_error.clear();
+    boost::filesystem::rename(path, retired, retired_error);
+    if (retired_error)
+        throw boost::filesystem::filesystem_error("cannot replace in-use plug-in file", path, retired_error);
+}
+
+static const std::vector<std::string>& known_linux_component_payload_names()
+{
+    static const std::vector<std::string> names = {
+        Slic3r::SlicerLinuxRuntime::linux_component_library_name(),
+        Slic3r::SlicerLinuxRuntime::linux_source_library_name(),
+        "liblive555.so",
+        "libagora_rtc_sdk.so",
+        "libagora-fdkaac.so",
+        Slic3r::SlicerLinuxRuntime::linux_component_manifest_file_name()
+    };
+    return names;
+}
+
+static bool is_known_linux_component_payload_name(const std::string& file_name)
+{
+    const auto& names = known_linux_component_payload_names();
+    return std::find(names.begin(), names.end(), file_name) != names.end();
+}
+
+int GUI_App::download_plugin(std::string name, std::string package_name, InstallProgressFn pro_fn,
+                             WasCancelledFn cancel_fn, std::string* downloaded_version)
 {
     int result = 0;
     json j;
     std::string err_msg;
 
-    // get country_code
+    if (downloaded_version)
+        downloaded_version->clear();
+
     AppConfig* app_config = wxGetApp().app_config;
     if (!app_config) {
         j["result"] = "failed";
@@ -1172,21 +1375,24 @@ int GUI_App::download_plugin(std::string name, std::string package_name, Install
 
     BOOST_LOG_TRIVIAL(info) << "[download_plugin]: enter";
     m_networking_cancel_update = false;
-    // get temp path
-    fs::path target_file_path = (fs::temp_directory_path() / package_name);
+
+    const fs::path package_file = fs::path(package_name).filename();
+    if (package_file.empty()) {
+        j["result"] = "failed";
+        j["error_msg"] = "invalid package name";
+        return -1;
+    }
+
+    const fs::path target_file_path = fs::temp_directory_path() / package_file;
     fs::path tmp_path = target_file_path;
     tmp_path += format(".%1%%2%", get_current_pid(), ".tmp");
 
-    // Determine the package OS for this optional external component.
-    // The component is installed by the user. On Windows/macOS it is executed by
-    // the local Linux runtime, so the existing download flow selects
-    // the Linux component package for that execution environment.
     std::string os_type;
     if (Slic3r::SlicerLinuxRuntime::should_select_linux_component_package(name)) {
         os_type = Slic3r::SlicerLinuxRuntime::linux_component_package_os_type();
     } else {
 #if defined(__WINDOWS__)
-        os_type = is_running_on_arm64() ? "windows_arm" : "windows";
+        os_type = (is_running_on_arm64() && !use_legacy_network_plugin()) ? "windows_arm" : "windows";
 #elif defined(__APPLE__)
         os_type = "macos";
 #elif defined(__linux__)
@@ -1196,312 +1402,484 @@ int GUI_App::download_plugin(std::string name, std::string package_name, Install
 #endif
     }
 
-    // get_url
-    std::string  url = get_plugin_url(name, app_config->get_country_code());
+    const std::string url = get_plugin_url(name, app_config->get_country_code());
     std::string download_url;
-    Slic3r::Http http_url = Slic3r::Http::get(url);
+    std::string package_version;
     BOOST_LOG_TRIVIAL(info) << "[download_plugin]: check the plugin from " << url;
-    http_url.timeout_connect(TIMEOUT_CONNECT)
-        .timeout_max(TIMEOUT_RESPONSE)
-        .header("X-BBL-OS-Type", os_type)
-        .on_complete(
-        [&download_url](std::string body, unsigned status) {
-            try {
-                json j = json::parse(body);
-                std::string message = j["message"].get<std::string>();
 
-                if (message == "success") {
-                    json resource = j.at("resources");
-                    if (resource.is_array()) {
-                        for (auto iter = resource.begin(); iter != resource.end(); iter++) {
-                            Semver version;
-                            std::string url;
-                            std::string type;
-                            std::string vendor;
-                            std::string description;
-                            for (auto sub_iter = iter.value().begin(); sub_iter != iter.value().end(); sub_iter++) {
-                                if (boost::iequals(sub_iter.key(), "type")) {
-                                    type = sub_iter.value();
-                                    BOOST_LOG_TRIVIAL(info) << "[download_plugin]: get version of settings's type, " << sub_iter.value();
-                                }
-                                else if (boost::iequals(sub_iter.key(), "version")) {
-                                    version = *(Semver::parse(sub_iter.value()));
-                                }
-                                else if (boost::iequals(sub_iter.key(), "description")) {
-                                    description = sub_iter.value();
-                                }
-                                else if (boost::iequals(sub_iter.key(), "url")) {
-                                    url = sub_iter.value();
-                                }
-                            }
-                            BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: get type " << type << ", version " << version.to_string() << ", url " << url;
-                            download_url = url;
-                        }
-                    }
+    auto parse_plugin_manifest = [&download_url, &package_version](const std::string& body) {
+        try {
+            const json response = json::parse(body);
+            if (response.value("message", std::string()) != "success") {
+                BOOST_LOG_TRIVIAL(error) << "[download_plugin 1]: server rejected plugin manifest";
+                return;
+            }
+
+            const auto resources = response.value("resources", json::array());
+            if (!resources.is_array()) {
+                BOOST_LOG_TRIVIAL(error) << "[download_plugin 1]: resources is not an array";
+                return;
+            }
+
+            boost::optional<Semver> selected_version;
+            for (const auto& entry : resources) {
+                if (!entry.is_object())
+                    continue;
+
+                const std::string type = entry.value("type", std::string());
+                const std::string version = entry.value("version", std::string());
+                const std::string entry_url = entry.value("url", std::string());
+                BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: candidate type=" << type
+                                        << ", version=" << version
+                                        << ", url=" << entry_url;
+
+                const boost::optional<Semver> parsed_version = Semver::parse(version);
+                if (entry_url.empty() || !parsed_version) {
+                    BOOST_LOG_TRIVIAL(warning) << "[download_plugin 1]: ignored incomplete or invalid resource entry";
+                    continue;
                 }
-                else {
-                    BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: get version of plugin failed, body=" << body;
+
+                if (!selected_version || *selected_version < *parsed_version) {
+                    selected_version = *parsed_version;
+                    download_url = entry_url;
+                    package_version = version;
                 }
             }
-            catch (...) {
-                BOOST_LOG_TRIVIAL(error) << "[download_plugin 1]: catch unknown exception";
-                ;
-            }
-        }).on_error(
-            [&result, &err_msg](std::string body, std::string error, unsigned int status) {
-                BOOST_LOG_TRIVIAL(error) << "[download_plugin 1] on_error: " << error<<", body = " << body;
-                err_msg += "[download_plugin 1] on_error: " + error + ", body = " + body;
-                result = -1;
-        }).perform_sync();
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "[download_plugin 1]: invalid manifest: " << e.what();
+        }
+    };
+
+    // Package selection is controlled by X-BBL-OS-Type. Downloading the bytes must
+    // remain native so a clean Windows/macOS installation does not need the Linux
+    // runtime before it can download the Linux component that runtime will execute.
+    Slic3r::Http::get(url)
+        .via_native_transport()
+        .size_limit(4ULL * 1024ULL * 1024ULL)
+        .timeout_connect(TIMEOUT_CONNECT)
+        .timeout_max(TIMEOUT_RESPONSE)
+        .header("X-BBL-Client-Type", "slicer")
+        .header("X-BBL-Client-Name", "BambuStudio")
+        .header("X-BBL-Client-Version", get_bbl_client_version())
+        .header("X-BBL-OS-Type", os_type)
+        .header("X-BBL-OS-Version", "0.0.0")
+        .header("X-BBL-Device-ID", app_config->get("slicer_uuid"))
+        .on_complete([&](std::string body, unsigned) { parse_plugin_manifest(body); })
+        .on_error([&result, &err_msg](std::string, std::string error, unsigned int status) {
+            BOOST_LOG_TRIVIAL(error) << "[download_plugin 1] on_error: " << error << ", status=" << status;
+            err_msg = "[download_plugin 1] on_error: " + error;
+            result = -1;
+        })
+        .perform_sync();
 
     bool cancel = false;
     if (result < 0) {
         j["result"] = "failed";
         j["error_msg"] = err_msg;
-        if (pro_fn) pro_fn(InstallStatusDownloadFailed, 0, cancel);
+        if (pro_fn)
+            pro_fn(InstallStatusDownloadFailed, 0, cancel);
         return result;
     }
 
-
-    if (download_url.empty()) {
-        BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: no available plugin found for this app version: " << SLIC3R_VERSION;
-        if (pro_fn) pro_fn(InstallStatusDownloadFailed, 0, cancel);
+    if (download_url.empty() || package_version.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "[download_plugin 1]: no complete plugin resource for app version " << SLIC3R_VERSION;
+        if (pro_fn)
+            pro_fn(InstallStatusDownloadFailed, 0, cancel);
         j["result"] = "failed";
-        j["error_msg"] = "[download_plugin 1]: no available plugin found for this app version: " + std::string(SLIC3R_VERSION);
+        j["error_msg"] = "[download_plugin 1]: server response did not contain both URL and version";
         return -1;
     }
-    else if (pro_fn) {
+
+    if (pro_fn)
         pro_fn(InstallStatusNormal, 5, cancel);
-    }
 
-    if (m_networking_cancel_update || cancel) {
-        BOOST_LOG_TRIVIAL(info) << boost::format("[download_plugin 1]: %1%, cancelled by user") % __LINE__;
+    if (m_networking_cancel_update || cancel || (cancel_fn && cancel_fn())) {
+        BOOST_LOG_TRIVIAL(info) << "[download_plugin 1]: cancelled by user";
         j["result"] = "failed";
-        j["error_msg"] = (boost::format("[download_plugin 1]: %1%, cancelled by user") % __LINE__).str();
+        j["error_msg"] = "[download_plugin 1]: cancelled by user";
         return -1;
     }
-    BOOST_LOG_TRIVIAL(info) << "[download_plugin] get_url = " << download_url;
 
-    // download
-    Slic3r::Http http = Slic3r::Http::get(download_url);
+    BOOST_LOG_TRIVIAL(info) << "[download_plugin] get_url = " << download_url
+                            << ", package_version = " << package_version;
+
     int reported_percent = 0;
-    http.header("X-BBL-OS-Type", os_type)
-        .on_progress(
-        [this, &pro_fn, cancel_fn, &result, &reported_percent, &err_msg](Slic3r::Http::Progress progress, bool& cancel) {
-            int percent = 0;
-            if (progress.dltotal != 0)
-                percent = progress.dlnow * 50 / progress.dltotal;
+    Slic3r::Http::get(download_url)
+        .via_native_transport()
+        .size_limit(512ULL * 1024ULL * 1024ULL)
+        .timeout_connect(TIMEOUT_CONNECT)
+        .timeout_max(TIMEOUT_RESPONSE)
+        .header("X-BBL-Client-Type", "slicer")
+        .header("X-BBL-Client-Name", "BambuStudio")
+        .header("X-BBL-Client-Version", get_bbl_client_version())
+        .header("X-BBL-OS-Type", os_type)
+        .header("X-BBL-OS-Version", "0.0.0")
+        .header("X-BBL-Device-ID", app_config->get("slicer_uuid"))
+        .on_progress([this, &pro_fn, cancel_fn, &result, &reported_percent, &err_msg](Slic3r::Http::Progress progress, bool& cancel_http) {
+            const int percent = progress.dltotal == 0
+                ? 0
+                : static_cast<int>(progress.dlnow * 50 / progress.dltotal);
             bool was_cancel = false;
-            if (pro_fn && ((percent - reported_percent) >= 10)) {
+            if (pro_fn && percent - reported_percent >= 10) {
                 pro_fn(InstallStatusNormal, percent, was_cancel);
                 reported_percent = percent;
-                BOOST_LOG_TRIVIAL(info) << "[download_plugin 2] progress: " << reported_percent;
             }
-            cancel = m_networking_cancel_update || was_cancel;
-            if (cancel_fn)
-                if (cancel_fn())
-                    cancel = true;
-
-            if (cancel) {
-                err_msg += "[download_plugin] cancel";
+            cancel_http = m_networking_cancel_update || was_cancel || (cancel_fn && cancel_fn());
+            if (cancel_http) {
+                err_msg = "[download_plugin 2] cancelled";
                 result = -1;
             }
         })
-        .on_complete([&pro_fn, tmp_path, target_file_path](std::string body, unsigned status) {
-            BOOST_LOG_TRIVIAL(info) << "[download_plugin 2] completed";
-            bool cancel = false;
-            int percent = 0;
+        .on_complete([this, &pro_fn, cancel_fn, &result, &err_msg, tmp_path, target_file_path](std::string body, unsigned) {
+            if (result < 0 || m_networking_cancel_update || (cancel_fn && cancel_fn())) {
+                err_msg = "[download_plugin 2] cancelled before package commit";
+                result = -1;
+                return;
+            }
+
             fs::fstream file(tmp_path, std::ios::out | std::ios::binary | std::ios::trunc);
-            file.write(body.c_str(), body.size());
+            file.write(body.data(), static_cast<std::streamsize>(body.size()));
             file.close();
-            fs::rename(tmp_path, target_file_path);
-            if (pro_fn) pro_fn(InstallStatusDownloadCompleted, 80, cancel);
-            })
-        .on_error([&pro_fn, &result, &err_msg](std::string body, std::string error, unsigned int status) {
-            bool cancel = false;
-            if (pro_fn) pro_fn(InstallStatusDownloadFailed, 0, cancel);
-            BOOST_LOG_TRIVIAL(error) << "[download_plugin 2] on_error: " << error<<", body = " << body;
-            err_msg += "[download_plugin 2] on_error: " + error + ", body = " + body;
+            if (!file.good()) {
+                err_msg = "[download_plugin 2] failed to write downloaded package";
+                result = -1;
+                return;
+            }
+
+            const std::error_code rename_error = rename_file(tmp_path.string(), target_file_path.string());
+            if (rename_error) {
+                err_msg = "[download_plugin 2] failed to commit downloaded package: " + rename_error.message();
+                result = -1;
+                boost::system::error_code remove_error;
+                fs::remove(tmp_path, remove_error);
+                return;
+            }
+
+            bool ignored = false;
+            if (pro_fn)
+                pro_fn(InstallStatusDownloadCompleted, 80, ignored);
+        })
+        .on_error([&pro_fn, &result, &err_msg](std::string, std::string error, unsigned int status) {
+            bool ignored = false;
+            if (pro_fn)
+                pro_fn(InstallStatusDownloadFailed, 0, ignored);
+            BOOST_LOG_TRIVIAL(error) << "[download_plugin 2] on_error: " << error << ", status=" << status;
+            err_msg = "[download_plugin 2] on_error: " + error;
             result = -1;
-        });
-    http.perform_sync();
+        })
+        .perform_sync();
+
+    if (result < 0) {
+        boost::system::error_code remove_error;
+        fs::remove(tmp_path, remove_error);
+    } else if (downloaded_version) {
+        *downloaded_version = package_version;
+    }
+
     j["result"] = result < 0 ? "failed" : "success";
     j["error_msg"] = err_msg;
     return result;
 }
 
-int GUI_App::install_plugin(std::string name, std::string package_name, InstallProgressFn pro_fn, WasCancelledFn cancel_fn)
+int GUI_App::install_plugin(std::string name, std::string package_name, InstallProgressFn pro_fn,
+                            WasCancelledFn cancel_fn, const std::string& package_version)
 {
     bool cancel = false;
-    std::string target_file_path = (fs::temp_directory_path() / package_name).string();
+    const boost::filesystem::path package_file = boost::filesystem::path(package_name).filename();
+    if (package_file.empty())
+        return InstallStatusUnzipFailed;
+    if (name == "plugins" && package_version.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] missing downloaded package version";
+        return InstallStatusUnzipFailed;
+    }
+    if (name == "plugins" && app_config == nullptr) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] app_config is nullptr";
+        return InstallStatusUnzipFailed;
+    }
+    const std::string target_file_path = (fs::temp_directory_path() / package_file).string();
 
     BOOST_LOG_TRIVIAL(info) << "[install_plugin] enter";
-    std::string data_dir_str = data_dir();
-    boost::filesystem::path data_dir_path(data_dir_str);
-    auto component_folder = data_dir_path / name;
-    auto backup_folder = component_folder / "backup";
-    if (!boost::filesystem::exists(component_folder))
-        boost::filesystem::create_directory(component_folder);
-    if (!boost::filesystem::exists(backup_folder))
-        boost::filesystem::create_directory(backup_folder);
+    const boost::filesystem::path data_dir_path(data_dir());
+    const auto component_folder = data_dir_path / name;
+    const auto backup_folder = component_folder / "backup";
+    const auto parent_folder = component_folder.parent_path();
+    const std::string suffix = "." + std::to_string(get_current_pid());
+    const auto staging_folder = parent_folder / (component_folder.filename().string() + ".install" + suffix);
+    const auto backup_staging_folder = parent_folder / (component_folder.filename().string() + ".backup" + suffix);
+    const auto previous_backup_folder = parent_folder / (component_folder.filename().string() + ".previous-backup" + suffix);
 
-    if (m_networking_cancel_update)
+    auto cleanup = [&]() {
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(staging_folder, ec);
+        ec.clear();
+        boost::filesystem::remove_all(backup_staging_folder, ec);
+        ec.clear();
+        boost::filesystem::remove_all(previous_backup_folder, ec);
+    };
+
+    cleanup();
+    try {
+        boost::filesystem::create_directories(component_folder);
+        boost::filesystem::create_directories(staging_folder);
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] staging setup failed: " << e.what();
+        cleanup();
+        return InstallStatusUnzipFailed;
+    }
+
+    if (m_networking_cancel_update) {
+        cleanup();
         return -1;
+    }
     if (pro_fn)
         pro_fn(InstallStatusNormal, 50, cancel);
 
     mz_zip_archive archive;
     mz_zip_zero_struct(&archive);
     if (!open_zip_reader(&archive, target_file_path)) {
-        if (pro_fn) pro_fn(InstallStatusDownloadFailed, 0, cancel);
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusDownloadFailed, 0, cancel);
         return InstallStatusUnzipFailed;
     }
 
     const bool select_linux_component_package = Slic3r::SlicerLinuxRuntime::should_select_linux_component_package(name);
     const std::string manifest_name = Slic3r::SlicerLinuxRuntime::linux_component_manifest_file_name();
+    constexpr mz_uint64 max_entry_size = 1024ULL * 1024ULL * 1024ULL;
+    constexpr mz_uint64 max_archive_size = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    mz_uint64 total_size = 0;
+    bool extracted_any = false;
 
-    mz_uint num_entries = mz_zip_reader_get_num_files(&archive);
+    const auto fail_extract = [&](const std::string& reason) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] " << reason;
+        close_zip_reader(&archive);
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusUnzipFailed, 0, cancel);
+        return InstallStatusUnzipFailed;
+    };
+
+    const mz_uint num_entries = mz_zip_reader_get_num_files(&archive);
     mz_zip_archive_file_stat stat;
-    for (mz_uint i = 0; i < num_entries; i++) {
-        if (m_networking_cancel_update || cancel) {
+    for (mz_uint i = 0; i < num_entries; ++i) {
+        if (m_networking_cancel_update || cancel || (cancel_fn && cancel_fn())) {
             close_zip_reader(&archive);
+            cleanup();
             return -1;
         }
         if (!mz_zip_reader_file_stat(&archive, i, &stat))
-            continue;
-        if (stat.m_uncomp_size == 0)
-            continue;
+            return fail_extract("failed to read archive entry");
 
-        std::string dest_file;
+        std::string archive_name;
         if (stat.m_is_utf8) {
-            dest_file = stat.m_filename;
+            archive_name = stat.m_filename;
         } else {
             std::string extra(1024, 0);
-            size_t n = mz_zip_reader_get_extra(&archive, stat.m_file_index, extra.data(), extra.size());
-            dest_file = decode(extra.substr(0, n), stat.m_filename);
+            const size_t n = mz_zip_reader_get_extra(&archive, stat.m_file_index, extra.data(), extra.size());
+            archive_name = decode(extra.substr(0, n), stat.m_filename);
         }
 
-        boost::filesystem::path relative(dest_file);
+        boost::filesystem::path relative;
+        if (!safe_plugin_archive_path(boost::filesystem::path(archive_name), relative))
+            return fail_extract("unsafe archive path: " + archive_name);
+
         if (select_linux_component_package) {
             const std::string file_name = relative.filename().string();
-            if (!(file_name == manifest_name || Slic3r::SlicerLinuxRuntime::is_linux_component_package_filename(file_name)))
+            if (!is_known_linux_component_payload_name(file_name))
                 continue;
             relative = boost::filesystem::path(file_name);
         }
 
-        auto dest_path = component_folder / relative;
-        boost::filesystem::create_directories(dest_path.parent_path());
-        std::string dest_zip_file = encode_path(dest_path.string().c_str());
+        if (stat.m_is_directory) {
+            try {
+                boost::filesystem::create_directories(staging_folder / relative);
+            } catch (const std::exception& e) {
+                return fail_extract(e.what());
+            }
+            continue;
+        }
+        if (stat.m_uncomp_size == 0)
+            continue;
+        if (stat.m_uncomp_size > max_entry_size || total_size > max_archive_size - stat.m_uncomp_size)
+            return fail_extract("archive size limit exceeded");
+        total_size += stat.m_uncomp_size;
 
+        const auto destination = staging_folder / relative;
         try {
-            if (fs::exists(dest_path))
-                fs::remove(dest_path);
-            mz_bool res = 0;
+            boost::filesystem::create_directories(destination.parent_path());
+            if (boost::filesystem::exists(destination) || boost::filesystem::is_symlink(destination))
+                boost::filesystem::remove_all(destination);
+
+            mz_bool result = 0;
 #ifndef WIN32
             if (S_ISLNK(stat.m_external_attr >> 16)) {
-                std::string link(stat.m_uncomp_size + 1, 0);
-                res = mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, link.data(), stat.m_uncomp_size, 0);
-                try {
-                    boost::filesystem::create_symlink(link, dest_path);
-                } catch (const std::exception &) {}
+                std::string link(stat.m_uncomp_size, '\0');
+                result = mz_zip_reader_extract_to_mem(&archive, stat.m_file_index, link.data(), stat.m_uncomp_size, 0);
+                boost::filesystem::path safe_link;
+                if (!result || !safe_plugin_archive_path(boost::filesystem::path(link), safe_link))
+                    return fail_extract("unsafe archive symlink: " + archive_name);
+                boost::filesystem::create_symlink(safe_link, destination);
             } else {
 #endif
-                res = mz_zip_reader_extract_to_file(&archive, stat.m_file_index, dest_zip_file.c_str(), 0);
+                const std::string encoded_destination = encode_path(destination.string().c_str());
+                result = mz_zip_reader_extract_to_file(&archive, stat.m_file_index, encoded_destination.c_str(), 0);
 #ifndef WIN32
             }
 #endif
-            if (res == 0) {
 #ifdef WIN32
-                std::wstring new_dest_zip_file = boost::locale::conv::utf_to_utf<wchar_t>(dest_path.generic_string());
-                res = mz_zip_reader_extract_to_file_w(&archive, stat.m_file_index, new_dest_zip_file.c_str(), 0);
-#endif
-                if (res == 0) {
-                    close_zip_reader(&archive);
-                    if (pro_fn) pro_fn(InstallStatusUnzipFailed, 0, cancel);
-                    return InstallStatusUnzipFailed;
-                }
+            if (!result) {
+                const std::wstring wide_destination = boost::locale::conv::utf_to_utf<wchar_t>(destination.generic_string());
+                result = mz_zip_reader_extract_to_file_w(&archive, stat.m_file_index, wide_destination.c_str(), 0);
             }
+#endif
+            if (!result)
+                return fail_extract("failed to extract archive entry: " + archive_name);
 
             if (select_linux_component_package && relative.filename().string() != manifest_name) {
-                std::string validate_reason;
-                if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_file(dest_path.string(), &validate_reason)) {
-                    BOOST_LOG_TRIVIAL(error) << "[install_plugin] Linux component validation failed for " << dest_path.string() << ": " << validate_reason;
-                    close_zip_reader(&archive);
-                    if (pro_fn) pro_fn(InstallStatusUnzipFailed, 0, cancel);
-                    return InstallStatusUnzipFailed;
-                }
+                std::string validation_reason;
+                if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_file(destination.string(), &validation_reason))
+                    return fail_extract("Linux component validation failed for " + destination.string() + ": " + validation_reason);
             }
-        } catch (const std::exception &) {
-            close_zip_reader(&archive);
-            if (pro_fn) pro_fn(InstallStatusUnzipFailed, 0, cancel);
-            return InstallStatusUnzipFailed;
+            extracted_any = true;
+        } catch (const std::exception& e) {
+            return fail_extract(e.what());
         }
     }
-
     close_zip_reader(&archive);
 
+    if (!extracted_any) {
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusUnzipFailed, 0, cancel);
+        return InstallStatusUnzipFailed;
+    }
+
     if (select_linux_component_package) {
-        std::string validate_reason;
-        const auto manifest_path = component_folder / manifest_name;
+        std::string validation_reason;
+        const auto manifest_path = staging_folder / manifest_name;
         if (boost::filesystem::exists(manifest_path) &&
-            !Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(component_folder, &validate_reason)) {
-            BOOST_LOG_TRIVIAL(error) << "[install_plugin] manifest validation failed: " << validate_reason;
-            if (pro_fn) pro_fn(InstallStatusUnzipFailed, 0, cancel);
+            !Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(staging_folder, &validation_reason)) {
+            BOOST_LOG_TRIVIAL(error) << "[install_plugin] manifest validation failed: " << validation_reason;
+            cleanup();
+            if (pro_fn)
+                pro_fn(InstallStatusUnzipFailed, 0, cancel);
             return InstallStatusUnzipFailed;
         }
     }
 
-    {
-        fs::path dir_path(component_folder);
-        if (fs::exists(dir_path) && fs::is_directory(dir_path)) {
-            int file_count = 0, file_index = 0;
-            for (fs::directory_iterator it(dir_path); it != fs::directory_iterator(); ++it) {
-                if (it->path().string() == backup_folder.string())
-                    continue;
-                if (fs::is_regular_file(it->status()))
-                    ++file_count;
+    if (m_networking_cancel_update || cancel || (cancel_fn && cancel_fn())) {
+        cleanup();
+        return -1;
+    }
+
+    std::string filesystem_error;
+    if (!copy_plugin_contents(component_folder, backup_staging_folder, backup_folder, filesystem_error)) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] backup failed: " << filesystem_error;
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusUnzipFailed, 0, cancel);
+        return InstallStatusUnzipFailed;
+    }
+
+    try {
+        if (boost::filesystem::exists(backup_folder))
+            boost::filesystem::rename(backup_folder, previous_backup_folder);
+        boost::filesystem::rename(backup_staging_folder, backup_folder);
+        boost::filesystem::remove_all(previous_backup_folder);
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] backup commit failed: " << e.what();
+        try {
+            if (!boost::filesystem::exists(backup_folder) && boost::filesystem::exists(previous_backup_folder))
+                boost::filesystem::rename(previous_backup_folder, backup_folder);
+        } catch (...) {}
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusUnzipFailed, 0, cancel);
+        return InstallStatusUnzipFailed;
+    }
+
+    if (m_networking_cancel_update || cancel || (cancel_fn && cancel_fn())) {
+        cleanup();
+        return -1;
+    }
+
+    bool commit_failed = false;
+    try {
+        if (select_linux_component_package) {
+            for (const std::string& file_name : known_linux_component_payload_names()) {
+                if (!boost::filesystem::exists(staging_folder / file_name))
+                    remove_or_retire_plugin_entry(component_folder / file_name);
             }
-            for (fs::directory_iterator it(dir_path); it != fs::directory_iterator(); ++it) {
-                if (it->path().string() == backup_folder.string())
-                    continue;
-                auto dest_path = backup_folder.string() + "/" + it->path().filename().string();
-                if (fs::is_regular_file(it->status())) {
-                    try {
-                        if (file_count > 0 && pro_fn)
-                            pro_fn(InstallStatusNormal, 50 + file_index / file_count, cancel);
-                        ++file_index;
-                        if (fs::exists(dest_path))
-                            fs::remove(dest_path);
-                        std::string error_message;
-                        CopyFileResult cfr = copy_file(it->path().string(), dest_path, error_message, false);
-                        if (cfr != CopyFileResult::SUCCESS)
-                            BOOST_LOG_TRIVIAL(error) << "Copying to backup failed(" << cfr << "): " << error_message;
-                    } catch (const std::exception &) {}
-                } else {
-                    copy_framework(it->path().string(), dest_path);
+        }
+
+        for (boost::filesystem::directory_iterator it(staging_folder); it != boost::filesystem::directory_iterator();) {
+            const auto source = it->path();
+            const auto destination = component_folder / source.filename();
+            ++it;
+            remove_or_retire_plugin_entry(destination);
+            boost::filesystem::rename(source, destination);
+        }
+    } catch (const std::exception& e) {
+        filesystem_error = e.what();
+        commit_failed = true;
+    }
+
+    if (commit_failed) {
+        std::string restore_error;
+        if (!restore_plugin_backup(component_folder, backup_folder, restore_error))
+            filesystem_error += "; restore failed: " + restore_error;
+        BOOST_LOG_TRIVIAL(error) << "[install_plugin] commit failed: " << filesystem_error;
+        cleanup();
+        if (pro_fn)
+            pro_fn(InstallStatusUnzipFailed, 0, cancel);
+        return InstallStatusUnzipFailed;
+    }
+
+    cleanup();
+    if (pro_fn)
+        pro_fn(InstallStatusInstallCompleted, 100, cancel);
+
+    // Do not mark the optional network component as installed here. Windows and
+    // macOS still need their Linux runtime prepared. UpgradeNetworkJob commits
+    // the configuration only after the entire user-requested transaction succeeds.
+    BOOST_LOG_TRIVIAL(info) << "[install_plugin] payload installed successfully";
+    return 0;
+}
+
+bool GUI_App::rollback_network_plugin_payload(std::string* error)
+{
+    const boost::filesystem::path component_folder = boost::filesystem::path(data_dir()) / "plugins";
+    const boost::filesystem::path backup_folder = component_folder / "backup";
+    std::string local_error;
+
+    try {
+        if (!boost::filesystem::is_directory(backup_folder)) {
+            local_error = "plug-in backup directory is missing";
+        } else {
+            for (const std::string& file_name : known_linux_component_payload_names())
+                remove_or_retire_plugin_entry(component_folder / file_name);
+
+            for (const std::string& file_name : known_linux_component_payload_names()) {
+                const boost::filesystem::path source = backup_folder / file_name;
+                if (boost::filesystem::exists(source) || boost::filesystem::is_symlink(source)) {
+                    if (!copy_plugin_entry(source, component_folder / file_name, local_error))
+                        break;
                 }
             }
         }
+    } catch (const std::exception& e) {
+        local_error = e.what();
     }
 
-    if (pro_fn)
-        pro_fn(InstallStatusInstallCompleted, 100, cancel);
-    if (name == "plugins") {
-        app_config->set_bool("installed_networking", true);
-        app_config->add_cloud_provider(BBL_CLOUD_PROVIDER);
-        auto save_networking_config = [this]() {
-            if (app_config)
-                app_config->save();
-            if (mainframe && mainframe->m_webview)
-                mainframe->m_webview->SendCloudProvidersInfo();
-        };
-        if (is_main_thread_active())
-            save_networking_config();
-        else
-            CallAfter(save_networking_config);
+    if (error)
+        *error = local_error;
+    if (!local_error.empty()) {
+        BOOST_LOG_TRIVIAL(error) << "[rollback_network_plugin_payload] " << local_error;
+        return false;
     }
-    BOOST_LOG_TRIVIAL(info) << "[install_plugin] success";
-    return 0;
+
+    BOOST_LOG_TRIVIAL(info) << "[rollback_network_plugin_payload] previous payload restored";
+    return true;
 }
 
 void GUI_App::restart_networking()
@@ -1526,11 +1904,13 @@ void GUI_App::restart_networking()
         m_agent->set_on_http_error_fn([this](CloudEvent event, unsigned int status, std::string body) {
             this->handle_http_error(status, body, event.provider);
         });
-        if (mainframe && preset_bundle) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": switching printer agent after network restart";
-            switch_printer_agent();
-        }
-        m_agent->start_discovery(true, false);
+        // on_init_network() rebuilt m_agent with a null printer agent, so calling
+        // m_agent->start_discovery() directly would no-op (NetworkAgent::start_discovery
+        // returns false when m_printer_agent is null). Re-establish the printer agent for the
+        // active preset first - switch_printer_agent() installs it and then starts discovery,
+        // mirroring startup - otherwise LAN discovery stays dead after a plugin hot reload
+        // until the user next changes a preset/tab.
+        switch_printer_agent();
         if (mainframe)
             mainframe->refresh_plugin_tips();
         if (plater_)
@@ -1639,9 +2019,65 @@ bool GUI_App::wait_for_network_idle(int timeout_ms)
     return false;
 }
 
+void GUI_App::migrate_network_plugin_config()
+{
+    if (!app_config)
+        return;
+
+    const std::string cfg = app_config->get_network_plugin_version();
+    if (!is_series_managed_version(cfg) || !is_supported_network_version(cfg))
+        return; // empty / legacy / custom-named / unsupported old series -> nothing to migrate here
+                // (an unsupported old config is handled by the fallback in on_init_network)
+
+    const std::string series = network_plugin_series(cfg);
+    if (cfg != series) {
+        app_config->set_network_plugin_version(series);
+        app_config->save();
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": network_plugin_version " << cfg << " -> " << series;
+    }
+
+    // Consolidate the on-disk files onto the series name. Runs at startup before the plug-in is
+    // loaded, so the rename is safe even on Windows (nothing holds the file open yet). If it is
+    // skipped or fails, resolve_library_path() still loads the specific build for this series.
+    std::string newest;
+    for (const auto& v : BBLNetworkPlugin::scan_plugin_versions())
+        if (is_series_managed_version(v) && network_plugin_series(v) == series && (newest.empty() || v > newest))
+            newest = v;
+    if (newest.empty())
+        return;
+
+    boost::system::error_code ec;
+    const boost::filesystem::path series_path(BBLNetworkPlugin::get_versioned_library_path(series));
+    if (newest != series) {
+        // Make the newest same-series build the series file. Safe here (pre-load); if the rename
+        // fails, resolve_library_path() still loads the specific build for this series.
+        boost::filesystem::remove(series_path, ec);
+        boost::filesystem::rename(BBLNetworkPlugin::get_versioned_library_path(newest), series_path, ec);
+        if (ec)
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": rename " << newest << " -> " << series
+                                       << " failed (" << ec.message() << "), loader will resolve it";
+    }
+
+    // Tidy strictly-older same-series managed builds (best-effort; never touch custom/legacy).
+    for (const auto& v : BBLNetworkPlugin::scan_plugin_versions()) {
+        if (v == series || !is_series_managed_version(v) || network_plugin_series(v) != series)
+            continue;
+        boost::filesystem::remove(BBLNetworkPlugin::get_versioned_library_path(v), ec);
+    }
+}
+
 bool GUI_App::hot_reload_network_plugin()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": starting hot reload";
+
+    if (Slic3r::HasActiveFTObjects()) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": file-transfer operation is active";
+        MessageDialog dialog(mainframe,
+            _L("A file transfer is still active. Finish or cancel it before reloading the network plug-in."),
+            _L("Network plug-in is busy"), wxICON_WARNING | wxOK);
+        dialog.ShowModal();
+        return false;
+    }
 
     wxBusyCursor busy;
     wxBusyInfo info(_L("Reloading network plug-in..."), mainframe);
@@ -1654,6 +2090,25 @@ bool GUI_App::hot_reload_network_plugin()
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": navigating away from Monitor tab before unload";
             mainframe->m_tabpanel->SetSelection(MainFrame::TabPosition::tp3DEditor);
         }
+    }
+
+    if (mainframe && mainframe->m_monitor && mainframe->m_monitor->get_status_panel()) {
+        auto* media = mainframe->m_monitor->get_status_panel()->get_media_play_ctrl();
+        if (media && !media->stop_for_network_reload(5000)) {
+            MessageDialog dialog(mainframe,
+                _L("The live view is still closing. Try reloading the network plug-in again."),
+                _L("Network plug-in is busy"), wxICON_WARNING | wxOK);
+            dialog.ShowModal();
+            return false;
+        }
+    }
+
+    if (Slic3r::NetworkAgent::active_source_tunnels() != 0) {
+        MessageDialog dialog(mainframe,
+            _L("A printer media operation is still active. Finish it before reloading the network plug-in."),
+            _L("Network plug-in is busy"), wxICON_WARNING | wxOK);
+        dialog.ShowModal();
+        return false;
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": stopping sync thread before unload";
@@ -1673,7 +2128,9 @@ bool GUI_App::hot_reload_network_plugin()
         m_agent->set_on_printer_connected_fn(nullptr);
         m_agent->set_on_server_connected_fn(nullptr);
         m_agent->set_on_http_error_fn(nullptr);
+        m_agent->set_get_country_code_fn(nullptr);
         m_agent->set_on_subscribe_failure_fn(nullptr);
+        m_agent->set_server_callback(nullptr);
         m_agent->set_on_message_fn(nullptr);
         m_agent->set_on_user_message_fn(nullptr);
         m_agent->set_on_local_connect_fn(nullptr);
@@ -1700,11 +2157,25 @@ bool GUI_App::hot_reload_network_plugin()
 
         // Phase 5: Final bounded drain before destruction
         drain_pending_events(FINAL_DRAIN_TIMEOUT_MS);
+        const auto callback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (Slic3r::NetworkAgent::active_forwarder_callbacks() != 0 && std::chrono::steady_clock::now() < callback_deadline)
+            drain_pending_events(FINAL_DRAIN_TIMEOUT_MS);
 
         // Phase 6: Destroy agent
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": Phase 6 - destroying agent";
         delete m_agent;
         m_agent = nullptr;
+        Slic3r::BBLNetworkPlugin::instance().destroy_agent();
+
+        const auto callback_deadline_after_destroy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (Slic3r::NetworkAgent::active_forwarder_callbacks() != 0 &&
+               std::chrono::steady_clock::now() < callback_deadline_after_destroy) {
+            drain_pending_events(FINAL_DRAIN_TIMEOUT_MS);
+        }
+        if (Slic3r::NetworkAgent::active_forwarder_callbacks() != 0) {
+            restart_networking();
+            return false;
+        }
     }
 
     // Phase 7: Unload module
@@ -1713,6 +2184,10 @@ bool GUI_App::hot_reload_network_plugin()
         drain_pending_events(FINAL_DRAIN_TIMEOUT_MS);
         int unload_result = Slic3r::NetworkAgent::unload_network_module();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": unload_result=" << unload_result;
+        if (unload_result != 0) {
+            restart_networking();
+            return false;
+        }
     }
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": calling restart_networking";
@@ -1731,17 +2206,28 @@ bool GUI_App::hot_reload_network_plugin()
             }
         }
     }
-    bool user_logged_in = m_agent && m_agent->is_user_login();
+    bool user_logged_in = false;
+    if (m_agent && app_config) {
+        for (const auto& provider : app_config->get_cloud_providers()) {
+            if (m_agent->is_user_login(provider)) {
+                user_logged_in = true;
+                break;
+            }
+        }
+    }
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": after restart_networking, is_user_login = " << user_logged_in
                             << ", m_agent = " << (m_agent ? "valid" : "null")
                             << ", version = " << loaded_version;
 
-    if (success && m_agent && m_device_manager && !app_config->get_stealth_mode()) {
+    if (success && user_logged_in && m_agent && m_device_manager && !app_config->get_stealth_mode()) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": connecting to cloud server";
         m_agent->connect_server();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": re-subscribing to cloud printers";
         m_device_manager->add_user_subscribe();
     }
+
+    if (success && mainframe && mainframe->m_webview)
+        mainframe->m_webview->SendCloudProvidersInfo();
 
     if (mainframe && mainframe->m_monitor) {
         mainframe->m_monitor->update_network_version_footer();
@@ -1755,7 +2241,7 @@ bool GUI_App::hot_reload_network_plugin()
 
 std::string GUI_App::get_latest_network_version() const
 {
-    return SLIC3R_VERSION;
+    return Slic3r::get_latest_network_version();
 }
 
 bool GUI_App::has_network_update_available() const
@@ -1786,10 +2272,6 @@ void GUI_App::show_network_plugin_download_dialog(bool is_update)
 
     switch (dlg.ShowModal()) {
     case NetworkPluginDownloadDialog::RESULT_DOWNLOAD:
-        if (app_config) {
-            app_config->set(SETTING_NETWORK_PLUGIN_VERSION, get_latest_network_version());
-            app_config->save();
-        }
         {
             DownloadProgressDialog download_dlg(_L("Downloading Network Plug-in"));
             download_dlg.ShowModal();
@@ -1843,9 +2325,24 @@ bool GUI_App::check_networking_version()
         BOOST_LOG_TRIVIAL(info) << "get_network_agent_version=" << network_ver;
     }
 
-    std::string studio_ver = get_latest_network_version();
+    std::string studio_ver;
+    if (use_legacy_network_plugin()) {
+        studio_ver = BAMBU_NETWORK_AGENT_VERSION_LEGACY;
+    } else if (app_config) {
+        const std::string user_version = app_config->get_network_plugin_version();
+        studio_ver = user_version.empty() ? get_latest_network_version() : user_version;
+    } else {
+        studio_ver = get_latest_network_version();
+    }
 
     BOOST_LOG_TRIVIAL(info) << "check_networking_version: network_ver=" << network_ver << ", expected=" << studio_ver;
+
+    // A configured version outside the whitelisted series must never pass as compatible,
+    // even if it matches the loaded library - its ABI does not match this build.
+    if (!use_legacy_network_plugin() && !is_supported_network_version(studio_ver)) {
+        m_networking_compatible = false;
+        return false;
+    }
 
     if (network_ver.length() >= 8 && studio_ver.length() >= 8) {
         if (network_ver.substr(0,8) == studio_ver.substr(0,8)) {
@@ -1856,6 +2353,11 @@ bool GUI_App::check_networking_version()
 
     m_networking_compatible = false;
     return false;
+}
+
+bool GUI_App::use_legacy_network_plugin() const
+{
+    return app_config && BBLNetworkPlugin::is_legacy_version(app_config->get_network_plugin_version());
 }
 
 bool GUI_App::is_compatibility_version()
@@ -2144,6 +2646,14 @@ void GUI_App::init_networking_callbacks()
 GUI_App::~GUI_App()
 {
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": enter");
+
+    if (m_agent)
+        m_agent->set_printer_agent(nullptr);
+    NetworkAgentFactory::clear_printer_agent_cache();
+
+    Slic3r::PluginManager::instance().shutdown();
+    Slic3r::PythonInterpreter::instance().shutdown();
+
     if (app_config != nullptr) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": destroy app_config");
         delete app_config;
@@ -2164,6 +2674,7 @@ GUI_App::~GUI_App()
 
 
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": exit");
+    shutdown_console_logging();
 }
 
 bool GUI_App::is_blocking_printing(MachineObject *obj_)
@@ -2264,13 +2775,37 @@ void GUI_App::init_download_path()
 #if wxUSE_WEBVIEW_EDGE
 void GUI_App::init_webview_runtime()
 {
-    // Check WebView Runtime
-    if (!WebView::CheckWebViewRuntime()) {
-        int nRet = wxMessageBox(_L("Orca Slicer requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
-                                _L("WebView2 Runtime"), wxYES_NO);
-        if (nRet == wxYES) {
-            WebView::DownloadAndInstallWebViewRuntime();
-        }
+    // Check whether the Microsoft WebView2 runtime is already present.
+    if (WebView::CheckWebViewRuntime()) {
+        BOOST_LOG_TRIVIAL(info) << "WebView2 runtime detected.";
+        return;
+    }
+
+    BOOST_LOG_TRIVIAL(warning) << "WebView2 runtime not found; prompting user to install.";
+    int nRet = wxMessageBox(_L("Orca Slicer requires the Microsoft WebView2 Runtime to operate certain features.\nClick Yes to install it now."),
+                            _L("WebView2 Runtime"), wxYES_NO);
+    if (nRet != wxYES) {
+        BOOST_LOG_TRIVIAL(warning) << "User declined WebView2 runtime installation.";
+        return;
+    }
+
+    // The bootstrapper auto-detects the device architecture (x64/x86/ARM64) and
+    // installs the matching runtime. The install is synchronous, and because this
+    // runs before the first WebView is created, a successful install takes effect
+    // in this same process without a restart.
+    bool installed = WebView::DownloadAndInstallWebViewRuntime();
+
+    // Re-check: the install can still fail (declined UAC elevation, no network,
+    // etc.). Without the runtime the setup wizard and other WebView dialogs render
+    // blank, so surface an explicit message rather than failing silently.
+    if (installed && WebView::CheckWebViewRuntime()) {
+        BOOST_LOG_TRIVIAL(info) << "WebView2 runtime installed successfully.";
+    } else {
+        BOOST_LOG_TRIVIAL(error) << "WebView2 runtime installation failed or still not detected.";
+        wxMessageBox(_L("The Microsoft WebView2 Runtime could not be installed.\n"
+                        "Some features, including the setup wizard, may appear blank until it is installed.\n"
+                        "Please install it manually from https://developer.microsoft.com/microsoft-edge/webview2/ and restart Orca Slicer."),
+                     _L("WebView2 Runtime"), wxOK | wxICON_WARNING);
     }
 }
 #endif
@@ -2279,6 +2814,7 @@ void GUI_App::init_app_config()
 {
 	// Profiles for the alpha are stored into the PrusaSlicer-alpha directory to not mix with the current release.
     SetAppName("BambuStudio_OrcaSlicer");
+    SetAppDisplayName(SLIC3R_APP_NAME);
 //	SetAppName(SLIC3R_APP_KEY "-alpha");
 //  SetAppName(SLIC3R_APP_KEY "-beta");
 //	SetAppDisplayName(SLIC3R_APP_NAME);
@@ -2418,7 +2954,6 @@ void GUI_App::on_start_subscribe_again(std::string dev_id)
 
         if ( (dev_id == obj->get_dev_id()) && obj->is_connecting() && obj->subscribe_counter > 0) {
             obj->subscribe_counter--;
-            if(wxGetApp().getAgent()) wxGetApp().getAgent()->set_user_selected_machine(dev_id);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": dev_id=" << obj->get_dev_id();
         }
     });
@@ -2553,11 +3088,56 @@ std::string get_system_info()
     return out.str();
 }
 
-static bool prepare_windows_slicer_linux_runtime(const boost::filesystem::path& component_folder,
-                                                const boost::filesystem::path& component_cache_dir);
-static bool prepare_macos_slicer_linux_runtime(const boost::filesystem::path& component_folder,
-                                              const boost::filesystem::path& component_cache_dir);
 void copy_local_runtime_files(const boost::filesystem::path& component_folder);
+
+// wx/app-level plugin wiring, kept in one place: subscriptions to plugin
+// loader events that drive GUI policy (plugins dialog refresh, network-agent
+// registration, plate revalidation). The libslic3r dispatch hooks are NOT
+// wired here -- PluginManager::initialize() installs those via
+// plugin_hooks::install().
+void GUI_App::init_plugin_gui_wiring()
+{
+    PluginManager& plugin_mgr = PluginManager::instance();
+
+    auto refresh_plugins_dialog = [] {
+        if (!wxTheApp)
+            return;
+
+        GUI_App* app = &GUI::wxGetApp();
+        if (app->is_closing())
+            return;
+
+        app->CallAfter([app] {
+            if (!app->is_closing() && app->m_plugins_dlg)
+                app->m_plugins_dlg->update_plugin_dialog_ui();
+        });
+    };
+
+    plugin_mgr.subscribe_on_unload_callback(PluginHostUi::close_windows_for_plugin);
+    plugin_mgr.subscribe_on_load_callback([refresh_plugins_dialog](const std::string&) { refresh_plugins_dialog(); });
+    plugin_mgr.subscribe_on_unload_callback([refresh_plugins_dialog](const std::string&) { refresh_plugins_dialog(); });
+    plugin_mgr.subscribe_on_load_callback(NetworkAgentFactory::register_python_plugin);
+    plugin_mgr.subscribe_on_unload_callback(NetworkAgentFactory::deregister_python_plugin);
+    plugin_mgr.subscribe_on_capability_load_callback(
+        [refresh_plugins_dialog](const PluginCapabilityId& capability) {
+            if (capability.type == PluginCapabilityType::PrinterConnection)
+                NetworkAgentFactory::register_python_printer_agent(capability.plugin_key, capability.name);
+            refresh_plugins_dialog();
+            // A newly loaded capability may satisfy a missing-plugin notification; re-validate the
+            // current plate (on the UI thread) so the notification clears once its plugin is available.
+            if (wxTheApp && !wxGetApp().is_closing())
+                wxGetApp().CallAfter([]() {
+                    if (Plater* plater = wxGetApp().plater())
+                        plater->revalidate_current_plate_if_plugins_missing();
+                });
+        });
+    plugin_mgr.subscribe_on_capability_unload_callback(
+        [refresh_plugins_dialog](const PluginCapabilityId& capability) {
+            if (capability.type == PluginCapabilityType::PrinterConnection)
+                NetworkAgentFactory::deregister_python_printer_agent(capability.plugin_key, capability.name);
+            refresh_plugins_dialog();
+        });
+}
 
 bool GUI_App::on_init_inner()
 {
@@ -2742,31 +3322,35 @@ bool GUI_App::on_init_inner()
         //update_label_colours_from_appconfig();
     }
     if (bool new_sys_menu_enabled = app_config->get("sys_menu_enabled") == "1";
-        init_sys_menu_enabled != new_sys_menu_enabled)
+        init_sys_menu_enabled != new_sys_menu_enabled) {
 #ifdef __WINDOWS__
         NppDarkMode::SetSystemMenuForApp(new_sys_menu_enabled);
 #endif
+    }
 #endif
 
-    if (m_last_config_version) {
-        int last_major = m_last_config_version->maj();
-        int last_minor = m_last_config_version->min();
-        int last_patch = m_last_config_version->patch()/100;
-        std::string studio_ver = SLIC3R_VERSION;
-        int cur_major = atoi(studio_ver.substr(0,2).c_str());
-        int cur_minor = atoi(studio_ver.substr(3,2).c_str());
-        int cur_patch = atoi(studio_ver.substr(6,2).c_str());
-        BOOST_LOG_TRIVIAL(info) << boost::format("last app version {%1%.%2%.%3%}, current version {%4%.%5%.%6%}")
-            %last_major%last_minor%last_patch%cur_major%cur_minor%cur_patch;
-        if ((last_major != cur_major)
-            ||(last_minor != cur_minor)
-            ||(last_patch != cur_patch)) {
-            remove_old_networking_plugins();
-        }
-    }
+    // Orca: we allow user to pin the version of plugin, so we don't need to remove old networking plugins when the app version is updated
+    //
+    // if (m_last_config_version) {
+    //     int last_major = m_last_config_version->maj();
+    //     int last_minor = m_last_config_version->min();
+    //     int last_patch = m_last_config_version->patch()/100;
+    //     std::string studio_ver = SLIC3R_VERSION;
+    //     int cur_major = atoi(studio_ver.substr(0,2).c_str());
+    //     int cur_minor = atoi(studio_ver.substr(3,2).c_str());
+    //     int cur_patch = atoi(studio_ver.substr(6,2).c_str());
+    //     BOOST_LOG_TRIVIAL(info) << boost::format("last app version {%1%.%2%.%3%}, current version {%4%.%5%.%6%}")
+    //         %last_major%last_minor%last_patch%cur_major%cur_minor%cur_patch;
+    //     if ((last_major != cur_major)
+    //         ||(last_minor != cur_minor)
+    //         ||(last_patch != cur_patch)) {
+    //         remove_old_networking_plugins();
+    //     }
+    // }
 
-    if(app_config->get("version") != SLIC3R_VERSION) {
-        app_config->set("version", SLIC3R_VERSION);
+    //Orca: write OrcaSlicer version
+    if(app_config->get("version") != SoftFever_VERSION) {
+        app_config->set("version", SoftFever_VERSION);
     }
 
     // Orca: use wxWeakRef to provent wild pointer.
@@ -2785,7 +3369,7 @@ bool GUI_App::on_init_inner()
         //BBS use BBL splashScreen
         scrn = new SplashScreen(splashscreen_pos);
         wxYield();
-        scrn->SetText(_L("Loading configuration") + dots);
+        scrn->SetText(_L("Loading configuration") + dots, 5);
     }
 
     BOOST_LOG_TRIVIAL(info) << "loading systen presets...";
@@ -2856,7 +3440,7 @@ bool GUI_App::on_init_inner()
                         if (is_running_in_msix())
                             open_ms_store_product_page();
                         else
-                            wxLaunchDefaultBrowser(version_info.url);
+                            open_browser_with_warning_dialog(version_info.url);
                         break;
                     case wxID_NO:
                         break;
@@ -2883,7 +3467,7 @@ bool GUI_App::on_init_inner()
                 switch (result)
                 {
                  case wxID_YES:
-                     wxLaunchDefaultBrowser(download_url);
+                     open_browser_with_warning_dialog(download_url);
                      break;
                  case wxID_NO:
                      wxGetApp().mainframe->Close(true);
@@ -2930,38 +3514,77 @@ bool GUI_App::on_init_inner()
 
 
 
-    // Use the current Bambu Studio version mapping for the optional external component.
-    NetworkAgent::use_legacy_network = false;
-    if (app_config && app_config->get_network_plugin_version().empty())
-        app_config->set(SETTING_NETWORK_PLUGIN_VERSION, get_latest_network_version());
-
+    const std::string configured_version = app_config ? app_config->get_network_plugin_version() : std::string();
+    BOOST_LOG_TRIVIAL(info) << "Network plugin mode: "
+        << (use_legacy_network_plugin()
+            ? ("legacy (version: " + std::string(BAMBU_NETWORK_AGENT_VERSION_LEGACY) + ")")
+            : ("modern (installed version: " + (configured_version.empty() ? std::string("not installed") : configured_version) + ")"));
+    // The Bambu network component is optional. Never verify, install or repair
+    // Lima/WSL during general application startup. Runtime setup is performed
+    // only by the explicit plug-in installation job after user consent.
     copy_network_if_available();
-    bool slicer_linux_runtime_setup_ok = true;
-    if (Slic3r::SlicerLinuxRuntime::enabled()) {
-        const boost::filesystem::path component_folder = boost::filesystem::path(data_dir()) / "plugins";
-        const boost::filesystem::path component_cache_dir = boost::filesystem::path(data_dir()) / "ota" / "plugins";
-#ifdef WIN32
-        slicer_linux_runtime_setup_ok = prepare_windows_slicer_linux_runtime(component_folder, component_cache_dir);
-#elif defined(__APPLE__) || defined(__WXMAC__)
-        slicer_linux_runtime_setup_ok = prepare_macos_slicer_linux_runtime(component_folder, component_cache_dir);
-#endif
+
+    if (scrn) {
+        scrn->SetText(_L("Loading Plugins") + dots, 20);
+        wxYield();
     }
-    if (!slicer_linux_runtime_setup_ok && app_config) {
-        BOOST_LOG_TRIVIAL(error) << "[slicer_linux_runtime_setup] runtime setup failed or was cancelled, starting without network module";
-        const bool installed_networking = app_config->get_bool("installed_networking");
-        if (installed_networking)
-            app_config->set_bool("installed_networking", false);
-        on_init_network();
-        if (installed_networking)
-            app_config->set_bool("installed_networking", true);
-    } else {
-        on_init_network();
+
+    on_init_network();
+
+    // Initialize plugins after network then register on_load callbacks so once the plugin loads finish, it gets registered automatically.
+    // initialize() also installs the libslic3r hooks (capability resolver,
+    // slicing-pipeline dispatcher) via plugin_hooks::install() -- no
+    // per-capability wiring belongs here.
+    PluginManager& plugin_mgr = PluginManager::instance();
+    plugin_mgr.initialize();
+
+    // Set cloud plugin directory from previous session so cloud-installed
+    // plugins are discovered even before the network agent is ready.
+    const std::string preset_folder = app_config->get("preset_folder");
+    if (!preset_folder.empty()) {
+        plugin_mgr.set_cloud_user(preset_folder);
     }
+
+    plugin_mgr.discover_plugins(false, true);
+
+    init_plugin_gui_wiring();
+
+    // Subscribe to the plugin loader and enumerate current actions (UI thread, once).
+    m_action_registry.init();
+
+    for (const std::string& plugin_key : plugin_mgr.get_enabled_plugin_keys()) {
+        if (!plugin_mgr.is_plugin_loaded(plugin_key)) {
+            plugin_mgr.load_plugin(plugin_key, false);
+            BOOST_LOG_TRIVIAL(info) << "Auto-loading plugin on startup: " << plugin_key;
+        }
+    }
+
+    if (m_agent)
+        plugin_mgr.set_cloud_agent(std::dynamic_pointer_cast<OrcaCloudServiceAgent>(m_agent->get_cloud_agent()));
 
     if (m_agent && m_agent->is_user_login()) {
         enable_user_preset_folder(true);
+        plugin_mgr.set_cloud_user(m_agent->get_user_id());
+        // If there is a user logged in we do an immediate sync.
+        std::vector<std::string> not_found, unauthorized;
+        plugin_mgr.fetch_plugins_from_cloud(&not_found, &unauthorized);
+        if (plater()) {
+            for (const auto& uuid : not_found) {
+                plater()->get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::RegularNotificationLevel,
+                    format(_L("Plugin %s is no longer available."), uuid));
+            }
+            for (const auto& uuid : unauthorized) {
+                plater()->get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::RegularNotificationLevel,
+                    format(_L("Plugin %s access is unauthorized."), uuid));
+            }
+        }
     } else {
         enable_user_preset_folder(false);
+        plugin_mgr.set_cloud_user("");
     }
 
     // BBS if load user preset failed
@@ -2970,6 +3593,7 @@ bool GUI_App::on_init_inner()
             // Enable all substitutions (in both user and system profiles), but log the substitutions in user profiles only.
             // If there are substitutions in system profiles, then a "reconfigure" event shall be triggered, which will force
             // installation of a compatible system preset, thus nullifying the system preset substitutions.
+            if (scrn) { scrn->SetText(_L("Loading printer & filament profiles") + dots, 30); wxYield(); }
             init_params->preset_substitutions = preset_bundle->load_presets(*app_config, ForwardCompatibilitySubstitutionRule::EnableSystemSilent);
         }
         catch (const std::exception& ex) {
@@ -2998,6 +3622,11 @@ bool GUI_App::on_init_inner()
     }
 #endif
 
+    if (scrn) {
+        const auto scrn_txt = _L("Creating main window") + dots;
+        scrn->SetText(scrn_txt, 70);
+        wxYield();
+    }
     BOOST_LOG_TRIVIAL(info) << "create the main window";
     mainframe = new MainFrame();
     // hide settings tabs after first Layout
@@ -3022,8 +3651,10 @@ bool GUI_App::on_init_inner()
             // ensure the selected technology is ptFFF
             plater_->set_printer_technology(ptFFF);
     }
-    else
+    else {
+        if (scrn) { scrn->SetText(_L("Loading current preset") + dots, 85); wxYield(); }
         load_current_presets();
+    }
 
     if (plater_ != nullptr) {
         plater_->reset_project_dirty_initial_presets();
@@ -3035,7 +3666,9 @@ bool GUI_App::on_init_inner()
 #ifdef __WINDOWS__
     mainframe->topbar()->SaveNormalRect();
 #endif
+    if (scrn) { scrn->SetText(_L("Showing main window") + dots, 95); wxYield(); }
     mainframe->Show(true);
+    if (scrn) { scrn->SetText(_L("Showing main window") + dots, 100); scrn->Destroy(); scrn = nullptr; }
     BOOST_LOG_TRIVIAL(info) << "main frame firstly shown";
     if (scrn) {
         scrn->Destroy();
@@ -3151,243 +3784,6 @@ static const char* legacy_wsl_bootstrap_script_name()
     return "slicer_linux_runtime_wsl_run_host.sh";
 }
 
-static wxString quote_windows_command_arg(const wxString& value)
-{
-    wxString escaped = value;
-    escaped.Replace("\"", "\\\"");
-    return wxString::Format("\"%s\"", escaped);
-}
-
-static wxString quote_posix_command_arg(const wxString& value)
-{
-    wxString out("'");
-    for (wxUniChar ch : value) {
-        if (ch == '\'')
-            out += "'\\''";
-        else
-            out += ch;
-    }
-    out += "'";
-    return out;
-}
-
-static long run_hidden_windows_command(const wxString& command, wxArrayString* stdout_lines, wxArrayString* stderr_lines)
-{
-#ifdef WIN32
-    wxArrayString local_stdout;
-    wxArrayString local_stderr;
-    long exit_code = wxExecute(command, local_stdout, local_stderr, wxEXEC_SYNC | wxEXEC_HIDE_CONSOLE);
-    if (stdout_lines)
-        *stdout_lines = local_stdout;
-    if (stderr_lines)
-        *stderr_lines = local_stderr;
-    return exit_code;
-#else
-    (void)command;
-    (void)stdout_lines;
-    (void)stderr_lines;
-    return -1;
-#endif
-}
-
-static long run_posix_command_sync(const wxString& command, wxArrayString* stdout_lines, wxArrayString* stderr_lines)
-{
-#if defined(__WXMAC__) || defined(__APPLE__) || defined(__WXGTK__)
-    wxArrayString local_stdout;
-    wxArrayString local_stderr;
-    long exit_code = wxExecute(command, local_stdout, local_stderr, wxEXEC_SYNC);
-    if (stdout_lines)
-        *stdout_lines = local_stdout;
-    if (stderr_lines)
-        *stderr_lines = local_stderr;
-    return exit_code;
-#else
-    (void)command;
-    (void)stdout_lines;
-    (void)stderr_lines;
-    return -1;
-#endif
-}
-
-static void log_runtime_command_output(const char* tag, long exit_code, const wxArrayString& stdout_lines, const wxArrayString& stderr_lines)
-{
-    BOOST_LOG_TRIVIAL(info) << tag << ": exit_code=" << exit_code;
-    for (const auto& line : stdout_lines)
-        BOOST_LOG_TRIVIAL(info) << tag << " [stdout] " << into_u8(line);
-    for (const auto& line : stderr_lines)
-        BOOST_LOG_TRIVIAL(error) << tag << " [stderr] " << into_u8(line);
-}
-
-static wxString runtime_command_detail(const wxArrayString& stdout_lines, const wxArrayString& stderr_lines)
-{
-    wxString detail;
-    auto append = [&detail](const wxArrayString& lines) {
-        for (const auto& line : lines) {
-            if (!detail.empty())
-                detail += "\n";
-            detail += line;
-        }
-    };
-    append(stderr_lines);
-    append(stdout_lines);
-    if (detail.empty())
-        detail = _L("no details");
-    if (detail.length() > 1800) {
-        detail.Truncate(1800);
-        detail += "\n...";
-    }
-    return detail;
-}
-
-static bool prepare_windows_slicer_linux_runtime(const boost::filesystem::path& component_folder,
-                                                              const boost::filesystem::path& component_cache_dir)
-{
-#ifndef WIN32
-    (void)component_folder;
-    (void)component_cache_dir;
-    return true;
-#else
-    if (!Slic3r::SlicerLinuxRuntime::enabled())
-        return true;
-
-    const auto verify_script = component_folder / Slic3r::SlicerLinuxRuntime::windows_wsl_validate_script_file_name();
-    const auto install_script = component_folder / Slic3r::SlicerLinuxRuntime::windows_wsl_import_script_file_name();
-    if (!boost::filesystem::exists(verify_script) || !boost::filesystem::exists(install_script)) {
-        BOOST_LOG_TRIVIAL(warning) << "[slicer_linux_runtime_setup] missing verify/install script in " << component_folder.string();
-        return false;
-    }
-
-    const wxString component_dir_wx = from_u8(component_folder.string());
-    const wxString cache_dir_wx = from_u8(component_cache_dir.string());
-    const wxString verify_cmd = wxString::Format(
-        "powershell -NoProfile -ExecutionPolicy Bypass -File %s -PackageDir %s -ComponentCacheDir %s -AllowMissingComponent -SkipProbe",
-        quote_windows_command_arg(from_u8(verify_script.string())),
-        quote_windows_command_arg(component_dir_wx),
-        quote_windows_command_arg(cache_dir_wx));
-
-    wxArrayString verify_out;
-    wxArrayString verify_err;
-    long verify_code = run_hidden_windows_command(verify_cmd, &verify_out, &verify_err);
-    log_runtime_command_output("[slicer_linux_runtime_verify]", verify_code, verify_out, verify_err);
-    if (verify_code == 0)
-        return true;
-
-    wxString prompt_text = _L("The Windows WSL2 Linux runtime is not ready. The application can install or repair the bundled WSL2 runtime now.");
-    prompt_text += "\n\n";
-    prompt_text += _L("Details:");
-    prompt_text += "\n";
-    prompt_text += runtime_command_detail(verify_out, verify_err);
-    prompt_text += "\n\n";
-    prompt_text += _L("Install or repair it now?");
-
-    wxMessageDialog prompt(nullptr, prompt_text, _L("BambuStudio Linux Runtime"), wxYES_NO | wxICON_QUESTION | wxCENTRE);
-    if (prompt.ShowModal() != wxID_YES)
-        return false;
-
-    const wxString install_cmd = wxString::Format(
-        "powershell -NoProfile -ExecutionPolicy Bypass -File %s -PackageDir %s -ComponentDir %s -ComponentCacheDir %s",
-        quote_windows_command_arg(from_u8(install_script.string())),
-        quote_windows_command_arg(component_dir_wx),
-        quote_windows_command_arg(component_dir_wx),
-        quote_windows_command_arg(cache_dir_wx));
-
-    wxArrayString install_out;
-    wxArrayString install_err;
-    long install_code = run_hidden_windows_command(install_cmd, &install_out, &install_err);
-    log_runtime_command_output("[slicer_linux_runtime_install]", install_code, install_out, install_err);
-
-    if (install_code != 0) {
-        wxString error_text = _L("Windows WSL2 Linux runtime installation failed.");
-        error_text += "\n\n";
-        error_text += runtime_command_detail(install_out, install_err);
-        wxMessageDialog error(nullptr, error_text, _L("BambuStudio Linux Runtime"), wxOK | wxICON_ERROR | wxCENTRE);
-        error.ShowModal();
-        return false;
-    }
-
-    verify_out.clear();
-    verify_err.clear();
-    verify_code = run_hidden_windows_command(verify_cmd, &verify_out, &verify_err);
-    log_runtime_command_output("[slicer_linux_runtime_verify_after_install]", verify_code, verify_out, verify_err);
-    return verify_code == 0;
-#endif
-}
-
-static bool prepare_macos_slicer_linux_runtime(const boost::filesystem::path& component_folder,
-                                                            const boost::filesystem::path& component_cache_dir)
-{
-#if !(defined(__WXMAC__) || defined(__APPLE__))
-    (void)component_folder;
-    (void)component_cache_dir;
-    return true;
-#else
-    if (!Slic3r::SlicerLinuxRuntime::enabled())
-        return true;
-
-    const auto verify_script = component_folder / Slic3r::SlicerLinuxRuntime::mac_runtime_verify_script_file_name();
-    const auto install_script = component_folder / Slic3r::SlicerLinuxRuntime::mac_runtime_install_script_file_name();
-    if (!boost::filesystem::exists(verify_script) || !boost::filesystem::exists(install_script)) {
-        BOOST_LOG_TRIVIAL(warning) << "[slicer_linux_runtime_setup] missing macOS verify/install script in " << component_folder.string();
-        return false;
-    }
-
-    const wxString component_dir_wx = from_u8(component_folder.string());
-    const wxString cache_dir_wx = from_u8(component_cache_dir.string());
-    const wxString verify_cmd = wxString::Format(
-        "/bin/bash %s -PackageDir %s -ComponentDir %s -ComponentCacheDir %s -AllowMissingComponent -SkipProbe",
-        quote_posix_command_arg(from_u8(verify_script.string())),
-        quote_posix_command_arg(component_dir_wx),
-        quote_posix_command_arg(component_dir_wx),
-        quote_posix_command_arg(cache_dir_wx));
-
-    wxArrayString verify_out;
-    wxArrayString verify_err;
-    long verify_code = run_posix_command_sync(verify_cmd, &verify_out, &verify_err);
-    log_runtime_command_output("[slicer_linux_runtime_verify_macos]", verify_code, verify_out, verify_err);
-    if (verify_code == 0)
-        return true;
-
-    wxString prompt_text = _L("The macOS Linux runtime is not ready. The application can install or repair the bundled Lima runtime now.");
-    prompt_text += "\n\n";
-    prompt_text += _L("Details:");
-    prompt_text += "\n";
-    prompt_text += runtime_command_detail(verify_out, verify_err);
-    prompt_text += "\n\n";
-    prompt_text += _L("Install or repair it now?");
-
-    wxMessageDialog prompt(nullptr, prompt_text, _L("BambuStudio Linux Runtime"), wxYES_NO | wxICON_QUESTION | wxCENTRE);
-    if (prompt.ShowModal() != wxID_YES)
-        return false;
-
-    const wxString install_cmd = wxString::Format(
-        "/bin/bash %s -PackageDir %s -ComponentDir %s -ComponentCacheDir %s -ReplaceExisting",
-        quote_posix_command_arg(from_u8(install_script.string())),
-        quote_posix_command_arg(component_dir_wx),
-        quote_posix_command_arg(component_dir_wx),
-        quote_posix_command_arg(cache_dir_wx));
-
-    wxArrayString install_out;
-    wxArrayString install_err;
-    long install_code = run_posix_command_sync(install_cmd, &install_out, &install_err);
-    log_runtime_command_output("[slicer_linux_runtime_install_macos]", install_code, install_out, install_err);
-
-    if (install_code != 0) {
-        wxString error_text = _L("macOS Linux runtime installation failed.");
-        error_text += "\n\n";
-        error_text += runtime_command_detail(install_out, install_err);
-        wxMessageDialog error(nullptr, error_text, _L("BambuStudio Linux Runtime"), wxOK | wxICON_ERROR | wxCENTRE);
-        error.ShowModal();
-        return false;
-    }
-
-    verify_out.clear();
-    verify_err.clear();
-    verify_code = run_posix_command_sync(verify_cmd, &verify_out, &verify_err);
-    log_runtime_command_output("[slicer_linux_runtime_verify_after_install_macos]", verify_code, verify_out, verify_err);
-    return verify_code == 0;
-#endif
-}
-
 bool slicer_linux_runtime_ready(const boost::filesystem::path& component_folder, std::string* reason)
 {
     if (!Slic3r::SlicerLinuxRuntime::enabled()) {
@@ -3406,6 +3802,11 @@ bool slicer_linux_runtime_ready(const boost::filesystem::path& component_folder,
         Slic3r::SlicerLinuxRuntime::host_executable_file_name(),
         std::string("slicer_linux_runtime_host_abi1"),
         std::string("slicer_linux_runtime_host_abi0"),
+        std::string("liborcastudio_rosetta_splitlock_compat.so"),
+        std::string("slicer_linux_auth_browser"),
+        std::string("slicer_linux_auth_browser_x86_64"),
+        std::string("slicer_linux_auth_browser_aarch64"),
+        std::string("run_auth_browser.sh"),
         Slic3r::SlicerLinuxRuntime::mac_host_wrapper_file_name(),
         Slic3r::SlicerLinuxRuntime::mac_runtime_install_script_file_name(),
         Slic3r::SlicerLinuxRuntime::mac_runtime_verify_script_file_name(),
@@ -3430,6 +3831,8 @@ bool slicer_linux_runtime_ready(const boost::filesystem::path& component_folder,
         Slic3r::SlicerLinuxRuntime::host_executable_file_name(),
         std::string("slicer_linux_runtime_host_abi1"),
         std::string("slicer_linux_runtime_host_abi0"),
+        std::string("slicer_linux_auth_browser"),
+        std::string("run_auth_browser.sh"),
         Slic3r::SlicerLinuxRuntime::windows_wsl_distro_file_name(),
         Slic3r::SlicerLinuxRuntime::windows_wsl_validate_script_file_name(),
         Slic3r::SlicerLinuxRuntime::windows_wsl_rootfs_file_name(),
@@ -3610,197 +4013,232 @@ void copy_local_runtime_files(const boost::filesystem::path& component_folder)
     }
 }
 
+
 void GUI_App::copy_network_if_available()
 {
-    std::string data_dir_str = data_dir();
-    boost::filesystem::path data_dir_path(data_dir_str);
-    auto component_folder = data_dir_path / "plugins";
-    auto cache_folder = data_dir_path / "ota";
+    const boost::filesystem::path data_dir_path(data_dir());
+    const boost::filesystem::path component_folder = data_dir_path / "plugins";
 
-    if (!boost::filesystem::exists(component_folder))
-        boost::filesystem::create_directory(component_folder);
-
+    boost::filesystem::create_directories(component_folder);
     copy_local_runtime_files(component_folder);
-
-    if (Slic3r::SlicerLinuxRuntime::enabled()) {
-        const auto linux_cache_folder = cache_folder / "plugins";
-        if (boost::filesystem::exists(linux_cache_folder) && boost::filesystem::is_directory(linux_cache_folder))
-            cache_folder = linux_cache_folder;
-    }
-
-    std::string changelog_file = (cache_folder / "network_plugins.json").string();
 
     if (app_config->get("update_network_plugin") != "true")
         return;
 
+    bool had_cache = false;
+    const bool installed = install_network_plugin_from_ota(had_cache);
+    if (installed || !had_cache)
+        app_config->set("update_network_plugin", "false");
+}
+
+bool GUI_App::install_network_plugin_from_ota(bool& had_cache)
+{
+    had_cache = false;
+
+    const boost::filesystem::path data_dir_path(data_dir());
+    const boost::filesystem::path plugin_folder = data_dir_path / "plugins";
+    const boost::filesystem::path cache_folder = data_dir_path / "ota" / "plugins";
+    const boost::filesystem::path changelog_file = cache_folder / "network_plugins.json";
+
+    if (!boost::filesystem::exists(cache_folder) || !boost::filesystem::is_directory(cache_folder))
+        return false;
+
     std::string cached_version;
     if (boost::filesystem::exists(changelog_file)) {
         try {
-            boost::nowide::ifstream ifs(changelog_file);
+            boost::nowide::ifstream ifs(changelog_file.string());
             json j;
             ifs >> j;
             if (j.contains("version"))
-                cached_version = j["version"];
-        } catch (nlohmann::detail::parse_error&) {}
+                cached_version = j["version"].get<std::string>();
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid plugin changelog: " << e.what();
+        }
     }
 
-    const bool select_linux_component_package = Slic3r::SlicerLinuxRuntime::enabled();
-    std::string error_message;
+    const bool linux_component = Slic3r::SlicerLinuxRuntime::enabled();
+    if (linux_component) {
+        had_cache = true;
+        boost::filesystem::create_directories(plugin_folder);
 
-    auto copy_one = [&](const boost::filesystem::path& src, const boost::filesystem::path& dst) -> bool {
-        boost::filesystem::create_directories(dst.parent_path());
+        auto copy_one = [&](const boost::filesystem::path& src, const boost::filesystem::path& dst) -> bool {
+            boost::filesystem::create_directories(dst.parent_path());
+            if (boost::filesystem::exists(dst)) {
+                boost::system::error_code ec;
+                boost::filesystem::remove(dst, ec);
+                if (ec) {
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": removing stale runtime file failed: "
+                                             << dst.string() << ", err=" << ec.message();
+                    return false;
+                }
+            }
+            std::string error_message;
+            const CopyFileResult result = copy_file(src.string(), dst.string(), error_message, false);
+            if (result != CopyFileResult::SUCCESS) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": copying " << src.string()
+                                         << " failed(" << result << "): " << error_message;
+                return false;
+            }
+#ifndef WIN32
+            static constexpr const auto perms = fs::owner_read | fs::owner_write |
+                fs::group_read | fs::others_read | fs::owner_exe | fs::group_exe | fs::others_exe;
+            try { fs::permissions(dst, perms); } catch (...) {}
+#endif
+            return true;
+        };
 
-        if (boost::filesystem::exists(dst)) {
-            boost::system::error_code rm_ec;
-            boost::filesystem::remove(dst, rm_ec);
-            if (rm_ec) {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Removing stale file failed: "
-                                         << dst.string() << ", err=" << rm_ec.message();
+        try {
+            for (const auto& entry : boost::filesystem::directory_iterator(cache_folder)) {
+                const boost::filesystem::path path = entry.path();
+                if (!boost::filesystem::is_regular_file(path))
+                    continue;
+                const std::string file_name = path.filename().string();
+                if (!Slic3r::SlicerLinuxRuntime::is_overlay_runtime_filename(file_name))
+                    continue;
+
+                std::string validate_reason;
+                if (Slic3r::SlicerLinuxRuntime::is_linux_component_package_filename(file_name)) {
+                    if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_file(path.string(), &validate_reason)) {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid cached Linux component "
+                                                 << file_name << ": " << validate_reason;
+                        return false;
+                    }
+                } else if (path.extension() == ".so" || file_name.find(".so.") != std::string::npos) {
+                    if (!Slic3r::SlicerLinuxRuntime::validate_linux_so_binary(path.string(), &validate_reason)) {
+                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid cached Linux library "
+                                                 << file_name << ": " << validate_reason;
+                        return false;
+                    }
+                }
+
+                if (!copy_one(path, plugin_folder / file_name))
+                    return false;
+            }
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": installing Linux component failed: " << e.what();
+            return false;
+        }
+
+        copy_local_runtime_files(plugin_folder);
+        const boost::filesystem::path manifest = plugin_folder /
+            Slic3r::SlicerLinuxRuntime::linux_component_manifest_file_name();
+        if (boost::filesystem::exists(manifest)) {
+            std::string validate_reason;
+            if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(plugin_folder, &validate_reason)) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": installed Linux component failed validation: "
+                                         << validate_reason;
                 return false;
             }
         }
 
-        CopyFileResult cfr = copy_file(src.string(), dst.string(), error_message, false);
-        if (cfr != CopyFileResult::SUCCESS) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": Copying failed(" << cfr << "): " << error_message;
-            return false;
-        }
-        static constexpr const auto perms = fs::owner_read | fs::owner_write | fs::group_read | fs::others_read |
-                                            fs::owner_exe | fs::group_exe | fs::others_exe;
-        try { fs::permissions(dst, perms); } catch (...) {}
-        return true;
-    };
-
-    if (select_linux_component_package) {
-        if (!boost::filesystem::exists(cache_folder)) {
-            try {
-                boost::filesystem::create_directories(cache_folder);
-            } catch (...) {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": failed to create Linux package cache folder: " << cache_folder.string();
-                return;
-            }
-        }
-
-        bool copy_failed = false;
-        try {
-            for (auto& dir_entry : boost::filesystem::directory_iterator(cache_folder)) {
-                const auto& path = dir_entry.path();
-                const std::string file_name = path.filename().string();
-                const std::string file_path = path.string();
-
-                if (!Slic3r::SlicerLinuxRuntime::is_overlay_runtime_filename(file_name))
-                    continue;
-
-                if (Slic3r::SlicerLinuxRuntime::is_linux_component_package_filename(file_name)) {
-                    std::string validate_reason;
-                    if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_file(file_path, &validate_reason)) {
-                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid cached Linux package file " << file_name << ", reason=" << validate_reason;
-                        copy_failed = true;
-                        break;
-                    }
-                } else if (path.extension() == ".so" || file_name.find(".so.") != std::string::npos) {
-                    std::string validate_reason;
-                    if (!Slic3r::SlicerLinuxRuntime::validate_linux_so_binary(file_path, &validate_reason)) {
-                        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": invalid cached linux runtime file " << file_name << ", reason=" << validate_reason;
-                        copy_failed = true;
-                        break;
-                    }
-                }
-
-                if (!copy_one(path, component_folder / file_name)) {
-                    copy_failed = true;
-                    break;
-                }
-
-                try {
-                    fs::remove(path);
-                } catch (...) {}
-            }
-
-            copy_local_runtime_files(component_folder);
-        } catch (...) {
-            copy_failed = true;
-        }
-
-        if (copy_failed)
-            return;
-
-        const auto manifest = component_folder / Slic3r::SlicerLinuxRuntime::linux_component_manifest_file_name();
-        if (boost::filesystem::exists(manifest)) {
-            std::string validate_reason;
-            if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(component_folder, &validate_reason)) {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": manifest validation failed after copy: " << validate_reason;
-                return;
-            }
-        }
-
         if (!cached_version.empty()) {
-            app_config->set(SETTING_NETWORK_PLUGIN_VERSION, cached_version);
+            app_config->set_network_plugin_version(cached_version);
             app_config->save();
         }
-        if (boost::filesystem::exists(changelog_file))
-            fs::remove(changelog_file);
-        app_config->set("update_network_plugin", "false");
-        return;
+        try { fs::remove_all(cache_folder); } catch (...) {}
+        return true;
     }
 
     if (cached_version.empty()) {
-        app_config->set("update_network_plugin", "false");
-        return;
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": no version found in changelog, nothing to install";
+        return false;
     }
+    had_cache = true;
+    boost::filesystem::create_directories(plugin_folder);
 
-    std::string network_library, player_library, live555_library, network_library_dst, player_library_dst, live555_library_dst;
+    std::string network_library, player_library, live555_library;
+    std::string network_library_dst, player_library_dst, live555_library_dst;
 #if defined(_MSC_VER) || defined(_WIN32)
-    network_library = cache_folder.string() + "/bambu_networking.dll";
-    player_library = cache_folder.string() + "/BambuSource.dll";
-    live555_library = cache_folder.string() + "/live555.dll";
-    network_library_dst = component_folder.string() + "/" + std::string(BAMBU_NETWORK_LIBRARY) + "_" + cached_version + ".dll";
-    player_library_dst = component_folder.string() + "/BambuSource.dll";
-    live555_library_dst = component_folder.string() + "/live555.dll";
+    network_library = (cache_folder / "bambu_networking.dll").string();
+    player_library = (cache_folder / "BambuSource.dll").string();
+    live555_library = (cache_folder / "live555.dll").string();
+    network_library_dst = (plugin_folder / (std::string(BAMBU_NETWORK_LIBRARY) + "_" + cached_version + ".dll")).string();
+    player_library_dst = (plugin_folder / "BambuSource.dll").string();
+    live555_library_dst = (plugin_folder / "live555.dll").string();
 #elif defined(__WXMAC__)
-    network_library = cache_folder.string() + "/libbambu_networking.dylib";
-    player_library = cache_folder.string() + "/libBambuSource.dylib";
-    live555_library = cache_folder.string() + "/liblive555.dylib";
-    network_library_dst = component_folder.string() + "/lib" + std::string(BAMBU_NETWORK_LIBRARY) + "_" + cached_version + ".dylib";
-    player_library_dst = component_folder.string() + "/libBambuSource.dylib";
-    live555_library_dst = component_folder.string() + "/liblive555.dylib";
+    network_library = (cache_folder / "libbambu_networking.dylib").string();
+    player_library = (cache_folder / "libBambuSource.dylib").string();
+    live555_library = (cache_folder / "liblive555.dylib").string();
+    network_library_dst = (plugin_folder / (std::string("lib") + BAMBU_NETWORK_LIBRARY + "_" + cached_version + ".dylib")).string();
+    player_library_dst = (plugin_folder / "libBambuSource.dylib").string();
+    live555_library_dst = (plugin_folder / "liblive555.dylib").string();
 #else
-    network_library = cache_folder.string() + "/libbambu_networking.so";
-    player_library = cache_folder.string() + "/libBambuSource.so";
-    live555_library = cache_folder.string() + "/liblive555.so";
-    network_library_dst = component_folder.string() + "/lib" + std::string(BAMBU_NETWORK_LIBRARY) + "_" + cached_version + ".so";
-    player_library_dst = component_folder.string() + "/libBambuSource.so";
-    live555_library_dst = component_folder.string() + "/liblive555.so";
+    network_library = (cache_folder / "libbambu_networking.so").string();
+    player_library = (cache_folder / "libBambuSource.so").string();
+    live555_library = (cache_folder / "liblive555.so").string();
+    network_library_dst = (plugin_folder / (std::string("lib") + BAMBU_NETWORK_LIBRARY + "_" + cached_version + ".so")).string();
+    player_library_dst = (plugin_folder / "libBambuSource.so").string();
+    live555_library_dst = (plugin_folder / "liblive555.so").string();
 #endif
 
+    auto install_file = [](const std::string& src, const std::string& dst) -> bool {
+        boost::system::error_code ec;
+        if (boost::filesystem::exists(dst, ec)) {
+            boost::filesystem::remove(dst, ec);
+            if (ec) {
+                boost::filesystem::path aside(dst);
+                aside += ".old";
+                boost::system::error_code aside_ec;
+                boost::filesystem::remove(aside, aside_ec);
+                boost::filesystem::rename(dst, aside, aside_ec);
+                if (aside_ec) {
+                    BOOST_LOG_TRIVIAL(error) << "install_network_plugin_from_ota: cannot replace "
+                                             << dst << ": " << aside_ec.message();
+                    return false;
+                }
+            }
+        }
+        std::string error_message;
+        const CopyFileResult result = copy_file(src, dst, error_message, false);
+        if (result != CopyFileResult::SUCCESS) {
+            BOOST_LOG_TRIVIAL(error) << "install_network_plugin_from_ota: copying " << src
+                                     << " failed(" << result << "): " << error_message;
+            return false;
+        }
+        static constexpr const auto perms = fs::owner_read | fs::owner_write | fs::group_read | fs::others_read;
+        fs::permissions(dst, perms);
+        boost::filesystem::remove(src, ec);
+        return true;
+    };
+
     if (boost::filesystem::exists(network_library)) {
-        if (!copy_one(network_library, network_library_dst))
-            return;
-        fs::remove(network_library);
-        app_config->set(SETTING_NETWORK_PLUGIN_VERSION, cached_version);
+        if (!install_file(network_library, network_library_dst))
+            return false;
+        app_config->set_network_plugin_version(cached_version);
         app_config->save();
     }
+    if (boost::filesystem::exists(player_library) && !install_file(player_library, player_library_dst))
+        return false;
+    if (boost::filesystem::exists(live555_library) && !install_file(live555_library, live555_library_dst))
+        return false;
 
-    if (boost::filesystem::exists(player_library)) {
-        if (!copy_one(player_library, player_library_dst))
-            return;
-        fs::remove(player_library);
+    try { fs::remove_all(cache_folder); }
+    catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << ": failed to remove cache " << cache_folder.string()
+                                 << ": " << e.what();
     }
-
-    if (boost::filesystem::exists(live555_library)) {
-        if (!copy_one(live555_library, live555_library_dst))
-            return;
-        fs::remove(live555_library);
-    }
-
-    if (boost::filesystem::exists(changelog_file))
-        fs::remove(changelog_file);
-    app_config->set("update_network_plugin", "false");
+    return true;
 }
-
 
 bool GUI_App::on_init_network(bool try_backup)
 {
+    {
+        const boost::filesystem::path plugin_folder = boost::filesystem::path(data_dir()) / "plugins";
+        boost::system::error_code ec;
+        if (boost::filesystem::is_directory(plugin_folder, ec)) {
+            for (boost::filesystem::directory_iterator it(plugin_folder, ec), end; !ec && it != end; it.increment(ec)) {
+                if (it->path().extension() == ".old") {
+                    boost::system::error_code remove_ec;
+                    boost::filesystem::remove(it->path(), remove_ec);
+                    if (remove_ec)
+                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": could not remove stale "
+                                                << it->path().filename().string() << " (" << remove_ec.message()
+                                                << "), will retry next launch";
+                }
+            }
+        }
+    }
+
     const bool should_load_networking_plugin = app_config && app_config->get_bool("installed_networking");
     bool create_network_agent = false;
 
@@ -3808,7 +4246,18 @@ bool GUI_App::on_init_network(bool try_backup)
         m_networking_need_update = true;
     };
 
-    std::string config_version = get_latest_network_version();
+    if (app_config)
+        migrate_network_plugin_config();
+
+    std::string config_version = app_config ? app_config->get_network_plugin_version() : std::string();
+    if (should_load_networking_plugin && !config_version.empty() && !is_supported_network_version(config_version)) {
+        const std::string latest = get_latest_network_version();
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": configured plugin version " << config_version
+                                   << " is unsupported, falling back to " << latest;
+        config_version = BBLNetworkPlugin::versioned_library_exists(latest) ? latest : std::string();
+        app_config->set_network_plugin_version(config_version);
+        app_config->save();
+    }
 
 #if defined(__LINUX__)
     {
@@ -3824,11 +4273,6 @@ bool GUI_App::on_init_network(bool try_backup)
     }
 #endif
 
-    if (app_config && app_config->get_network_plugin_version() != config_version) {
-        app_config->set(SETTING_NETWORK_PLUGIN_VERSION, config_version);
-        app_config->save();
-    }
-
     if (should_load_networking_plugin && Slic3r::SlicerLinuxRuntime::enabled()) {
         const boost::filesystem::path component_folder = boost::filesystem::path(data_dir()) / "plugins";
         const auto network_so = component_folder / Slic3r::SlicerLinuxRuntime::linux_component_library_name();
@@ -3837,6 +4281,8 @@ bool GUI_App::on_init_network(bool try_backup)
             !boost::filesystem::exists(source_so) || boost::filesystem::is_directory(source_so)) {
             BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": Linux runtime component payload incomplete, skip network module load";
             mark_networking_need_update();
+            app_config->set_bool("installed_networking", false);
+            app_config->save();
             const int result = Slic3r::NetworkAgent::unload_network_module();
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": payload incomplete fallback, unload_network_module, result = " << result;
             if (!m_device_manager)
@@ -3853,53 +4299,82 @@ bool GUI_App::on_init_network(bool try_backup)
 
     if (should_load_networking_plugin) {
         if (config_version.empty()) {
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": no version configured, need to download";
+            if (Slic3r::SlicerLinuxRuntime::enabled()) {
+                config_version = get_latest_network_version();
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": using transient Linux component series " << config_version;
+            } else {
+                boost::optional<Semver> newest_version;
+                for (const std::string& candidate : Slic3r::NetworkAgent::scan_plugin_versions()) {
+                    const boost::optional<Semver> parsed = Semver::parse(candidate);
+                    if (parsed && (!newest_version || *newest_version < *parsed)) {
+                        newest_version = *parsed;
+                        config_version = candidate;
+                    }
+                }
+                if (config_version.empty() && Slic3r::NetworkAgent::legacy_library_exists())
+                    config_version = BAMBU_NETWORK_AGENT_VERSION_LEGACY;
+                if (!config_version.empty())
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": recovered installed component version " << config_version;
+            }
+        }
+
+        if (config_version.empty()) {
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": no installed component version found, need to download";
             mark_networking_need_update();
         } else {
             int load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(false, config_version);
         __retry:
             if (!load_agent_dll) {
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, load dll ok";
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": network module loaded";
 
-                std::string loaded_version = Slic3r::NetworkAgent::get_version();
+                const std::string loaded_version = Slic3r::NetworkAgent::get_version();
                 if (app_config && !loaded_version.empty() && loaded_version != "00.00.00.00") {
-                    std::string configured_version = app_config->get_network_plugin_version();
-                    std::string config_base = extract_base_version(configured_version);
-                    if (config_base != loaded_version) {
-                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": syncing config version from " << configured_version << " to loaded " << loaded_version;
-                        app_config->set(SETTING_NETWORK_PLUGIN_VERSION, loaded_version);
+                    const std::string configured_version = app_config->get_network_plugin_version();
+                    const std::string loaded_series = network_plugin_series(loaded_version);
+                    if (network_plugin_series(configured_version) != loaded_series) {
+                        const std::string synced = is_series_managed_version(loaded_version) ? loaded_series : loaded_version;
+                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": syncing config version from " << configured_version
+                                                << " to loaded " << loaded_version << " (stored as " << synced << ")";
+                        app_config->set_network_plugin_version(synced);
                         app_config->save();
                     }
                 }
 
                 if (check_networking_version()) {
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, compatibility version";
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": compatible network module";
                     if (Slic3r::SlicerLinuxRuntime::enabled()) {
                         create_network_agent = true;
                     } else {
                         auto bambu_source = Slic3r::NetworkAgent::get_bambu_source_entry();
                         if (!bambu_source) {
-                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": can not get bambu source module";
+                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": cannot get BambuSource module";
                             m_networking_compatible = false;
                             mark_networking_need_update();
                         } else {
                             create_network_agent = true;
                         }
                     }
+                } else if (try_backup) {
+                    const int result = Slic3r::NetworkAgent::unload_network_module();
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": version mismatch, unload result = " << result;
+                    load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(true, config_version);
+                    try_backup = false;
+                    goto __retry;
                 } else {
-                    if (try_backup) {
-                        int result = Slic3r::NetworkAgent::unload_network_module();
-                        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": version mismatch, unload_network_module, result = " << result;
-                        load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(true, config_version);
-                        try_backup = false;
-                        goto __retry;
-                    }
-                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": version mismatch, need network module update";
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": incompatible network module, update required";
                     mark_networking_need_update();
                 }
             } else {
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, load dll failed";
-                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": on_init_network, need network module update";
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": network module load failed";
+                const std::string latest = get_latest_network_version();
+                if (config_version != latest && BBLNetworkPlugin::versioned_library_exists(latest)) {
+                    BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": falling back to installed " << latest;
+                    config_version = latest;
+                    app_config->set_network_plugin_version(latest);
+                    app_config->save();
+                    load_agent_dll = Slic3r::NetworkAgent::initialize_network_module(false, config_version);
+                    goto __retry;
+                }
                 mark_networking_need_update();
             }
         }
@@ -3907,10 +4382,9 @@ bool GUI_App::on_init_network(bool try_backup)
 
     if (create_network_agent) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": create network agent";
-        std::string data_directory = data_dir();
+        const std::string data_directory = data_dir();
 
         Slic3r::NetworkAgentFactory::register_all_agents();
-
         std::unique_ptr<Slic3r::NetworkAgent> agent_ptr = Slic3r::create_agent_from_config(data_directory, app_config);
         m_agent = agent_ptr.release();
         if (!m_agent || !m_agent->get_network_agent()) {
@@ -3933,7 +4407,7 @@ bool GUI_App::on_init_network(bool try_backup)
             else
                 m_user_manager->set_agent(m_agent);
 
-            if (this->is_enable_multi_machine()) {
+            if (is_enable_multi_machine()) {
                 if (!m_task_manager) {
                     m_task_manager = new Slic3r::TaskManager(m_agent);
                     m_task_manager->start();
@@ -3946,45 +4420,36 @@ bool GUI_App::on_init_network(bool try_backup)
             m_agent->set_config_dir(data_directory);
             m_agent->init_log();
             m_agent->set_cert_file(resources_dir() + "/cert", "slicer_base64.cer");
-
             init_networking_callbacks();
-            std::string country_code = app_config->get_country_code();
-            m_agent->set_country_code(country_code);
+            m_agent->set_country_code(app_config->get_country_code());
             m_agent->start();
             check_track_enable();
         }
     }
 
     if (!create_network_agent) {
-        int result = Slic3r::NetworkAgent::unload_network_module();
+        const int result = Slic3r::NetworkAgent::unload_network_module();
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": fallback, unload_network_module, result = " << result;
 
         if (!m_device_manager)
             m_device_manager = new Slic3r::DeviceManager();
         else
             m_device_manager->set_agent(nullptr);
-
         if (!m_user_manager)
             m_user_manager = new Slic3r::UserManager();
         else
             m_user_manager->set_agent(nullptr);
     }
 
-    if (should_load_networking_plugin && m_networking_compatible && !NetworkAgent::use_legacy_network) {
+    if (should_load_networking_plugin && m_networking_compatible && !use_legacy_network_plugin()) {
         app_config->clear_remind_network_update_later();
-
         if (has_network_update_available()) {
-            std::string latest = get_latest_network_version();
-
-            bool should_prompt = !app_config->is_network_update_prompt_disabled()
+            const std::string latest = get_latest_network_version();
+            const bool should_prompt = !app_config->is_network_update_prompt_disabled()
                 && !app_config->is_network_version_skipped(latest)
                 && !app_config->should_remind_network_update_later();
-
-            if (should_prompt) {
-                CallAfter([this]() {
-                    show_network_plugin_download_dialog(true);
-                });
-            }
+            if (should_prompt)
+                CallAfter([this]() { show_network_plugin_download_dialog(true); });
         }
     }
 
@@ -4005,53 +4470,58 @@ unsigned GUI_App::get_colour_approx_luma(const wxColour& colour)
 
 void GUI_App::switch_printer_agent()
 {
-    if (!m_agent) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": no agent exists";
+    if (!m_agent || !preset_bundle) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": network or preset state is unavailable";
         return;
     }
 
-    std::string effective_agent_id = ORCA_PRINTER_AGENT_ID;
-    std::string cloud_agent_id = ORCA_CLOUD_PROVIDER;
-    if (preset_bundle->is_bbl_vendor()) {
-        effective_agent_id = BBL_PRINTER_AGENT_ID;
-        cloud_agent_id = BBL_CLOUD_PROVIDER;
-    } else {
-        const DynamicPrintConfig& config = preset_bundle->printers.get_edited_preset().config;
-        if (config.has("printer_agent")) {
-            const std::string& value = config.option<ConfigOptionString>("printer_agent")->value;
-            if (!value.empty())
-                effective_agent_id = value;
-        }
+    std::string effective_agent_id = preset_bundle->is_bbl_vendor() ? BBL_PRINTER_AGENT_ID : ORCA_PRINTER_AGENT_ID;
+    const DynamicPrintConfig& config = preset_bundle->printers.get_edited_preset().config;
+    if (config.has("printer_agent")) {
+        const std::string& value = config.option<ConfigOptionString>("printer_agent")->value;
+        if (!value.empty())
+            effective_agent_id = value;
     }
 
-    if (!NetworkAgentFactory::is_printer_agent_registered(effective_agent_id)) {
-        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": unregistered agent ID '" << effective_agent_id << "', keeping current agent";
+    const PrinterAgentInfo* agent_info_ptr = NetworkAgentFactory::get_printer_agent_info(effective_agent_id);
+    if (!agent_info_ptr) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": unregistered agent ID '" << effective_agent_id
+                                   << "', keeping current agent";
         return;
     }
 
-    std::string current_agent_id;
-    if (m_agent->get_printer_agent())
-        current_agent_id = m_agent->get_printer_agent()->get_agent_info().id;
+    const PrinterAgentInfo agent_info = *agent_info_ptr;
+    const std::string cloud_agent_id = agent_info.id == BBL_PRINTER_AGENT_ID ? BBL_CLOUD_PROVIDER : ORCA_CLOUD_PROVIDER;
+    std::shared_ptr<ICloudServiceAgent> cloud_agent = m_agent->get_cloud_agent(cloud_agent_id);
+    std::shared_ptr<IPrinterAgent> new_printer_agent =
+        NetworkAgentFactory::create_printer_agent_by_id(effective_agent_id, cloud_agent, data_dir());
 
-    if (current_agent_id != effective_agent_id) {
-        std::string log_dir = data_dir();
-        std::shared_ptr<ICloudServiceAgent> cloud_agent = m_agent->get_cloud_agent(cloud_agent_id);
-
-        std::shared_ptr<IPrinterAgent> new_printer_agent =
-            NetworkAgentFactory::create_printer_agent_by_id(effective_agent_id, cloud_agent, log_dir);
-
-        if (!new_printer_agent) {
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": failed to create agent '" << effective_agent_id << "', keeping current agent";
-            return;
-        }
-
-        m_agent->set_printer_agent(new_printer_agent);
-        sidebar().update_all_preset_comboboxes();
-
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": printer agent switched to " << effective_agent_id;
-
-        select_machine(effective_agent_id);
+    if (!new_printer_agent) {
+        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": failed to create agent '" << effective_agent_id
+                                   << "', keeping current agent";
+        return;
     }
+
+    if (m_agent->get_printer_agent() == new_printer_agent) {
+        if (effective_agent_id != BBL_PRINTER_AGENT_ID && m_device_manager) {
+            const std::string print_host = config.opt_string("print_host");
+            if (!print_host.empty()) {
+                const std::string dev_id = MachineObject::dev_id_from_address(
+                    print_host, config.opt_string("printhost_port"));
+                MachineObject* selected = m_device_manager->get_selected_machine();
+                if (!selected || selected->get_dev_id() != dev_id)
+                    select_machine(effective_agent_id);
+            }
+        }
+        return;
+    }
+
+    m_agent->set_printer_agent(new_printer_agent);
+    sidebar().update_all_preset_comboboxes();
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": printer agent switched to " << effective_agent_id;
+
+    m_agent->start_discovery(true, false);
+    select_machine(effective_agent_id);
 }
 
 void GUI_App::select_machine(const std::string& agent_id)
@@ -4477,7 +4947,7 @@ void GUI_App::ShowUserLogin(bool show, const std::string& provider)
             delete login_dlg;
             auto cloud_agent = m_agent->get_cloud_agent(provider);
             login_dlg        = new ZUserLogin(cloud_agent);
-            login_dlg->ShowModal();
+            login_dlg->run();
         } catch (std::exception &) {
             ;
         }
@@ -5007,18 +5477,23 @@ void GUI_App::request_user_logout(const std::string& provider/* = ORCA_CLOUD_PRO
         if (provider == ORCA_CLOUD_PROVIDER || provider == BBL_CLOUD_PROVIDER) {
             const bool active_preset_user = logged_out_user_id.empty() || app_config->get("preset_folder") == logged_out_user_id;
             if (active_preset_user) {
-                /* delete old user settings */
-                bool     transfer_preset_changes = false;
+                bool transfer_preset_changes = false;
                 wxString header = _L("Some presets are modified.") + "\n" +
-                    _L("You can keep the modified presets to the new project, discard or save changes as new presets.");
+                    _L("You can keep the modified presets for the new project, discard, or save changes as new presets.");
                 wxGetApp().check_and_keep_current_preset_changes(_L("User logged out"), header, ActionButtons::KEEP | ActionButtons::SAVE, &transfer_preset_changes);
 
                 remove_user_presets();
                 enable_user_preset_folder(false);
+                if (provider == ORCA_CLOUD_PROVIDER) {
+                    Slic3r::PluginManager::instance().unload_cloud_plugins();
+                    Slic3r::PluginManager::instance().clear_cloud_plugin_metadata();
+                    Slic3r::PluginManager::instance().set_cloud_user("");
+                }
                 preset_bundle->load_user_presets(DEFAULT_USER_FOLDER_NAME, ForwardCompatibilitySubstitutionRule::Enable);
                 mainframe->update_side_preset_ui();
-
-                GUI::wxGetApp().stop_sync_user_preset();
+                if (m_plugins_dlg)
+                    m_plugins_dlg->update_plugin_dialog_ui();
+                stop_sync_user_preset();
             }
         }
 
@@ -5254,7 +5729,7 @@ std::string GUI_App::handle_web_request(std::string cmd)
                     pt::ptree                    data_node = root.get_child("data");
                     boost::optional<std::string> path      = data_node.get_optional<std::string>("url");
                     if (path.has_value()) {
-                        wxLaunchDefaultBrowser(path.value());
+                        open_browser_with_warning_dialog(from_u8(path.value()));
                     }
                 }
             }
@@ -5272,7 +5747,7 @@ std::string GUI_App::handle_web_request(std::string cmd)
             else if (command_str.compare("common_openurl") == 0) {
                 boost::optional<std::string> path      = root.get_optional<std::string>("url");
                 if (path.has_value()) {
-                    wxLaunchDefaultBrowser(path.value());
+                    open_browser_with_warning_dialog(from_u8(path.value()));
                 }
             } 
             else if (command_str.compare("homepage_makerlab_get") == 0) {
@@ -5485,21 +5960,28 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
         if (plater != nullptr && wxGetApp().imgui()->display_initialized()) {
             std::string text;
 
+            // Name the specific preset in the header so the user knows which one conflicts.
+            // The agent injects the local preset name into every 409 conflict body, so this is
+            // normally populated; fall back to a generic header if it is somehow missing.
+            const std::string header = conflict_preset_name.empty()
+                ? _u8L("Cloud sync conflict:")
+                : format(_u8L("Cloud sync conflict for preset \"%s\":"), conflict_preset_name);
+
             switch (conflict_code) {
             case -1:
-                text = _u8L("Cloud sync conflict: this preset has a newer version in OrcaCloud.\n"
+                text = header + " " + _u8L("This preset has a newer version in OrcaCloud.\n"
                             "Pull downloads the cloud copy. Force push overwrites it with your local preset.");
                 break;
             case -2:
-                text = _u8L("Cloud sync conflict: a preset with this name already exists in OrcaCloud.\n"
+                text = header + " " + _u8L("A preset with this name already exists in OrcaCloud.\n"
                             "Pull downloads the cloud copy. Force push overwrites it with your local preset.");
                 break;
             case -3:
-                text = _u8L("Cloud sync conflict: a preset with the same name was previously deleted from the cloud.\n"
+                text = header + " " + _u8L("A preset with the same name was previously deleted from the cloud.\n"
                             "Delete will delete your local preset. Force push overwrites it with your local preset.");
                 break;
             default:
-                text = _u8L("Cloud sync conflict: there was an unexpected or unidentified preset conflict.\n"
+                text = header + " " + _u8L("There was an unexpected or unidentified preset conflict.\n"
                             "Pull downloads the cloud copy. Force push overwrites it with your local preset.");
                 break;
             };
@@ -5518,10 +6000,12 @@ void GUI_App::on_http_error(wxCommandEvent &evt)
                 [this, conflict_setting_id, conflict_preset_name, conflict_user_id](wxEvtHandler*) {
                     if (mainframe == nullptr)
                         return false;
-                    MessageDialog
-                        dlg(mainframe,
-                            _L("Force push will overwrite the cloud copy with your local preset changes.\nDo you want to continue?"),
-                            _L("Resolve cloud sync conflict"), wxCENTER | wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+                    const wxString confirm_msg = conflict_preset_name.empty()
+                        ? _L("Force push will overwrite the cloud copy with your local preset changes.\nDo you want to continue?")
+                        : format_wxstr(_L("Force push will overwrite the cloud copy of preset \"%s\" with your local changes.\nDo you want to continue?"),
+                                       conflict_preset_name);
+                    MessageDialog dlg(mainframe, confirm_msg, _L("Resolve cloud sync conflict"),
+                                      wxCENTER | wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
                     if (dlg.ShowModal() != wxID_YES)
                         return false;
 
@@ -5557,10 +6041,12 @@ void GUI_App::enable_user_preset_folder(bool enable, const std::string& provider
         }
         app_config->set("preset_folder", user_id);
         GUI::wxGetApp().preset_bundle->update_user_presets_directory(user_id);
+        PluginManager::instance().set_cloud_user(user_id);
     } else {
         BOOST_LOG_TRIVIAL(info) << "preset_folder: set to empty";
         app_config->set("preset_folder", "");
         GUI::wxGetApp().preset_bundle->update_user_presets_directory(DEFAULT_USER_FOLDER_NAME);
+        PluginManager::instance().set_cloud_user("");
     }
 }
 
@@ -5629,14 +6115,29 @@ void GUI_App::on_user_login_handle(wxCommandEvent &evt)
     });
 
     if (online_login && (provider == ORCA_CLOUD_PROVIDER || provider == BBL_CLOUD_PROVIDER)) {
-        if (provider == ORCA_CLOUD_PROVIDER)
+        ProgressDialog dlg(_L("Loading"), _L("Syncing your account…"), 100, mainframe,
+            wxPD_AUTO_HIDE | wxPD_APP_MODAL);
+
+        if (provider == ORCA_CLOUD_PROVIDER) {
+            dlg.Update(10, _L("Migrating presets…"));
             maybe_migrate_user_presets_on_login();
+        }
 
         remove_user_presets();
         enable_user_preset_folder(true, provider);
+
+        if (provider == ORCA_CLOUD_PROVIDER) {
+            dlg.Update(40, _L("Fetching plugins…"));
+            PluginManager::instance().fetch_plugins_from_cloud();
+            if (m_plugins_dlg)
+                m_plugins_dlg->update_plugin_dialog_ui();
+        }
+
+        dlg.Update(70, _L("Loading user presets…"));
         preset_bundle->load_user_presets(m_agent->get_user_id(provider), ForwardCompatibilitySubstitutionRule::Enable);
         mainframe->update_side_preset_ui();
 
+        dlg.Update(100);
         GUI::wxGetApp().mainframe->show_sync_dialog();
     }
 
@@ -5686,519 +6187,20 @@ void GUI_App::reset_to_active()
 
 void GUI_App::check_update(bool show_tips, int by_user)
 {
-    if (version_info.version_str.empty()) return;
-    if (version_info.url.empty()) return;
-
-    auto curr_version = Semver::parse(SLIC3R_VERSION);
-    auto remote_version = Semver::parse(version_info.version_str);
-    if (curr_version && remote_version && (*remote_version > *curr_version)) {
-        if (version_info.force_upgrade) {
-            wxGetApp().app_config->set_bool("force_upgrade", version_info.force_upgrade);
-            wxGetApp().app_config->set("upgrade", "force_upgrade", true);
-            wxGetApp().app_config->set("upgrade", "description", version_info.description);
-            wxGetApp().app_config->set("upgrade", "version", version_info.version_str);
-            wxGetApp().app_config->set("upgrade", "url", version_info.url);
-            GUI::wxGetApp().enter_force_upgrade();
-        }
-        else {
-            GUI::wxGetApp().request_new_version(by_user);
-        }
-    } else {
-        wxGetApp().app_config->set("upgrade", "force_upgrade", false);
-        if (show_tips)
-            this->no_new_version();
-    }
+    (void)show_tips;
+    (void)by_user;
 }
 
 void GUI_App::check_new_version(bool show_tips, int by_user)
 {
-    return; // orca: not used, see check_new_version_sf
-    std::string platform = "windows";
-
-#ifdef __WINDOWS__
-    platform = "windows";
-#endif
-#ifdef __APPLE__
-    platform = "macos";
-#endif
-#ifdef __LINUX__
-    platform = "linux";
-#endif
-    std::string query_params = (boost::format("?name=slicer&version=%1%&guide_version=%2%")
-        % VersionInfo::convert_full_version(SLIC3R_VERSION)
-        % VersionInfo::convert_full_version("0.0.0.1")
-        ).str();
-
-    std::string url = get_http_url(app_config->get_country_code()) + query_params;
-    Slic3r::Http http = Slic3r::Http::get(url);
-
-    http.header("accept", "application/json")
-        .timeout_connect(TIMEOUT_CONNECT)
-        .timeout_max(TIMEOUT_RESPONSE)
-        .on_complete([this, show_tips, by_user](std::string body, unsigned) {
-        try {
-            json j = json::parse(body);
-            if (j.contains("message")) {
-                if (j["message"].get<std::string>() == "success") {
-                    if (j.contains("software")) {
-                        if (j["software"].empty() && show_tips) {
-                            this->no_new_version();
-                        }
-                        else {
-                            if (j["software"].contains("url")
-                                && j["software"].contains("version")
-                                && j["software"].contains("description")) {
-                                version_info.url = j["software"]["url"].get<std::string>();
-                                version_info.version_str = j["software"]["version"].get<std::string>();
-                                version_info.description = j["software"]["description"].get<std::string>();
-                            }
-                            if (j["software"].contains("force_update")) {
-                                version_info.force_upgrade = j["software"]["force_update"].get<bool>();
-                            }
-                            CallAfter([this, show_tips, by_user](){
-                                this->check_update(show_tips, by_user);
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        catch (...) {
-            ;
-        }
-            })
-        .on_error([this](std::string body, std::string error, unsigned int status) {
-            handle_http_error(status, body);
-            BOOST_LOG_TRIVIAL(error) << "check new version error" << body;
-    }).perform();
+    (void)show_tips;
+    (void)by_user;
 }
-
-//parse the string, if it doesn't contain a valid version string, return invalid version.
-Semver get_version(const std::string& str, const std::regex& regexp) {
-    std::smatch match;
-    if (std::regex_match(str, match, regexp)) {
-        std::string version_cleaned = match[0];
-        const boost::optional<Semver> version = Semver::parse(version_cleaned);
-        if (version.has_value()) {
-            return *version;
-        }
-    }
-    return Semver::invalid();
-}
-
-namespace
-{
-
-struct UpdaterQuery
-{
-    std::string iid;
-    std::string version;
-    std::string os;
-    std::string arch;
-    std::string os_info;
-};
-
-std::string detect_updater_os()
-{
-#if defined(_WIN32)
-    return "win";
-#elif defined(__APPLE__)
-    return "macos";
-#elif defined(__linux__) || defined(__LINUX__)
-    return "linux";
-#else
-    return "unknown";
-#endif
-}
-
-std::string detect_updater_arch()
-{
-#if defined(__aarch64__) || defined(_M_ARM64)
-    return "arm64";
-#elif defined(__x86_64__) || defined(_M_X64)
-    return "x86_64";
-#elif defined(__i386__) || defined(_M_IX86)
-    return "i386";
-#else
-    std::string arch = wxPlatformInfo::Get().GetArchName().ToStdString();
-    boost::algorithm::to_lower(arch);
-    if (arch.find("aarch64") != std::string::npos || arch.find("arm64") != std::string::npos)
-        return "arm64";
-    if (arch.find("x86_64") != std::string::npos || arch.find("amd64") != std::string::npos)
-        return "x86_64";
-    if (arch.find("i686") != std::string::npos || arch.find("i386") != std::string::npos || arch.find("x86") != std::string::npos)
-        return "i386";
-    return "unknown";
-#endif
-}
-
-std::string detect_updater_os_info()
-{
-    wxString description = wxPlatformInfo::Get().GetOperatingSystemDescription();
-#if defined(__LINUX__) || defined(__linux__)
-    wxLinuxDistributionInfo distro = wxGetLinuxDistributionInfo();
-    if (!distro.Id.empty()) {
-        wxString normalized = distro.Id;
-        if (!distro.Release.empty())
-            normalized << " " << distro.Release;
-        normalized.Trim(true);
-        normalized.Trim(false);
-        if (!normalized.empty())
-            description = normalized;
-    }
-#endif
-    if (description.empty())
-        description = wxGetOsDescription();
-
-    //Orca: workaround: wxGetOsVersion can't recognize Windows 11
-    // For Windows, use actual version numbers to properly detect Windows 11
-    // Windows 11 starts at build 22000
-#if defined(_WIN32)
-    int major = 0, minor = 0, micro = 0;
-    wxGetOsVersion(&major, &minor, &micro);
-    if (micro >= 22000) {
-        // replace Windows 10 with Windows 11
-        description.Replace("Windows 10", "Windows 11");
-    }
-#endif
-    std::string os_info = description.ToStdString();
-    boost::replace_all(os_info, "\r", " ");
-    boost::replace_all(os_info, "\n", " ");
-    boost::algorithm::trim(os_info);
-    if (os_info.size() > 120)
-        os_info.resize(120);
-    boost::algorithm::to_lower(os_info);
-    return os_info;
-}
-
-std::string detect_updater_version()
-{
-    return SoftFever_VERSION;
-}
-
-std::string detect_updater_iid(AppConfig* config)
-{
-    if (config == nullptr)
-        return {};
-    return instance_id::ensure(*config);
-}
-
-std::string encode_uri_component(const std::string& value)
-{
-    static constexpr const char* hex = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(value.size());
-    for (unsigned char ch : value) {
-        if ((ch >= 'A' && ch <= 'Z') ||
-            (ch >= 'a' && ch <= 'z') ||
-            (ch >= '0' && ch <= '9') ||
-            ch == '-' || ch == '_' || ch == '.' || ch == '~' ||
-            ch == '!' || ch == '*' || ch == '(' || ch == ')' || ch == '\'') {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('%');
-            out.push_back(hex[(ch >> 4) & 0xF]);
-            out.push_back(hex[ch & 0xF]);
-        }
-    }
-    return out;
-}
-
-std::string build_updater_query(const UpdaterQuery& query)
-{
-    std::vector<std::pair<std::string, std::string>> params;
-
-    auto add_param = [&params](const char* key, const std::string& value) {
-        if (!value.empty())
-            params.emplace_back(key, encode_uri_component(value));
-    };
-
-    add_param("iid", query.iid);
-    add_param("v", query.version);
-    add_param("os", query.os);
-    add_param("arch", query.arch);
-    add_param("os_info", query.os_info);
-
-    std::sort(params.begin(), params.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.first < rhs.first;
-    });
-
-    if (params.empty())
-        return {};
-
-    std::string encoded;
-    for (size_t idx = 0; idx < params.size(); ++idx) {
-        if (idx > 0)
-            encoded.push_back('&');
-        encoded += params[idx].first;
-        encoded.push_back('=');
-        encoded += params[idx].second;
-    }
-    return encoded;
-}
-
-std::string base64url_encode(const unsigned char* data, std::size_t length)
-{
-    std::string encoded;
-    encoded.resize(boost::beast::detail::base64::encoded_size(length));
-    encoded.resize(boost::beast::detail::base64::encode(encoded.data(), data, length));
-    std::replace(encoded.begin(), encoded.end(), '+', '-');
-    std::replace(encoded.begin(), encoded.end(), '/', '_');
-    while (!encoded.empty() && encoded.back() == '=')
-        encoded.pop_back();
-    return encoded;
-}
-
-std::optional<std::vector<unsigned char>> load_signature_key()
-{
-#if ORCA_UPDATER_SIG_KEY_AVAILABLE
-    std::string key = ORCA_UPDATER_SIG_KEY_B64;
-    boost::algorithm::trim(key);
-    if (key.empty())
-        return std::nullopt;
-
-    key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char ch) { return std::isspace(ch); }), key.end());
-    std::replace(key.begin(), key.end(), '-', '+');
-    std::replace(key.begin(), key.end(), '_', '/');
-    while (key.size() % 4 != 0)
-        key.push_back('=');
-
-    std::string decoded;
-    decoded.resize(boost::beast::detail::base64::decoded_size(key.size()));
-    auto decode_result = boost::beast::detail::base64::decode(decoded.data(), key.data(), key.size());
-    if (!decode_result.second)
-        return std::nullopt;
-    decoded.resize(decode_result.first);
-
-    return std::vector<unsigned char>(decoded.begin(), decoded.end());
-#else
-    return std::nullopt;
-#endif
-}
-
-const std::optional<std::vector<unsigned char>>& get_signature_key()
-{
-    static std::optional<std::vector<unsigned char>> cached;
-    static bool loaded = false;
-    if (!loaded) {
-        cached = load_signature_key();
-        loaded = true;
-    }
-    return cached;
-}
-
-std::string extract_path_from_url(const std::string& url)
-{
-    if (url.empty())
-        return "/latest";
-
-    std::string path;
-    const auto scheme_pos = url.find("://");
-    if (scheme_pos != std::string::npos) {
-        const auto path_pos = url.find('/', scheme_pos + 3);
-        if (path_pos != std::string::npos)
-            path = url.substr(path_pos);
-        else
-            path = "/";
-    } else {
-        path = url;
-    }
-
-    const auto fragment_pos = path.find('#');
-    if (fragment_pos != std::string::npos)
-        path = path.substr(0, fragment_pos);
-
-    const auto query_pos = path.find('?');
-    if (query_pos != std::string::npos)
-        path = path.substr(0, query_pos);
-
-    if (path.empty())
-        path = "/";
-    return path;
-}
-
-void maybe_attach_updater_signature(Http& http, const std::string& canonical_query, const std::string& request_url)
-{
-    if (canonical_query.empty())
-        return;
-
-    const auto& key = get_signature_key();
-    if (!key || key->empty())
-        return;
-
-    const auto now   = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
-    const std::string timestamp = std::to_string(now.time_since_epoch().count());
-    const std::string path      = extract_path_from_url(request_url);
-
-    std::string string_to_sign = "GET\n";
-    string_to_sign += path;
-    string_to_sign += "\n";
-    string_to_sign += canonical_query;
-    string_to_sign += "\n";
-    string_to_sign += timestamp;
-
-    unsigned int digest_length = 0;
-    unsigned char digest[EVP_MAX_MD_SIZE] = {};
-    if (HMAC(EVP_sha256(), key->data(), static_cast<int>(key->size()),
-             reinterpret_cast<const unsigned char*>(string_to_sign.data()),
-             string_to_sign.size(), digest, &digest_length) == nullptr || digest_length == 0)
-        return;
-
-    const std::string signature = base64url_encode(digest, digest_length);
-    http.header("X-Orca-Ts", timestamp);
-    http.header("X-Orca-Sig", "v1:" + signature);
-}
-
-} // namespace
 
 void GUI_App::check_new_version_sf(bool show_tips, int by_user)
 {
     (void)show_tips;
     (void)by_user;
-    BOOST_LOG_TRIVIAL(info) << "Application update check disabled in this build";
-    return;
-
-    AppConfig* app_config = wxGetApp().app_config;
-    bool       check_stable_only = app_config->get_bool("check_stable_update_only");
-    auto version_check_url = app_config->version_check_url();
-
-    UpdaterQuery query{
-        detect_updater_iid(app_config),
-        detect_updater_version(),
-        detect_updater_os(),
-        detect_updater_arch(),
-        detect_updater_os_info()
-    };
-
-    const std::string query_string = build_updater_query(query);
-    if (!query_string.empty()) {
-        const bool has_query = version_check_url.find('?') != std::string::npos;
-        if (!has_query)
-            version_check_url.push_back('?');
-        else if (!version_check_url.empty() && version_check_url.back() != '&' && version_check_url.back() != '?')
-            version_check_url.push_back('&');
-        version_check_url += query_string;
-    }
-
-    auto http = Http::get(version_check_url);
-    maybe_attach_updater_signature(http, query_string, version_check_url);
-
-    http.header("accept", "application/vnd.github.v3+json")
-        .timeout_connect(5)
-        .timeout_max(10)
-        .on_error([&](std::string body, std::string error, unsigned http_status) {
-          (void)body;
-          BOOST_LOG_TRIVIAL(error) << format("Error getting: `%1%`: HTTP %2%, %3%", "check_new_version_sf", http_status,
-                                             error);
-        })
-        .on_complete([this, by_user, check_stable_only](std::string body, unsigned http_status) {
-          if (http_status != 200)
-            return;
-          try {
-            boost::trim(body);
-            if (body.empty()) {
-                if (by_user != 0)
-                    this->no_new_version();
-                return;
-            }
-
-            boost::property_tree::ptree root;
-            std::stringstream           json_stream(body);
-            boost::property_tree::read_json(json_stream, root);
-
-            std::regex matcher("[0-9]+\\.[0-9]+(\\.[0-9]+)*(-[A-Za-z0-9]+)?(\\+[A-Za-z0-9]+)?");
-            Semver    current_version = get_version(SoftFever_VERSION, matcher);
-            Semver    best_pre(0, 0, 0);
-            Semver    best_release(0, 0, 0);
-            bool      best_pre_valid = false;
-            bool      best_release_valid = false;
-            std::string best_pre_url;
-            std::string best_release_url;
-            std::string best_release_content;
-            std::string best_pre_content;
-
-            auto consider_release = [&](const boost::property_tree::ptree& node) {
-                auto tag_opt = node.get_optional<std::string>("tag_name");
-                if (!tag_opt)
-                    return;
-
-                std::string tag = *tag_opt;
-                if (!tag.empty() && tag.front() == 'v')
-                    tag.erase(0, 1);
-
-                Semver tag_version = get_version(tag, matcher);
-                if (!tag_version.valid())
-                    return;
-
-                const bool is_prerelease = node.get_optional<bool>("prerelease").get_value_or(false);
-                const std::string html_url = node.get_optional<std::string>("html_url").get_value_or(std::string());
-                const std::string body_copy = node.get_optional<std::string>("body").get_value_or(std::string());
-
-                if (is_prerelease) {
-                    if (!best_pre_valid || best_pre < tag_version) {
-                        best_pre        = tag_version;
-                        best_pre_url    = html_url;
-                        best_pre_content = body_copy;
-                        best_pre_valid  = true;
-                    }
-                } else {
-                    if (!best_release_valid || best_release < tag_version) {
-                        best_release         = tag_version;
-                        best_release_url     = html_url;
-                        best_release_content = body_copy;
-                        best_release_valid   = true;
-                    }
-                }
-            };
-
-            if (root.get_optional<std::string>("tag_name")) {
-                consider_release(root);
-            } else {
-                for (const auto& child : root)
-                    consider_release(child.second);
-            }
-
-            if (!best_release_valid && !best_pre_valid) {
-                if (by_user != 0)
-                    this->no_new_version();
-                return;
-            }
-
-            if (best_pre_valid && best_release_valid && best_pre < best_release) {
-                best_pre        = best_release;
-                best_pre_url    = best_release_url;
-                best_pre_content = best_release_content;
-                best_pre_valid  = true;
-            }
-
-            const bool        prefer_release = check_stable_only || !best_pre_valid;
-            const Semver&     chosen_version = prefer_release ? best_release : best_pre;
-            const bool        chosen_valid   = prefer_release ? best_release_valid : best_pre_valid;
-
-            if (!chosen_valid) {
-                if (by_user != 0)
-                    this->no_new_version();
-                return;
-            }
-
-            if (current_version.valid() && chosen_version <= current_version) {
-                if (by_user != 0)
-                    this->no_new_version();
-                return;
-            }
-
-            version_info.url           = prefer_release ? best_release_url : best_pre_url;
-            version_info.version_str   = prefer_release ? best_release.to_string_sf() : best_pre.to_string_sf();
-            version_info.description   = prefer_release ? best_release_content : best_pre_content;
-            version_info.force_upgrade = false;
-
-            wxCommandEvent* evt = new wxCommandEvent(EVT_SLIC3R_VERSION_ONLINE);
-            evt->SetString((prefer_release ? best_release : best_pre).to_string());
-            GUI::wxGetApp().QueueEvent(evt);
-          } catch (...) {}
-        });
-
-    http.perform();
 }
 
 void GUI_App::begin_bmcu_auto_retry(const std::string& dev_id, int timeout_ms)
@@ -6308,18 +6310,23 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
         }
         else if (msg == "unsigned_studio") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, unsigned_studio";
-            MessageDialog
-                msg_dlg(nullptr,
-                        _L("To use OrcaSlicer with Bambu Lab printers, you need to enable LAN mode and Developer mode on your printer.\n\n"
-                           "Please go to your printer's settings and:\n"
-                           "1. Turn on LAN mode\n"
-                           "2. Enable Developer mode\n\n"
-                           "Developer mode allows the printer to work exclusively through local network access, "
-                           "enabling full functionality with OrcaSlicer."),
-                        _L("Network Plug-in Restriction"), wxAPPLY | wxOK);
-            m_show_error_msgdlg = true;
-            msg_dlg.ShowModal();
-            m_show_error_msgdlg = false;
+            // Plugin re-emits this on every subscribe retry; latch it so it shows
+            // once per connection episode.
+            if (!m_show_error_msgdlg && !m_unsigned_plugin_warning_shown) {
+                m_unsigned_plugin_warning_shown = true;
+                MessageDialog
+                    msg_dlg(nullptr,
+                            _L("To use OrcaSlicer with Bambu Lab printers, you need to enable LAN mode and Developer mode on your printer.\n\n"
+                               "Please go to your printer's settings and:\n"
+                               "1. Turn on LAN mode\n"
+                               "2. Enable Developer mode\n\n"
+                               "Developer mode allows the printer to work exclusively through local network access, "
+                               "enabling full functionality with OrcaSlicer."),
+                            _L("Network Plug-in Restriction"), wxAPPLY | wxOK);
+                m_show_error_msgdlg = true;
+                msg_dlg.ShowModal();
+                m_show_error_msgdlg = false;
+            }
             return true;
         }
     }
@@ -6842,8 +6849,11 @@ bool GUI_App::maybe_migrate_user_presets_on_login()
 
 bool GUI_App::check_preset_parent_available(const std::pair<std::string, std::map<std::string, std::string>>& preset_data)
 {
-    std::string inherits_name = preset_data.second.at(BBL_JSON_KEY_INHERITS);
-    // // If contains "fdm_", "@System", and "@base", is a common base template that doesn't need to be installed
+    auto it = preset_data.second.find(BBL_JSON_KEY_INHERITS);
+    if (it == preset_data.second.end() || it->second.empty())
+        return true;
+    const std::string& inherits_name = it->second;
+    // If contains "fdm_", "@System", and "@base", is a common base template that doesn't need to be installed
     if (inherits_name.find("fdm_") != std::string::npos || inherits_name.find("@System") != std::string::npos || inherits_name.find("@base") != std::string::npos)
         return true;
 
@@ -7036,14 +7046,14 @@ void GUI_App::sync_preset(Preset* preset, bool force, const std::string& provide
         result = 0; // Set to 0 so the sync_info gets saved below
 
         // Show user notification
-        CallAfter([this] {
+        CallAfter([this, name = preset->name] {
             static bool size_limit_dialog_notified = false;
             if (size_limit_dialog_notified)
                 return;
             size_limit_dialog_notified = true;
             if (mainframe == nullptr)
                 return;
-            auto msg = _L("The preset content is too large to sync to the cloud (exceeds 1MB). Please reduce the preset size by removing custom configurations or use it locally only.");
+            auto msg = format_wxstr(_L("The preset \"%s\" is too large to sync to the cloud (exceeds 1MB). Please reduce the preset size by removing custom configurations or use it locally only."), name);
             MessageDialog(mainframe, msg, _L("Sync user presets"), wxICON_WARNING | wxOK).ShowModal();
         });
         // NOTE: Don't return here - let execution continue to save the sync_info
@@ -7125,16 +7135,16 @@ void GUI_App::update_single_bundle(wxCommandEvent& evt)
     });
 }
 
-void GUI_App::sync_bundle(std::string bundle_id, std::string version)
+int GUI_App::sync_bundle(std::string bundle_id, std::string version)
 {
     // if(preset_bundle->bundles.pauseReads.load())
     // {
     //     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << "ORCA : Update thread sync_bundle function yielded to main thread. 1";
     //     return; // if the main thread acquires the lock at the start of our operations, we will yield
     // }
-    if (!m_agent || !m_agent->is_user_login()) return;
+    if (!m_agent || !m_agent->is_user_login()) return 0;
     auto orca_agent = std::dynamic_pointer_cast<OrcaCloudServiceAgent>(m_agent->get_cloud_agent());
-    if (!orca_agent) return;
+    if (!orca_agent) return 0;
 
     BOOST_LOG_TRIVIAL(info) << "sync_bundle: checking bundle " << bundle_id << " for updates";
 
@@ -7157,12 +7167,12 @@ void GUI_App::sync_bundle(std::string bundle_id, std::string version)
             BOOST_LOG_TRIVIAL(warning) << "sync_bundle: failed to parse versions for bundle " << bundle_id
                                     << " (local: " << local_version << ", remote: " << remote_version << ")";
             preset_bundle->bundles.ReadUnlock(); // unlock read when fail
-            return;
+            return -1;
         }
         if (remote_version <= local_version) {
             BOOST_LOG_TRIVIAL(info) << "sync_bundle: bundle " << bundle_id << " is up-to-date (version " << local_version << ")";
             preset_bundle->bundles.ReadUnlock(); // unlock read when fail
-            return;
+            return -1;
         }
         BOOST_LOG_TRIVIAL(info) << "sync_bundle: updating bundle " << bundle_id
                                 << " from version " << local_version
@@ -7179,8 +7189,7 @@ void GUI_App::sync_bundle(std::string bundle_id, std::string version)
 
     // if it is an update, we will lock and write
     std::string ver;
-    if(is_update)
-    {
+    if (is_update) {
         preset_bundle->bundles.WriteLock();
         preset_bundle->bundles.m_bundles[bundle_id].update_available = true;
         preset_bundle->bundles.m_bundles[bundle_id].is_subscribed = true;
@@ -7188,8 +7197,13 @@ void GUI_App::sync_bundle(std::string bundle_id, std::string version)
         preset_bundle->bundles.WriteUnlock();
     }
 
-    if(app_config->get_bool("preset_bundle_auto_update") == true || is_new) 
-    {  
+    const bool auto_update = app_config->get_bool("preset_bundle_auto_update");
+
+    if (is_update && !auto_update) {
+        return 1;
+    }
+
+    if (auto_update || is_new) {
         // Fetch the latest bundle data from cloud
         std::map<std::string, std::map<std::string, std::string>> bundle_presets;
         BundleMetadata remote_metadata;
@@ -7197,22 +7211,23 @@ void GUI_App::sync_bundle(std::string bundle_id, std::string version)
 
         if (result != 0) {
             BOOST_LOG_TRIVIAL(warning) << "sync_bundle: failed to fetch bundle " << bundle_id << ", result=" << result;
-            return;
+            return -1;
         }
 
         // Import the updated bundle on the main thread
-        CallAfter([this, bundle_id, bundle_presets, remote_metadata,is_new,is_update,ver]() {
-            if (!is_closing() && preset_bundle && app_config) {
-                // Check the presets for any system vendors that need to be installed
-                for (auto data : bundle_presets) {
-                    if (!check_preset_parent_available(data)) {
-                        add_pending_vendor_preset(data);
+        CallAfter(
+            [this, bundle_id, bundle_presets, remote_metadata, is_new, is_update, ver]() {
+                if (!is_closing() && preset_bundle && app_config) {
+                    // Check the presets for any system vendors that need to be installed
+                    for (auto data : bundle_presets) {
+                        if (!check_preset_parent_available(data)) {
+                            add_pending_vendor_preset(data);
+                        }
                     }
-                }
-                load_pending_vendors();
+                    load_pending_vendors();
 
-                // if(!preset_bundle->bundles.pauseReads.load()) // check again if we can actually update so as to not block the main thread 
-                // {
+                    // if(!preset_bundle->bundles.pauseReads.load()) // check again if we can actually update so as to not block the main thread
+                    // {
                     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << "ORCA : CallAfter from sync_bundle function actually updating subscribed presets";
                     
                     preset_bundle->bundles.WriteLock();
@@ -7242,10 +7257,12 @@ void GUI_App::sync_bundle(std::string bundle_id, std::string version)
                     if (mainframe)
                         mainframe->update_side_preset_ui();
                     BOOST_LOG_TRIVIAL(info) << "sync_bundle: successfully updated bundle " << bundle_id;
-                // }
-            }
-        });
+                    // }
+                }
+            });
     }
+
+    return 0;
 }
 
 
@@ -7382,6 +7399,9 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
     // BBS
     m_user_sync_token.reset(new int(0));
     if (with_progress_dlg) {
+        // Mark a manual progress dialog as active so restart_sync_user_preset() ignores
+        // repeat triggers while it is on screen (prevents stacking modal dialogs).
+        m_sync_user_preset_dlg_active = true;
         auto dlg = new ProgressDialog(_L("Loading"), "", 100, this->mainframe, wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT);
         dlg->Update(0, _L("Loading user preset"));
         progressFn = [this, dlg](int percent) {
@@ -7393,7 +7413,9 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
             return is_closing() || dlg->WasCanceled() || t.expired();
         };
         finishFn = [this, dlg](bool) {
-            CallAfter([=]{ dlg->Destroy(); });
+            // Clear the guard together with destroying the dialog, on the GUI thread, so the
+            // next manual sync is allowed exactly once this dialog leaves the screen.
+            CallAfter([=]{ dlg->Destroy(); m_sync_user_preset_dlg_active = false; });
         };
     }
     else {
@@ -7407,7 +7429,15 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
 
     m_sync_update_thread = Slic3r::create_thread(
         [this, progressFn, cancelFn, finishFn, t = std::weak_ptr<int>(m_user_sync_token), active_provider] {
-            if (!m_agent) return;
+            bool finish_called = false;
+            auto finish_once = [&](bool success) {
+                if (!finish_called) {
+                    finish_called = true;
+                    finishFn(success);
+                }
+            };
+            try {
+                if (!m_agent) { finish_once(false); return; }
 
             // One-time scan for orphaned .info files left over from offline deletions; queues HTTP DELETEs.
             scan_orphaned_info_files();
@@ -7440,7 +7470,7 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
             }, progressFn, cancelFn, active_provider);
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " get_setting_list2 ret = " << ret << " m_is_closing = " << m_is_closing << " provider=" << active_provider;
 
-            finishFn(ret == 0);
+            finish_once(ret == 0);
 
             if (ret == 0 && m_agent && !t.expired())
                 reload_settings(active_provider);
@@ -7451,6 +7481,10 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
             std::vector<Preset> presets_to_sync;
             std::vector<std::pair<std::string, std::string>> bundles_to_sync;
             std::unordered_set<std::string> bundles_synced;
+
+            std::unordered_set<std::string> known_available_updates;
+
+            bool update_available = false;
             // Sync once immediately, then every 60 seconds.
             while (!t.expired()) {
                 ++tick_tock;
@@ -7556,17 +7590,31 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
                         
                             // Iterate over the bundles, and update/create
                         for (const auto& bundle_entry : bundles_to_sync) {
-
                             bundles_synced.insert(bundle_entry.first);
-                                // Sync each bundle individually
-                                // if(!preset_bundle->bundles.pauseReads.load()) // if pause is true we will skip updating this frame altogether
-                                // {   
-                                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << "ORCA : Update thread syncing bundles";
-                                    sync_bundle(bundle_entry.first, bundle_entry.second);
-                                // }
-                                // Small delay between bundle syncs to avoid overwhelming the server
-                                boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
-                            
+                            // Sync each bundle individually
+                            // if(!preset_bundle->bundles.pauseReads.load()) // if pause is true we will skip updating this frame altogether
+                            // {
+                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << "ORCA : Update thread syncing bundles";
+                            int res = sync_bundle(bundle_entry.first, bundle_entry.second);
+
+                            const std::string known_update_key = bundle_entry.first + ":" + bundle_entry.second;
+                            if (res == 1 && known_available_updates.insert(known_update_key).second) {
+                                update_available = true;
+                            }
+
+                            // }
+                            // Small delay between bundle syncs to avoid overwhelming the server
+                            boost::this_thread::sleep_for(boost::chrono::milliseconds(100));
+                        }
+
+                        if (update_available) {
+                            wxGetApp()
+                                .plater()
+                                ->get_notification_manager()
+                                ->push_notification(NotificationType::CustomNotification,
+                                                    NotificationManager::NotificationLevel::RegularNotificationLevel, _u8L("There is an update available. Open the preset bundle dialog to update it."));
+
+                            update_available = false;
                         }
                         
                         std::vector<BundleMetadata> to_delete;
@@ -7630,6 +7678,13 @@ void GUI_App::start_sync_user_preset(bool with_progress_dlg, const std::string& 
                     boost::this_thread::sleep_for(boost::chrono::milliseconds(500));
                 }
             }
+            } catch (const std::exception& e) {
+                finish_once(false);
+                BOOST_LOG_TRIVIAL(error) << "user preset sync thread terminated by exception: " << e.what();
+            } catch (...) {
+                finish_once(false);
+                BOOST_LOG_TRIVIAL(error) << "user preset sync thread terminated by unknown exception";
+            }
         });
 }
 
@@ -7649,6 +7704,9 @@ void GUI_App::stop_sync_user_preset()
 
 void GUI_App::restart_sync_user_preset(const std::string& provider)
 {
+    if (m_sync_user_preset_dlg_active)
+        return;
+
     const std::string active_provider = resolve_user_preset_provider(m_agent, provider);
     if (!m_user_sync_token) {
         // No sync running. If a restart helper is already in flight it will
@@ -7943,224 +8001,215 @@ bool GUI_App::select_language()
     return false;
 }
 
-// Load gettext translation files and activate them at the start of the application,
-// based on the "language" key stored in the application config.
+// Normalize UI language tags so values from the OS, wxWidgets and the
+// configuration file can be compared consistently.
+static wxString normalize_ui_language_code(wxString code)
+{
+    code.Trim(true).Trim(false);
+    code.Replace("-", "_");
+    return code;
+}
+
+static wxString ui_language_prefix(const wxString& code)
+{
+    return normalize_ui_language_code(code).BeforeFirst('_').Lower();
+}
+
+static bool is_english_source_language(const wxString& code)
+{
+    return ui_language_prefix(code) == "en";
+}
+
+// wxTranslations::GetAvailableTranslations() does not include the source
+// language (English). Match an exact catalog first, then a catalog for the
+// same base language, and finally accept English source strings without a
+// catalog.
+static wxString match_available_ui_translation(const wxString& requested,
+                                                const wxArrayString& available)
+{
+    const wxString normalized = normalize_ui_language_code(requested);
+    if (normalized.IsEmpty())
+        return wxString();
+
+    for (const wxString& candidate_raw : available) {
+        const wxString candidate = normalize_ui_language_code(candidate_raw);
+        if (candidate.CmpNoCase(normalized) == 0)
+            return candidate_raw;
+    }
+
+    const wxString prefix = ui_language_prefix(normalized);
+    for (const wxString& candidate_raw : available) {
+        if (ui_language_prefix(candidate_raw) == prefix)
+            return candidate_raw;
+    }
+
+    return prefix == "en" ? wxString("en_US") : wxString();
+}
+
+// Choose the best available UI translation for the operating-system language.
+// This is deliberately not written to AppConfig: an automatically detected
+// language is not a user preference and must be re-evaluated when the OS
+// language changes. Only select_language() persists an explicit user choice.
+static wxString select_automatic_ui_language(const wxLanguageInfo* system_language_info)
+{
+    wxTranslations* translations = wxTranslations::Get();
+    if (translations == nullptr)
+        return "en_US";
+
+    const wxArrayString available = translations->GetAvailableTranslations(SLIC3R_APP_KEY);
+    if (system_language_info != nullptr) {
+        const wxString system_match =
+            match_available_ui_translation(system_language_info->CanonicalName, available);
+        if (!system_match.IsEmpty())
+            return system_match;
+    }
+
+    translations->SetLanguage(wxLANGUAGE_DEFAULT);
+    const wxString best = translations->GetBestTranslation(SLIC3R_APP_KEY, wxLANGUAGE_ENGLISH_US);
+    const wxString best_match = match_available_ui_translation(best, available);
+    return best_match.IsEmpty() ? wxString("en_US") : best_match;
+}
+
+// Load gettext translation files and activate them at the start of the application.
+// A non-empty "language" key is an explicit user choice. If the key is absent,
+// the best available translation matching the OS UI language is selected for
+// this run without persisting it as a preference.
 bool GUI_App::load_language(wxString language, bool initial)
 {
-    BOOST_LOG_TRIVIAL(info) << boost::format("%1%: language %2%, initial: %3%") %__FUNCTION__ %language %initial;
+    BOOST_LOG_TRIVIAL(info) << boost::format("%1%: language %2%, initial: %3%") % __FUNCTION__ % language % initial;
+
     if (initial) {
-    	// There is a static list of lookup path prefixes in wxWidgets. Add ours.
-	    wxFileTranslationsLoader::AddCatalogLookupPathPrefix(from_u8(localization_dir()));
-    	// Get the active language from PrusaSlicer.ini, or empty string if the key does not exist.
-        language = app_config->get("language");
-        if (! language.empty())
-        	BOOST_LOG_TRIVIAL(info) << boost::format("language provided by OrcaSlicer.conf: %1%") % language;
-        else {
-            // Get the system language.
-            const wxLanguage lang_system = wxLanguage(wxLocale::GetSystemLanguage());
-            if (lang_system != wxLANGUAGE_UNKNOWN) {
-                m_language_info_system = wxLocale::GetLanguageInfo(lang_system);
+        wxFileTranslationsLoader::AddCatalogLookupPathPrefix(from_u8(localization_dir()));
+
+        // Detect regional/process locale independently from the UI translation.
+        // A user may choose English UI while retaining Polish number/date rules.
+        const wxLanguage lang_system = wxLanguage(wxLocale::GetSystemLanguage());
+        if (lang_system != wxLANGUAGE_UNKNOWN)
+            m_language_info_system = wxLocale::GetLanguageInfo(lang_system);
 #ifdef __WXMSW__
-                WCHAR wszLanguagesBuffer[LOCALE_NAME_MAX_LENGTH];
-                ::LCIDToLocaleName(LOCALE_USER_DEFAULT, wszLanguagesBuffer, LOCALE_NAME_MAX_LENGTH, 0);
-                wxString lang(wszLanguagesBuffer);
-                lang.Replace('-', '_');
-                if (auto info = wxLocale::FindLanguageInfo(lang))
-                    m_language_info_system = info;
+        WCHAR wszLanguagesBuffer[LOCALE_NAME_MAX_LENGTH];
+        if (::LCIDToLocaleName(LOCALE_USER_DEFAULT, wszLanguagesBuffer, LOCALE_NAME_MAX_LENGTH, 0) != 0) {
+            wxString windows_language(wszLanguagesBuffer);
+            windows_language.Replace('-', '_');
+            if (const wxLanguageInfo* info = wxLocale::FindLanguageInfo(windows_language))
+                m_language_info_system = info;
+        }
 #endif
-                BOOST_LOG_TRIVIAL(info) << boost::format("System language detected (user locales and such): %1%") % m_language_info_system->CanonicalName.ToUTF8().data();
-                // BBS set language to app config
-                app_config->set("language", m_language_info_system->CanonicalName.ToUTF8().data());
+        if (m_language_info_system != nullptr) {
+            BOOST_LOG_TRIVIAL(info) << boost::format("System locale detected: %1%") %
+                m_language_info_system->CanonicalName.ToUTF8().data();
+        }
+
+        // Create a temporary locale only to make wxTranslations available while
+        // enumerating catalogs and preferred UI languages.
+        wxLocale translation_probe;
+        translation_probe.Init(wxLANGUAGE_DEFAULT, wxLOCALE_DONT_LOAD_DEFAULT);
+
+        const wxString configured_language =
+            normalize_ui_language_code(from_u8(app_config->get("language")));
+        if (!configured_language.IsEmpty()) {
+            wxTranslations* translations = wxTranslations::Get();
+            const wxArrayString available = translations != nullptr
+                ? translations->GetAvailableTranslations(SLIC3R_APP_KEY)
+                : wxArrayString();
+            const wxString configured_match =
+                match_available_ui_translation(configured_language, available);
+            if (!configured_match.IsEmpty()) {
+                language = configured_match;
+                BOOST_LOG_TRIVIAL(info) << boost::format("Using user-selected UI language from OrcaSlicer.conf: %1%") %
+                    language.ToUTF8().data();
             } else {
-                {
-                    // Allocating a temporary locale will switch the default wxTranslations to its internal wxTranslations instance.
-                    wxLocale temp_locale;
-                    temp_locale.Init();
-                    // Set the current translation's language to default, otherwise GetBestTranslation() may not work (see the wxWidgets source code).
-                    wxTranslations::Get()->SetLanguage(wxLANGUAGE_DEFAULT);
-                    // Let the wxFileTranslationsLoader enumerate all translation dictionaries for PrusaSlicer
-                    // and try to match them with the system specific "preferred languages".
-                    // There seems to be a support for that on Windows and OSX, while on Linuxes the code just returns wxLocale::GetSystemLanguage().
-                    // The last parameter gets added to the list of detected dictionaries. This is a workaround
-                    // for not having the English dictionary. Let's hope wxWidgets of various versions process this call the same way.
-                    wxString best_language = wxTranslations::Get()->GetBestTranslation(SLIC3R_APP_KEY, wxLANGUAGE_ENGLISH);
-                    if (!best_language.IsEmpty()) {
-                        m_language_info_best = wxLocale::FindLanguageInfo(best_language);
-                        BOOST_LOG_TRIVIAL(info) << boost::format("Best translation language detected (may be different from user locales): %1%") %
-                                                        m_language_info_best->CanonicalName.ToUTF8().data();
-                        app_config->set("language", m_language_info_best->CanonicalName.ToUTF8().data());
-                    }
-#ifdef __linux__
-                    wxString lc_all;
-                    if (wxGetEnv("LC_ALL", &lc_all) && !lc_all.IsEmpty()) {
-                        // Best language returned by wxWidgets on Linux apparently does not respect LC_ALL.
-                        // Disregard the "best" suggestion in case LC_ALL is provided.
-                        m_language_info_best = nullptr;
-                    }
-#endif
-                }
+                language = select_automatic_ui_language(m_language_info_system);
+                BOOST_LOG_TRIVIAL(warning) << boost::format(
+                    "Configured UI language %1% has no usable catalog; falling back to %2% without overwriting the preference") %
+                    configured_language.ToUTF8().data() % language.ToUTF8().data();
             }
+        } else {
+            language = select_automatic_ui_language(m_language_info_system);
+            BOOST_LOG_TRIVIAL(info) << boost::format("Automatically selected UI language: %1%") %
+                language.ToUTF8().data();
         }
+    } else {
+        language = normalize_ui_language_code(language);
+        wxTranslations* translations = wxTranslations::Get();
+        const wxArrayString available = translations != nullptr
+            ? translations->GetAvailableTranslations(SLIC3R_APP_KEY)
+            : wxArrayString();
+        const wxString requested_match = match_available_ui_translation(language, available);
+        if (requested_match.IsEmpty()) {
+            BOOST_LOG_TRIVIAL(error) << boost::format("Requested UI language has no usable catalog: %1%") %
+                language.ToUTF8().data();
+            return false;
+        }
+        language = requested_match;
     }
 
-	const wxLanguageInfo *language_info = language.empty() ? nullptr : wxLocale::FindLanguageInfo(language);
-	if (! language.empty() && (language_info == nullptr || language_info->CanonicalName.empty())) {
-		// Fix for wxWidgets issue, where the FindLanguageInfo() returns locales with undefined ANSII code (wxLANGUAGE_KONKANI or wxLANGUAGE_MANIPURI).
-		language_info = nullptr;
-    	BOOST_LOG_TRIVIAL(error) << boost::format("Language code \"%1%\" is not supported") % language.ToUTF8().data();
-	}
-
-	if (language_info != nullptr && language_info->LayoutDirection == wxLayout_RightToLeft) {
-    	BOOST_LOG_TRIVIAL(trace) << boost::format("The following language code requires right to left layout, which is not supported by OrcaSlicer: %1%") % language_info->CanonicalName.ToUTF8().data();
-		language_info = nullptr;
-	}
-
-    if (language_info == nullptr) {
-        // PrusaSlicer does not support the Right to Left languages yet.
-        if (m_language_info_system != nullptr && m_language_info_system->LayoutDirection != wxLayout_RightToLeft)
-            language_info = m_language_info_system;
-        if (m_language_info_best != nullptr && m_language_info_best->LayoutDirection != wxLayout_RightToLeft)
-        	language_info = m_language_info_best;
-	    if (language_info == nullptr)
-			language_info = wxLocale::GetLanguageInfo(wxLANGUAGE_ENGLISH_US);
+    const wxLanguageInfo* translation_language_info = wxLocale::FindLanguageInfo(language);
+    if (translation_language_info == nullptr || translation_language_info->CanonicalName.IsEmpty() ||
+        translation_language_info->LayoutDirection == wxLayout_RightToLeft) {
+        BOOST_LOG_TRIVIAL(warning) << boost::format("UI language %1% is unsupported; using English source strings") %
+            language.ToUTF8().data();
+        language = "en_US";
+        translation_language_info = wxLocale::GetLanguageInfo(wxLANGUAGE_ENGLISH_US);
     }
+    if (translation_language_info == nullptr)
+        return false;
 
-    const wxLanguageInfo *translation_language_info = language_info;
     const wxString requested_language_code = translation_language_info->CanonicalName;
-    const wxLanguageInfo *locale_language_info = translation_language_info;
-    BOOST_LOG_TRIVIAL(trace) << boost::format("Requested translation language %1%") % requested_language_code.ToUTF8().data();
-
-    // Select language for locales. This language may be different from the language of the dictionary.
-    //if (language_info == m_language_info_best || language_info == m_language_info_system) {
-    //    // The current language matches user's default profile exactly. That's great.
-    //} else if (m_language_info_best != nullptr && language_info->CanonicalName.BeforeFirst('_') == m_language_info_best->CanonicalName.BeforeFirst('_')) {
-    //    // Use whatever the operating system recommends, if it the language code of the dictionary matches the recommended language.
-    //    // This allows a Swiss guy to use a German dictionary without forcing him to German locales.
-    //    language_info = m_language_info_best;
-    //} else if (m_language_info_system != nullptr && language_info->CanonicalName.BeforeFirst('_') == m_language_info_system->CanonicalName.BeforeFirst('_'))
-    //    language_info = m_language_info_system;
-
-    // Alternate language code.
-    wxLanguage language_dict = wxLanguage(translation_language_info->Language);
-    if (translation_language_info->CanonicalName.BeforeFirst('_') == "sk") {
-    	// Slovaks understand Czech well. Give them the Czech translation.
-    	language_dict = wxLANGUAGE_CZECH;
-		BOOST_LOG_TRIVIAL(info) << "Using Czech dictionaries for Slovak language";
+    wxLanguage dictionary_language = wxLanguage(translation_language_info->Language);
+    if (ui_language_prefix(requested_language_code) == "sk") {
+        dictionary_language = wxLANGUAGE_CZECH;
+        BOOST_LOG_TRIVIAL(info) << "Using Czech dictionaries for Slovak language";
     }
 
-#ifdef __linux__
-    // If we can't find this locale , try to use different one for the language
-    // instead of just reporting that it is impossible to switch.
-    if (!wxLocale::IsAvailable(locale_language_info->Language) && m_language_info_system) {
-        std::string original_lang = into_u8(locale_language_info->CanonicalName);
-        locale_language_info = linux_get_existing_locale_language(locale_language_info, m_language_info_system);
-        if (locale_language_info != nullptr && locale_language_info != translation_language_info) {
-            BOOST_LOG_TRIVIAL(info) << boost::format("Can't use locale %1% directly (missing locales). Using locale %2% instead.")
-                                        % original_lang % locale_language_info->CanonicalName.ToUTF8().data();
-        }
+    // Process/regional locale and UI translation are intentionally independent.
+    // Prefer the OS default locale (including C.UTF-8), then progressively fall
+    // back to a known system locale and finally the portable C locale.
+    auto new_locale = Slic3r::make_unique<wxLocale>();
+    bool locale_initialized = new_locale->Init(wxLANGUAGE_DEFAULT, wxLOCALE_DONT_LOAD_DEFAULT);
+    if (!locale_initialized && m_language_info_system != nullptr &&
+        wxLocale::IsAvailable(m_language_info_system->Language)) {
+        new_locale = Slic3r::make_unique<wxLocale>();
+        locale_initialized = new_locale->Init(m_language_info_system->Language, wxLOCALE_DONT_LOAD_DEFAULT);
     }
-#endif
-
-    // Try base language without region (e.g., "en" from "en_IL") on all platforms
-    if (locale_language_info == nullptr || !wxLocale::IsAvailable(locale_language_info->Language)) {
-        wxString base_lang = requested_language_code.BeforeFirst('_');
-        if (base_lang != requested_language_code) {
-            const wxLanguageInfo *base_info = wxLocale::FindLanguageInfo(base_lang);
-            if (base_info && wxLocale::IsAvailable(base_info->Language)) {
-                BOOST_LOG_TRIVIAL(info) << boost::format("Locale %1% not available. Falling back to base language %2%.")
-                    % requested_language_code.ToUTF8().data() % base_info->CanonicalName.ToUTF8().data();
-                locale_language_info = base_info;
-            }
-        }
+    if (!locale_initialized) {
+        new_locale = Slic3r::make_unique<wxLocale>();
+        locale_initialized = new_locale->Init("C", "C", "C", false);
     }
 
-    // Generic fallback chain for all platforms
-    if (locale_language_info == nullptr || !wxLocale::IsAvailable(locale_language_info->Language)) {
-        auto try_locale = [](const wxLanguageInfo* candidate) -> const wxLanguageInfo* {
-            return (candidate && wxLocale::IsAvailable(candidate->Language)) ? candidate : nullptr;
-        };
-        const wxLanguageInfo* fallback_locale_info =
-            try_locale(m_wxLocale ? wxLocale::GetLanguageInfo(wxLanguage(m_wxLocale->GetLanguage())) : nullptr);
-        if (!fallback_locale_info) fallback_locale_info = try_locale(m_language_info_system);
-        if (!fallback_locale_info) fallback_locale_info = try_locale(m_language_info_best);
-        if (!fallback_locale_info) fallback_locale_info = try_locale(wxLocale::GetLanguageInfo(wxLANGUAGE_ENGLISH_US));
-        if (!fallback_locale_info) fallback_locale_info = try_locale(wxLocale::GetLanguageInfo(wxLANGUAGE_ENGLISH_UK));
-        if (fallback_locale_info != nullptr) {
-            BOOST_LOG_TRIVIAL(info) << boost::format("Using fallback locale %1% while keeping translation dictionary %2%.")
-                                        % fallback_locale_info->CanonicalName.ToUTF8().data() % requested_language_code.ToUTF8().data();
-            locale_language_info = fallback_locale_info;
-        }
-    }
-
-    if (initial) {
-        // bbs supported languages
-        //TODO: use a global one with Preference
-        //wxLanguage supported_languages[]{
-        //    wxLANGUAGE_ENGLISH,
-        //    wxLANGUAGE_CHINESE_SIMPLIFIED,
-        //    wxLANGUAGE_GERMAN,
-        //    wxLANGUAGE_FRENCH,
-        //    wxLANGUAGE_SPANISH,
-        //    wxLANGUAGE_SWEDISH,
-        //    wxLANGUAGE_DUTCH,
-        //    wxLANGUAGE_HUNGARIAN,
-        //    wxLANGUAGE_JAPANESE,
-        //    wxLANGUAGE_ITALIAN
-        //};
-        //std::string cur_language = app_config->get("language");
-        //if (cur_language != "") {
-        //    //cleanup the language wrongly set before
-        //    const wxLanguageInfo *langinfo = nullptr;
-        //    bool embedded_language = false;
-        //    int language_num = sizeof(supported_languages) / sizeof(supported_languages[0]);
-        //    for (auto index = 0; index < language_num; index++) {
-        //        langinfo = wxLocale::GetLanguageInfo(supported_languages[index]);
-        //        std::string temp_lan = langinfo->CanonicalName.ToUTF8().data();
-        //        if (cur_language == temp_lan) {
-        //            embedded_language = true;
-        //            break;
-        //        }
-        //    }
-        //    if (!embedded_language)
-        //        app_config->erase("app", "language");
-        //}
-    }
-
-	BOOST_LOG_TRIVIAL(trace) << boost::format("Switching wxLocales to %1%") % locale_language_info->CanonicalName.ToUTF8().data();
-
-    if (!wxLocale::IsAvailable(locale_language_info->Language)) {
-    	// Loading the language dictionary failed.
-	    wxString message = "Switching Orca Slicer to language " + requested_language_code + " failed.";
-#if !defined(_WIN32) && !defined(__APPLE__)
-        // likely some linux system
-        message += "\nYou may need to reconfigure the missing locales, likely by running the \"locale-gen\" and \"dpkg-reconfigure locales\" commands.\n";
-#endif
+    if (!locale_initialized) {
+        wxString message = _L("Orca Slicer could not initialize a safe process locale.");
         if (initial)
-        	message + "\n\nApplication will close.";
-        wxMessageBox(message, "Orca Slicer - Switching language failed", wxOK | wxICON_ERROR);
+            message += "\n\nApplication will close.";
+        wxMessageBox(message, _L("Orca Slicer - Locale initialization failed"), wxOK | wxICON_ERROR);
         if (initial)
-			std::exit(EXIT_FAILURE);
-		else
-			return false;
+            std::exit(EXIT_FAILURE);
+        return false;
     }
 
-    // Release the old locales, create new locales.
-    //FIXME wxWidgets cause havoc if the current locale is deleted. We just forget it causing memory leaks for now.
+    // wxLocale owns the active wxTranslations object. Replace the previous
+    // locale only after the new process locale was initialized successfully.
     m_wxLocale.release();
-    m_wxLocale = Slic3r::make_unique<wxLocale>();
-    m_wxLocale->Init(locale_language_info->Language);
-    // Override language at the active wxTranslations class (which is stored in the active m_wxLocale)
-    // to load possibly different dictionary, for example, load Czech dictionary for Slovak language.
-    wxTranslations::Get()->SetLanguage(language_dict);
-    m_wxLocale->AddCatalog(SLIC3R_APP_KEY);
-    m_active_language_code = requested_language_code;
-    m_imgui->set_language(into_u8(requested_language_code));
+    m_wxLocale = std::move(new_locale);
+    wxTranslations::Get()->SetLanguage(dictionary_language);
 
-    //FIXME This is a temporary workaround, the correct solution is to switch to "C" locale during file import / export only.
-    //wxSetlocale(LC_NUMERIC, "C");
+    const bool catalog_loaded = m_wxLocale->AddCatalog(SLIC3R_APP_KEY);
+    if (!catalog_loaded && !is_english_source_language(requested_language_code)) {
+        BOOST_LOG_TRIVIAL(error) << boost::format("Failed to load UI catalog for %1%; using English source strings") %
+            requested_language_code.ToUTF8().data();
+        wxTranslations::Get()->SetLanguage(wxLANGUAGE_ENGLISH_US);
+        m_active_language_code = "en_US";
+        m_imgui->set_language("en_US");
+        if (!initial)
+            return false;
+    } else {
+        m_active_language_code = requested_language_code;
+        m_imgui->set_language(into_u8(requested_language_code));
+    }
+
     Preset::update_suffix_modified((_L("*") + " ").ToUTF8().data());
     HintDatabase::get_instance().reinit();
-	return true;
+    return true;
 }
 
 Tab* GUI_App::get_tab(Preset::Type type)
@@ -8492,6 +8541,89 @@ void GUI_App::open_presetbundledialog(size_t open_on_tab, const std::string& hig
         
     }
 }
+
+void GUI_App::open_plugins_dialog(size_t open_on_tab, const std::string& highlight_option)
+{
+    if (m_plugins_dlg) {
+        m_plugins_dlg->Show();
+        m_plugins_dlg->Raise();
+        return;
+    }
+
+    try {
+        m_plugins_dlg = new PluginsDialog(mainframe, wxID_ANY, _L("Plugins"));
+        m_plugins_dlg->set_open_terminal_dlg_fn();
+        m_plugins_dlg->Bind(wxEVT_DESTROY, [this](wxWindowDestroyEvent& event) {
+            if (event.GetEventObject() == m_plugins_dlg)
+                m_plugins_dlg = nullptr;
+            event.Skip();
+        });
+
+        m_plugins_dlg->Show();
+        m_plugins_dlg->Raise();
+    } catch (const std::exception& e) {
+        BOOST_LOG_TRIVIAL(error) << "open_plugins_dialog failed: " << e.what();
+        if (m_plugins_dlg) {
+            m_plugins_dlg->Destroy();
+            m_plugins_dlg = nullptr;
+        }
+        wxMessageBox(wxString::Format(_L("Failed to open the Plugins dialog:\n%s"), from_u8(e.what())), _L("Plugins"),
+                     wxOK | wxICON_ERROR, mainframe);
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(error) << "open_plugins_dialog failed with a non-standard exception";
+        if (m_plugins_dlg) {
+            m_plugins_dlg->Destroy();
+            m_plugins_dlg = nullptr;
+        }
+        wxMessageBox(_L("Failed to open the Plugins dialog (unknown error)."), _L("Plugins"), wxOK | wxICON_ERROR, mainframe);
+    }
+}
+
+void GUI_App::open_terminal_dialog()
+{
+    // Reached from the plugins dialog's webview ("open_terminal" command), i.e. from
+    // inside the webview script-message callback, which GTK/macOS deliver synchronously
+    // (see ui_create_window in PluginHostUi.cpp). TerminalDialog hosts a webview of its
+    // own, so creating or presenting it on that stack is the same class as the Linux
+    // gtk_window_present crash — defer all window work to a clean main-loop iteration.
+    CallAfter([this]() {
+        if (m_terminal_dlg) {
+            // Re-front the existing window; guard Show() per #13657 (GTK re-enters
+            // layout when showing an already-visible window).
+            if (!m_terminal_dlg->IsShown())
+                m_terminal_dlg->Show();
+            m_terminal_dlg->Raise();
+            return;
+        }
+
+        m_terminal_dlg = new TerminalDialog(mainframe, wxID_ANY, _L("Plugin Terminal"),
+                                            wxDefaultPosition, wxSize(820, 600));
+        m_terminal_dlg->Bind(wxEVT_DESTROY, [this](wxWindowDestroyEvent& event) {
+            if (event.GetEventObject() == m_terminal_dlg)
+                m_terminal_dlg = nullptr;
+            event.Skip();
+        });
+
+        // Show() alone activates and fronts a freshly created window on every platform.
+        m_terminal_dlg->Show();
+    });
+}
+
+void GUI_App::open_speed_dial()
+{
+    if (!mainframe)
+        return;
+    if (!m_speed_dial_dialog) {
+        m_speed_dial_dialog = new SpeedDialWebDialog(mainframe);
+        m_speed_dial_dialog->Bind(wxEVT_DESTROY, [this](wxWindowDestroyEvent& event) {
+            if (event.GetEventObject() == m_speed_dial_dialog)
+                m_speed_dial_dialog = nullptr;
+            event.Skip();
+        });
+    }
+    m_speed_dial_dialog->request_show();
+}
+
 void GUI_App::open_exportpresetbundledialog(size_t open_on_tab, const std::string& highlight_option)
 {
     bool app_layout_changed = false;
@@ -8947,8 +9079,13 @@ void GUI_App::scan_orphaned_info_files()
         if (!fs::exists(type_dir))
             continue;
 
-        // Iterate through all .info files
-        for (auto& entry : boost::filesystem::directory_iterator(type_dir)) {
+        // Iterate through all .info files. Use the error_code-based iterator so a transient
+        // directory-read failure (e.g. macOS readdir returning ENOTSUP) is logged and skipped
+        // instead of throwing an uncaught exception that would terminate the app from the
+        // background sync thread this runs on.
+        boost::system::error_code ec;
+        for (boost::filesystem::directory_iterator it(type_dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const auto& entry = *it;
             if (entry.path().extension() != ".info")
                 continue;
 
@@ -8967,6 +9104,8 @@ void GUI_App::scan_orphaned_info_files()
                 }
             }
         }
+        if (ec)
+            BOOST_LOG_TRIVIAL(warning) << "scan_orphaned_info_files: failed to scan " << type_dir.string() << ": " << ec.message();
     }
 }
 
@@ -9161,79 +9300,21 @@ void GUI_App::load_url(wxString url)
 
 void GUI_App::open_mall_page_dialog()
 {
-    std::string host_url;
-    std::string model_url;
-    std::string link_url;
-
-    int result = -1;
-
-    //model api url
-    host_url = get_model_http_url(app_config->get_country_code());
-
-    //model url
-
-    wxString language_code = this->current_language_code().BeforeFirst('_');
-    model_url = language_code.ToStdString();
-
-    if (getAgent() && mainframe) {
-
-        //login already
-        if (getAgent()->is_user_login()) {
-            std::string ticket;
-            result = getAgent()->request_bind_ticket(&ticket);
-
-            if(result == 0){
-                link_url = host_url + "api/sign-in/ticket?to=" + host_url + url_encode(model_url) + "&ticket=" + ticket;
-            }
-        }
-    }
-
-    if (result < 0) {
-       link_url = host_url + model_url;
-    }
-
-    if (link_url.find("?") != std::string::npos) {
-        link_url += "&from=orcaslicer";
-    } else {
-        link_url += "?from=orcaslicer";
-    }
-
-    wxLaunchDefaultBrowser(link_url);
+    const std::string host_url = get_model_http_url(app_config->get_country_code());
+    const std::string language = current_language_code().BeforeFirst('_').ToStdString();
+    std::string target = host_url + language;
+    target += target.find('?') == std::string::npos ? "?from=orcaslicer" : "&from=orcaslicer";
+    const bool bind_ticket = getAgent() && mainframe && getAgent()->is_user_login();
+    open_bambu_web_page(from_u8(target), bind_ticket);
 }
 
 void GUI_App::open_publish_page_dialog()
 {
-    std::string host_url;
-    std::string model_url;
-    std::string link_url;
-
-    int result = -1;
-
-    //model api url
-    host_url = get_model_http_url(app_config->get_country_code());
-
-    //publish url
-    wxString language_code = this->current_language_code().BeforeFirst('_');
-    model_url += (language_code.ToStdString() + "/my/models/publish");
-
-    if (getAgent() && mainframe) {
-
-        //login already
-        if (getAgent()->is_user_login()) {
-            std::string ticket;
-            result = getAgent()->request_bind_ticket(&ticket);
-
-            if (result == 0) {
-                link_url = host_url + "api/sign-in/ticket?to=" + host_url + url_encode(model_url) + "&ticket=" + ticket;
-            }
-        }
-    }
-
-    if (result < 0) {
-        link_url = host_url + model_url;
-    }
-
-    wxLaunchDefaultBrowser(link_url);
+    const std::string host_url = get_model_http_url(app_config->get_country_code());
+    const std::string language = current_language_code().BeforeFirst('_').ToStdString();
+    const std::string target = host_url + language + "/my/models/publish";
+    const bool bind_ticket = getAgent() && mainframe && getAgent()->is_user_login();
+    open_bambu_web_page(from_u8(target), bind_ticket);
 }
 
 char GUI_App::from_hex(char ch) {
@@ -9272,6 +9353,7 @@ void GUI_App::remove_mall_system_dialog()
     if (m_mall_publish_dialog != nullptr) {
         m_mall_publish_dialog->Destroy();
         delete m_mall_publish_dialog;
+        m_mall_publish_dialog = nullptr;
     }
 }
 
@@ -9626,8 +9708,57 @@ FilamentColorCodeQuery* GUI_App::get_filament_color_code_query()
     return m_filament_color_code_query;
 }
 
+bool GUI_App::is_bambu_web_url(const wxString& url) const
+{
+    std::string value = into_u8(url);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value.rfind("https://", 0) != 0)
+        return false;
+    const std::size_t authority_start = 8;
+    const std::size_t authority_end = value.find_first_of("/?#", authority_start);
+    std::string authority = value.substr(authority_start, authority_end == std::string::npos ? std::string::npos : authority_end - authority_start);
+    const std::size_t at = authority.rfind('@');
+    if (at != std::string::npos)
+        authority.erase(0, at + 1);
+    if (!authority.empty() && authority.front() == '[')
+        return false;
+    const std::size_t colon = authority.find(':');
+    std::string host = authority.substr(0, colon);
+    while (!host.empty() && host.back() == '.')
+        host.pop_back();
+    const auto matches = [&host](const std::string& domain) {
+        return host == domain || (host.size() > domain.size() &&
+            host.compare(host.size() - domain.size(), domain.size(), domain) == 0 &&
+            host[host.size() - domain.size() - 1] == '.');
+    };
+    return matches("bambulab.com") || matches("bambulab.cn") ||
+           matches("bambu-lab.com") || matches("makerworld.com");
+}
+
+bool GUI_App::open_bambu_web_page(const wxString& url, bool bind_ticket)
+{
+    if (!is_bambu_web_url(url))
+        return false;
+#if !defined(_WIN32) && !defined(__APPLE__)
+    return wxLaunchDefaultBrowser(url);
+#else
+    if (!Slic3r::SlicerLinuxRuntime::use_linux_runtime() || !Slic3r::SlicerLinuxRuntime::enabled()) {
+        BOOST_LOG_TRIVIAL(error) << "Refusing to open Bambu URL outside the Linux runtime: " << into_u8(url);
+        return false;
+    }
+#endif
+    if (!m_mall_publish_dialog)
+        m_mall_publish_dialog = new ModelMallDialog(plater_);
+    m_mall_publish_dialog->go_to_url(url, bind_ticket);
+    m_mall_publish_dialog->Show();
+    m_mall_publish_dialog->Raise();
+    return true;
+}
+
 bool GUI_App::open_browser_with_warning_dialog(const wxString& url, int flags/* = 0*/)
 {
+    if (is_bambu_web_url(url))
+        return open_bambu_web_page(url, false);
     return wxLaunchDefaultBrowser(url, flags);
 }
 

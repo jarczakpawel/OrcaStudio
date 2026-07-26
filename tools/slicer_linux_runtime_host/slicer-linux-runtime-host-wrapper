@@ -6,18 +6,23 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin
 HOST_PATH="${1:-}"
 RUNTIME_DIR="${2:-}"
 COMPONENT_DIR="${3:-}"
+[ "$#" -lt 3 ] || shift 3
 
 if [ -z "$HOST_PATH" ]; then
     echo "missing host path" >&2
     exit 127
 fi
 
-runtime_dir_default() {
-    printf '%s\n' "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime/runtime"
+app_support_dir() {
+    if [ -n "${SLICER_LINUX_RUNTIME_MAC_APP_SUPPORT_DIR:-}" ]; then
+        printf '%s\n' "$SLICER_LINUX_RUNTIME_MAC_APP_SUPPORT_DIR"
+    else
+        printf '%s\n' "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime"
+    fi
 }
 
-app_support_dir() {
-    printf '%s\n' "$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime"
+runtime_dir_default() {
+    printf '%s/runtime\n' "$(app_support_dir)"
 }
 
 shell_quote() {
@@ -28,19 +33,17 @@ shell_quote() {
 
 trim_file() {
     path="$1"
-    if [ ! -f "$path" ]; then
-        return 1
-    fi
-    LC_ALL=C tr -d '\r' < "$path" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    [ -f "$path" ] || return 1
+    LC_ALL=C awk 'NR == 1 { gsub(/\r/, ""); sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print }' "$path"
 }
 
 find_limactl() {
-    if [ -n "${SLICER_LINUX_RUNTIME_LIMACTL:-}" ] && [ -x "${SLICER_LINUX_RUNTIME_LIMACTL}" ]; then
+    if [ -n "${SLICER_LINUX_RUNTIME_LIMACTL:-}" ] && [ -x "$SLICER_LINUX_RUNTIME_LIMACTL" ]; then
         printf '%s\n' "$SLICER_LINUX_RUNTIME_LIMACTL"
         return 0
     fi
 
-    local_lima="$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime/lima/bin/limactl"
+    local_lima="$(app_support_dir)/lima/bin/limactl"
     if [ -x "$local_lima" ]; then
         printf '%s\n' "$local_lima"
         return 0
@@ -51,16 +54,12 @@ find_limactl() {
         return 0
     fi
 
-    for candidate in \
-        "/opt/homebrew/bin/limactl" \
-        "/usr/local/bin/limactl"
-    do
+    for candidate in /opt/homebrew/bin/limactl /usr/local/bin/limactl; do
         if [ -x "$candidate" ]; then
             printf '%s\n' "$candidate"
             return 0
         fi
     done
-
     return 1
 }
 
@@ -71,20 +70,22 @@ if [ -z "$COMPONENT_DIR" ]; then
     COMPONENT_DIR="${SLICER_LINUX_RUNTIME_COMPONENT_DIR:-$RUNTIME_DIR}"
 fi
 
+# Keep the downloaded optional component in the persistent macOS runtime cache.
+# The Linux guest receives a separate, architecture-clean copy below.
 sync_component_payload() {
     [ -d "$COMPONENT_DIR" ] || return 0
     mkdir -p "$RUNTIME_DIR"
     for path in "$COMPONENT_DIR"/*; do
         [ -f "$path" ] || continue
-        base="$(basename "$path")"
+        base=$(basename "$path")
         case "$base" in
-            libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|ca-certificates.crt|slicer_base64.cer|lib*.so|lib*.so.*|*.so|*.so.*)
+            libbambu_networking.so|libBambuSource.so|liblive555.so|libagora_rtc_sdk.so|libagora-fdkaac.so|linux_component_manifest.json)
                 if [ ! -f "$RUNTIME_DIR/$base" ] || ! cmp -s "$path" "$RUNTIME_DIR/$base"; then
-                    cp -f "$path" "$RUNTIME_DIR/$base"
+                    tmp_path=$(mktemp "$RUNTIME_DIR/.payload.XXXXXX")
+                    cp "$path" "$tmp_path" || { rm -f "$tmp_path"; return 1; }
+                    case "$base" in *.so|*.so.*) chmod 755 "$tmp_path" 2>/dev/null || true ;; esac
+                    mv -f "$tmp_path" "$RUNTIME_DIR/$base" || { rm -f "$tmp_path"; return 1; }
                 fi
-                case "$base" in
-                    *.so|*.so.*|lib*.so|lib*.so.*) chmod 755 "$RUNTIME_DIR/$base" 2>/dev/null || true ;;
-                esac
                 ;;
         esac
     done
@@ -108,19 +109,295 @@ fi
 
 APP_SUPPORT_DIR=$(app_support_dir)
 LOG_DIR="$APP_SUPPORT_DIR/logs"
-mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/linux-runtime-host.log"
+mkdir -p "$LOG_DIR"
+
+STATUS_OUTPUT=$("$LIMACTL" list --format '{{.Status}}' "$INSTANCE" 2>>"$LOG_FILE" || true)
+STATUS=$(LC_ALL=C awk 'NR == 1 { gsub(/\r/, ""); print }' <<EOF_STATUS
+$STATUS_OUTPUT
+EOF_STATUS
+)
+if [ "$STATUS" != "Running" ]; then
+    if ! "$LIMACTL" start "$INSTANCE" >>"$LOG_FILE" 2>&1; then
+        echo "failed to start Lima instance: $INSTANCE" >&2
+        exit 127
+    fi
+fi
+
+SSH_CONFIG_OUTPUT=$("$LIMACTL" list --format '{{.SSHConfigFile}}' "$INSTANCE" 2>>"$LOG_FILE" || true)
+SSH_CONFIG=$(LC_ALL=C awk 'NR == 1 { gsub(/\r/, ""); print }' <<EOF_SSH_CONFIG
+$SSH_CONFIG_OUTPUT
+EOF_SSH_CONFIG
+)
+if [ -z "$SSH_CONFIG" ] || [ ! -f "$SSH_CONFIG" ]; then
+    echo "Lima SSH configuration is unavailable for instance: $INSTANCE" >&2
+    exit 127
+fi
+SSH_HOST=$(awk '/^Host[[:space:]]+/ && !found { value=$2; found=1 } END { if (found) print value }' "$SSH_CONFIG")
+if [ -z "$SSH_HOST" ]; then
+    SSH_HOST="lima-$INSTANCE"
+fi
+
+SSH_BIN="${SLICER_LINUX_RUNTIME_SSH:-/usr/bin/ssh}"
+if [ ! -x "$SSH_BIN" ]; then
+    echo "ssh client not found: $SSH_BIN" >&2
+    exit 127
+fi
+
+ssh_guest_control() {
+    "$SSH_BIN" -F "$SSH_CONFIG" -T -n \
+        -o BatchMode=yes \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=20 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        "$SSH_HOST" "$@"
+}
+
+ssh_guest_stream() {
+    "$SSH_BIN" -F "$SSH_CONFIG" -T \
+        -o BatchMode=yes \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=20 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        "$SSH_HOST" "$@"
+}
+
+disable_guest_rosetta_aot_cache() {
+    disable_cmd='set -eu
+[ -x /mnt/lima-rosetta/rosetta ] || exit 0
+case "$(uname -m 2>/dev/null || true)" in aarch64|arm64) ;; *) exit 0 ;; esac
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; elif command -v sudo >/dev/null 2>&1; then SUDO="sudo -n"; else echo "sudo is required to disable Rosetta AOT caching" >&2; exit 1; fi
+marker_tmp=$(mktemp)
+dropin_tmp=$(mktemp)
+trap "rm -f \"$marker_tmp\" \"$dropin_tmp\"" EXIT HUP INT TERM
+printf "%s\n" "disabled-for-protected-vendor-elf" > "$marker_tmp"
+printf "%s\n" "[Unit]" "ConditionPathExists=!/etc/orcastudio-rosetta-aot-disabled" > "$dropin_tmp"
+$SUDO install -m 0644 "$marker_tmp" /etc/orcastudio-rosetta-aot-disabled
+if command -v systemctl >/dev/null 2>&1 && systemctl cat rosettad.service >/dev/null 2>&1; then
+  $SUDO install -d -m 0755 /etc/systemd/system/rosettad.service.d
+  $SUDO install -m 0644 "$dropin_tmp" /etc/systemd/system/rosettad.service.d/10-orcastudio-disable-aot.conf
+  $SUDO systemctl daemon-reload
+  $SUDO systemctl stop rosettad.service
+fi
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet rosettad.service 2>/dev/null; then echo "rosettad is still active" >&2; exit 1; fi
+rm -f "$marker_tmp" "$dropin_tmp"
+trap - EXIT HUP INT TERM
+$SUDO rm -f /run/rosettad/rosetta.sock /var/cache/rosettad/uds/rosetta.sock
+if [ -d /var/cache/rosettad ]; then $SUDO find /var/cache/rosettad -xdev -mindepth 1 -delete; fi
+[ ! -S /run/rosettad/rosetta.sock ]
+[ ! -S /var/cache/rosettad/uds/rosetta.sock ]'
+    if ! ssh_guest_control "/bin/sh -c $(shell_quote "$disable_cmd")" >>"$LOG_FILE" 2>&1; then
+        echo "failed to disable Rosetta AOT caching in the Lima guest" >&2
+        return 1
+    fi
+}
+
+# Rosetta is registered in the ARM guest through binfmt_misc. Run x86_64 ELF
+# files normally from the guest filesystem and let the guest's amd64 libc loader
+# handle them. Do not execute the private ld-linux directly and do not mmap the
+# translated process from the macOS VirtioFS mount - both combinations produced
+# SIGBUS on real Apple Silicon hardware.
+GUEST_RUNTIME_BASE_REL=".local/share/bambustudio-orcaslicer/linux-runtime-payloads"
+hash_named_file() {
+    file="$1"
+    name="$2"
+    [ -f "$file" ] || return 0
+    digest=$(shasum -a 256 "$file" | awk '{print $1}') || return 1
+    printf '%s  %s\n' "$digest" "$name"
+}
+
+payload_marker() {
+    {
+        printf '%s\n' 'orcastudio-linux-guest-payload-v3-content-addressed'
+        if [ -f "$RUNTIME_DIR/runtime-files.sha256" ]; then
+            cat "$RUNTIME_DIR/runtime-files.sha256"
+        fi
+        for name in \
+            slicer_linux_runtime_host \
+            slicer_linux_runtime_host_abi1 \
+            slicer_linux_runtime_host_abi0 \
+            liborcastudio_rosetta_splitlock_compat.so \
+            slicer_linux_auth_browser \
+            slicer_linux_auth_browser_x86_64 \
+            slicer_linux_auth_browser_aarch64 \
+            run_auth_browser.sh \
+            ca-certificates.crt \
+            slicer_base64.cer; do
+            hash_named_file "$RUNTIME_DIR/$name" "$name"
+        done
+        for name in \
+            libbambu_networking.so \
+            libBambuSource.so \
+            liblive555.so \
+            libagora_rtc_sdk.so \
+            libagora-fdkaac.so \
+            linux_component_manifest.json; do
+            if [ -f "$COMPONENT_DIR/$name" ]; then
+                hash_named_file "$COMPONENT_DIR/$name" "$name"
+            else
+                hash_named_file "$RUNTIME_DIR/$name" "$name"
+            fi
+        done
+    } | shasum -a 256 | awk '{print $1}'
+}
+
+copy_to_stage() {
+    src="$1"
+    dst="$2"
+    [ -f "$src" ] || return 0
+    cp -f "$src" "$dst"
+}
+
+PAYLOAD_MARKER=$(payload_marker) || {
+    echo "failed to calculate Linux guest payload marker" >&2
+    exit 127
+}
+GUEST_RUNTIME_REL="$GUEST_RUNTIME_BASE_REL/$PAYLOAD_MARKER"
+
+sync_guest_payload() {
+    marker="$PAYLOAD_MARKER"
+    check_cmd='root="$HOME/'"$GUEST_RUNTIME_REL"'"; test -x "$root/slicer_linux_runtime_host" && test -x "$root/slicer_linux_runtime_host_abi1" && test -f "$root/liborcastudio_rosetta_splitlock_compat.so" && test -x "$root/slicer_linux_auth_browser_x86_64" && test -x "$root/slicer_linux_auth_browser_aarch64" && test -x "$root/run_auth_browser.sh" && cat "$root/.payload-marker" 2>/dev/null || true'
+    remote_marker=$(ssh_guest_control "/bin/sh -c $(shell_quote "$check_cmd")" 2>>"$LOG_FILE" | tr -d '\r\n' || true)
+    if [ "$remote_marker" = "$marker" ]; then
+        return 0
+    fi
+
+    local_stage=$(mktemp -d "$APP_SUPPORT_DIR/.guest-payload.XXXXXX") || return 1
+    trap 'rm -rf "${local_stage:-}"' EXIT HUP INT TERM
+
+    for name in \
+        slicer_linux_runtime_host \
+        slicer_linux_runtime_host_abi1 \
+        slicer_linux_runtime_host_abi0 \
+        liborcastudio_rosetta_splitlock_compat.so \
+        slicer_linux_auth_browser \
+        slicer_linux_auth_browser_x86_64 \
+        slicer_linux_auth_browser_aarch64 \
+        run_auth_browser.sh \
+        ca-certificates.crt \
+        slicer_base64.cer; do
+        copy_to_stage "$RUNTIME_DIR/$name" "$local_stage/$name"
+    done
+    for name in \
+        libbambu_networking.so \
+        libBambuSource.so \
+        liblive555.so \
+        libagora_rtc_sdk.so \
+        libagora-fdkaac.so \
+        linux_component_manifest.json; do
+        if [ -f "$COMPONENT_DIR/$name" ]; then
+            copy_to_stage "$COMPONENT_DIR/$name" "$local_stage/$name"
+        else
+            copy_to_stage "$RUNTIME_DIR/$name" "$local_stage/$name"
+        fi
+    done
+
+    printf '%s\n' "$marker" > "$local_stage/.payload-marker"
+    chmod 755 \
+        "$local_stage/slicer_linux_runtime_host" \
+        "$local_stage/slicer_linux_runtime_host_abi1" \
+        "$local_stage/slicer_linux_auth_browser" \
+        "$local_stage/slicer_linux_auth_browser_x86_64" \
+        "$local_stage/slicer_linux_auth_browser_aarch64" \
+        "$local_stage/run_auth_browser.sh"
+    [ ! -f "$local_stage/slicer_linux_runtime_host_abi0" ] || chmod 755 "$local_stage/slicer_linux_runtime_host_abi0"
+    chmod 755 "$local_stage"/*.so 2>/dev/null || true
+
+    # Intentionally exclude ld-linux, libc, libstdc++ and the bundled x86 support
+    # closure. The guest's coherent amd64 multiarch packages must satisfy those
+    # dependencies; mixing the private Ubuntu userspace with Rosetta caused SIGBUS.
+    sync_cmd='set -eu; base="$HOME/'"$GUEST_RUNTIME_BASE_REL"'"; keep='"$PAYLOAD_MARKER"'; root="$base/$keep"; tmp="${root}.tmp.$$"; old="${root}.old.$$"; rm -rf "$tmp" "$old"; mkdir -p "$tmp"; tar -xf - -C "$tmp"; test -x "$tmp/slicer_linux_runtime_host"; test -x "$tmp/slicer_linux_runtime_host_abi1"; test -f "$tmp/liborcastudio_rosetta_splitlock_compat.so"; chmod 755 "$tmp"/slicer_linux_runtime_host "$tmp"/slicer_linux_runtime_host_abi1 "$tmp"/slicer_linux_auth_browser "$tmp"/slicer_linux_auth_browser_x86_64 "$tmp"/slicer_linux_auth_browser_aarch64 "$tmp"/run_auth_browser.sh; chmod 755 "$tmp"/*.so 2>/dev/null || true; if [ -d "$root" ]; then mv "$root" "$old"; fi; if mv "$tmp" "$root"; then rm -rf "$old"; rm -rf "$HOME/.local/share/bambustudio-orcaslicer/linux-runtime"; else rc=$?; rm -rf "$tmp"; if [ -d "$old" ]; then mv "$old" "$root"; fi; exit "$rc"; fi'
+    if ! (cd "$local_stage" && /usr/bin/tar -cf - .) | ssh_guest_stream "/bin/sh -c $(shell_quote "$sync_cmd")" >>"$LOG_FILE" 2>&1; then
+        rm -rf "$local_stage"
+        trap - EXIT HUP INT TERM
+        echo "failed to synchronize Linux runtime into the Lima guest filesystem" >&2
+        return 1
+    fi
+
+    rm -rf "$local_stage"
+    trap - EXIT HUP INT TERM
+    return 0
+}
+
+if ! disable_guest_rosetta_aot_cache; then
+    exit 127
+fi
+
+if ! sync_guest_payload; then
+    exit 127
+fi
+
+HOST_NOVNC_PORT=${SLICER_LINUX_RUNTIME_AUTH_HOST_NOVNC_PORT:-}
+GUEST_NOVNC_PORT=${SLICER_LINUX_RUNTIME_AUTH_NOVNC_PORT:-$HOST_NOVNC_PORT}
+GUEST_VNC_PORT=${SLICER_LINUX_RUNTIME_AUTH_VNC_PORT:-}
+FORWARD_ENABLED=0
+if [ -n "$HOST_NOVNC_PORT$GUEST_NOVNC_PORT$GUEST_VNC_PORT" ]; then
+    case "$HOST_NOVNC_PORT:$GUEST_NOVNC_PORT:$GUEST_VNC_PORT" in
+        *[!0-9:]*|:*|*::*|*:)
+            echo "invalid Linux browser transport ports" >&2
+            exit 127
+            ;;
+    esac
+    if [ "$HOST_NOVNC_PORT" -le 0 ] || [ "$HOST_NOVNC_PORT" -gt 65535 ] ||
+       [ "$GUEST_NOVNC_PORT" -le 0 ] || [ "$GUEST_NOVNC_PORT" -gt 65535 ] ||
+       [ "$GUEST_VNC_PORT" -le 0 ] || [ "$GUEST_VNC_PORT" -gt 65535 ] ||
+       [ "$GUEST_NOVNC_PORT" -eq "$GUEST_VNC_PORT" ]; then
+        echo "invalid Linux browser transport port range" >&2
+        exit 127
+    fi
+    FORWARD_ENABLED=1
+fi
+
+if [ -n "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}" ]; then
+    EXPECTED_ABI_COMMAND="export SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION=$(shell_quote "$SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION");"
+else
+    EXPECTED_ABI_COMMAND="unset SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION;"
+fi
+
+CMD='cd /; if [ "$(uname -s)" != Linux ]; then echo "not running inside Linux guest" >&2; exit 127; fi; GUEST_RUNTIME_DIR="$HOME/'"$GUEST_RUNTIME_REL"'"; test -x "$GUEST_RUNTIME_DIR/slicer_linux_runtime_host" || { echo "staged Linux runtime missing" >&2; exit 127; }; GUEST_ARCH=$(uname -m); case "$GUEST_ARCH" in aarch64|arm64) AUTH_BROWSER="$GUEST_RUNTIME_DIR/slicer_linux_auth_browser_aarch64" ;; x86_64|amd64) if [ -x "$GUEST_RUNTIME_DIR/slicer_linux_auth_browser_x86_64" ]; then AUTH_BROWSER="$GUEST_RUNTIME_DIR/slicer_linux_auth_browser_x86_64"; else AUTH_BROWSER="$GUEST_RUNTIME_DIR/slicer_linux_auth_browser"; fi ;; *) echo "unsupported Lima guest architecture: $GUEST_ARCH" >&2; exit 127 ;; esac; test -x "$AUTH_BROWSER" || { echo "authentication browser missing for guest architecture $GUEST_ARCH: $AUTH_BROWSER" >&2; exit 127; }; export SLICER_LINUX_RUNTIME_AUTH_BROWSER="$AUTH_BROWSER"; export SLICER_LINUX_RUNTIME_COMPONENT_DIR="$GUEST_RUNTIME_DIR"; export SLICER_LINUX_RUNTIME_COMPONENT_SO="$GUEST_RUNTIME_DIR/libbambu_networking.so"; export SLICER_LINUX_RUNTIME_SOURCE_SO="$GUEST_RUNTIME_DIR/libBambuSource.so"; export SLICER_LINUX_RUNTIME_MEDIA_SO="$GUEST_RUNTIME_DIR/liblive555.so"; export SLICER_LINUX_RUNTIME_REQUIRE_LINUX_GUEST=1; export SLICER_LINUX_RUNTIME_PREFER_SYSTEM_LOADER=1; export SLICER_LINUX_RUNTIME_DISABLE_ABI0_FALLBACK=1;'
+CMD="$CMD $EXPECTED_ABI_COMMAND export SLICER_LINUX_RUNTIME_REQUIRE_COMPATIBLE_HOST=$(shell_quote "${SLICER_LINUX_RUNTIME_REQUIRE_COMPATIBLE_HOST:-0}");"
+if [ "$FORWARD_ENABLED" -eq 1 ]; then
+    CMD="$CMD export SLICER_LINUX_RUNTIME_AUTH_HOST_NOVNC_PORT=$(shell_quote "$HOST_NOVNC_PORT"); export SLICER_LINUX_RUNTIME_AUTH_NOVNC_PORT=$(shell_quote "$GUEST_NOVNC_PORT"); export SLICER_LINUX_RUNTIME_AUTH_VNC_PORT=$(shell_quote "$GUEST_VNC_PORT");"
+fi
+CMD="$CMD if [ -s \"\$GUEST_RUNTIME_DIR/ca-certificates.crt\" ] && [ \"\$(grep -c -- '-----BEGIN CERTIFICATE-----' \"\$GUEST_RUNTIME_DIR/ca-certificates.crt\" 2>/dev/null || true)\" -ge 50 ]; then export SLICER_LINUX_RUNTIME_CA_BUNDLE=\"\$GUEST_RUNTIME_DIR/ca-certificates.crt\"; export SSL_CERT_FILE=\"\$SLICER_LINUX_RUNTIME_CA_BUNDLE\"; export CURL_CA_BUNDLE=\"\$SLICER_LINUX_RUNTIME_CA_BUNDLE\"; elif [ -s /etc/ssl/certs/ca-certificates.crt ]; then export SLICER_LINUX_RUNTIME_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt; export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt; else echo 'valid CA certificate bundle not found in Linux guest' >&2; exit 127; fi; if [ -d /etc/ssl/certs ]; then export SSL_CERT_DIR=/etc/ssl/certs; fi; exec /bin/sh \"\$GUEST_RUNTIME_DIR/slicer_linux_runtime_host\""
+for arg in "$@"; do
+    CMD="$CMD $(shell_quote "$arg")"
+done
+REMOTE_COMMAND="/bin/sh -c $(shell_quote "$CMD")"
 
 {
-    printf '%s\n' "---- slicer linux runtime launch ----"
+    printf '%s\n' '---- slicer linux runtime launch ----'
     date
     printf 'instance=%s\n' "$INSTANCE"
+    printf 'ssh_config=%s\n' "$SSH_CONFIG"
+    printf 'ssh_host=%s\n' "$SSH_HOST"
     printf 'host_path=%s\n' "$HOST_PATH"
     printf 'runtime_dir=%s\n' "$RUNTIME_DIR"
     printf 'component_dir=%s\n' "$COMPONENT_DIR"
+    printf 'guest_runtime=%s\n' "$GUEST_RUNTIME_REL"
     printf 'expected_abi=%s\n' "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}"
-} >> "$LOG_FILE" 2>/dev/null || true
+    printf 'forward_enabled=%s host_novnc_port=%s guest_novnc_port=%s guest_vnc_port=%s\n' \
+        "$FORWARD_ENABLED" "$HOST_NOVNC_PORT" "$GUEST_NOVNC_PORT" "$GUEST_VNC_PORT"
+} >>"$LOG_FILE" 2>/dev/null || true
 
-CMD="if [ \"\$(uname -s)\" != Linux ]; then echo 'not running inside Linux guest' >&2; exit 127; fi; export SLICER_LINUX_RUNTIME_COMPONENT_DIR=$(shell_quote "$RUNTIME_DIR"); export SLICER_LINUX_RUNTIME_COMPONENT_SO=$(shell_quote "$RUNTIME_DIR/libbambu_networking.so"); export SLICER_LINUX_RUNTIME_SOURCE_SO=$(shell_quote "$RUNTIME_DIR/libBambuSource.so"); export SLICER_LINUX_RUNTIME_MEDIA_SO=$(shell_quote "$RUNTIME_DIR/liblive555.so"); export SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION=$(shell_quote "${SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION:-}"); export SLICER_LINUX_RUNTIME_REQUIRE_LINUX_GUEST=1; unset LD_LIBRARY_PATH; if [ -f $(shell_quote "$RUNTIME_DIR/ca-certificates.crt") ]; then export SSL_CERT_FILE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); export CURL_CA_BUNDLE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); fi; if [ -d /etc/ssl/certs ]; then export SSL_CERT_DIR=/etc/ssl/certs; fi; exec /bin/sh $(shell_quote "$HOST_PATH")"
+if [ "$FORWARD_ENABLED" -eq 1 ]; then
+    exec "$SSH_BIN" -F "$SSH_CONFIG" -T \
+        -o BatchMode=yes \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=20 \
+        -o ExitOnForwardFailure=yes \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        -L "127.0.0.1:$HOST_NOVNC_PORT:127.0.0.1:$GUEST_NOVNC_PORT" \
+        "$SSH_HOST" "$REMOTE_COMMAND"
+fi
 
-exec "$LIMACTL" --tty=false shell "$INSTANCE" -- /bin/sh -lc "$CMD" 2>>"$LOG_FILE"
+exec "$SSH_BIN" -F "$SSH_CONFIG" -T \
+    -o BatchMode=yes \
+    -o LogLevel=ERROR \
+    -o ConnectTimeout=20 \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=3 \
+    "$SSH_HOST" "$REMOTE_COMMAND"

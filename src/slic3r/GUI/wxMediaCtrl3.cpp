@@ -1,6 +1,7 @@
 #include "wxMediaCtrl3.h"
 #include "AVVideoDecoder.hpp"
 #include "I18N.hpp"
+#include "Printer/StaticBambuLib.hpp"
 #include "libslic3r/Utils.hpp"
 #include <boost/log/trivial.hpp>
 #include <wx/dcclient.h>
@@ -34,11 +35,6 @@ static std::string wxmedia_safe_log_text(const std::string& value)
     return value;
 }
 
-struct StaticBambuLib : BambuLib
-{
-    static StaticBambuLib &get(BambuLib *);
-};
-
 wxMediaCtrl3::wxMediaCtrl3(wxWindow *parent)
     : wxWindow(parent, wxID_ANY)
     , BambuLib(StaticBambuLib::get(this))
@@ -67,6 +63,7 @@ wxMediaCtrl3::~wxMediaCtrl3()
         m_cond.notify_all();
     }
     m_thread.join();
+    StaticBambuLib::remove(this);
 }
 
 void wxMediaCtrl3::Load(wxURI url, std::chrono::system_clock::time_point play_start_time)
@@ -360,6 +357,11 @@ void wxMediaCtrl3::PlayThread()
             {
                 m_error = error;
                 BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::DLL load error ";
+                if (tunnel) {
+                    Bambu_Close(tunnel);
+                    Bambu_Destroy(tunnel);
+                    tunnel = nullptr;
+                }
                 lk.lock();
                 NotifyStopped();
                 continue;
@@ -622,6 +624,11 @@ void wxMediaCtrl3::PlayThread()
             {
                 m_error = error;
                 BOOST_LOG_TRIVIAL(info) << "MediaPlayCtrl::DLL load error ";
+                if (tunnel) {
+                    Bambu_Close(tunnel);
+                    Bambu_Destroy(tunnel);
+                    tunnel = nullptr;
+                }
                 lk.lock();
                 NotifyStopped();
                 continue;

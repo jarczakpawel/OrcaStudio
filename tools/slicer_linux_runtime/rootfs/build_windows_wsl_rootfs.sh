@@ -5,21 +5,37 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 OUTPUT_TAR="${1:-$SCRIPT_DIR/windows-wsl2-rootfs.tar}"
 PRIMARY_IMAGE="${SLICER_LINUX_RUNTIME_WSL_ROOTFS_IMAGE:-ubuntu:24.04}"
 FORCE_REBUILD="${SLICER_LINUX_RUNTIME_WSL_ROOTFS_FORCE:-0}"
+ROOTFS_MARKER="ubuntu-24.04-linux-auth-v3"
 
-if ! command -v docker >/dev/null 2>&1; then
-    echo "docker not found. Install Docker or provide a prebuilt windows-wsl2-rootfs.tar." >&2
-    exit 1
-fi
+for required_command in docker tar python3; do
+    if ! command -v "$required_command" >/dev/null 2>&1; then
+        echo "$required_command not found. It is required to build and validate windows-wsl2-rootfs.tar." >&2
+        exit 1
+    fi
+done
 
 mkdir -p "$(dirname -- "$OUTPUT_TAR")"
 
+PREPARE_SCRIPT="$SCRIPT_DIR/prepare_windows_wsl_rootfs.sh"
+VALIDATOR_SCRIPT="$SCRIPT_DIR/validate_windows_wsl_rootfs.py"
+for required_file in "$PREPARE_SCRIPT" "$VALIDATOR_SCRIPT"; do
+    if [[ ! -f "$required_file" ]]; then
+        echo "required WSL rootfs support file is missing: $required_file" >&2
+        exit 1
+    fi
+done
+
+validate_rootfs_tar() {
+    python3 "$SCRIPT_DIR/validate_windows_wsl_rootfs.py" "$1" "$ROOTFS_MARKER"
+}
+
 if [[ "$FORCE_REBUILD" != "1" && -s "$OUTPUT_TAR" ]]; then
-    if tar -tf "$OUTPUT_TAR" >/dev/null 2>&1; then
+    if validate_rootfs_tar "$OUTPUT_TAR"; then
         echo "Using existing WSL rootfs:"
         echo "  $OUTPUT_TAR"
         exit 0
     fi
-    echo "Existing WSL rootfs is not a valid tar, rebuilding: $OUTPUT_TAR" >&2
+    echo "Existing WSL rootfs is stale or invalid, rebuilding: $OUTPUT_TAR" >&2
     rm -f "$OUTPUT_TAR"
 fi
 
@@ -64,8 +80,34 @@ for image in "${IMAGES[@]}"; do
 
     docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-    if ! run_with_retries "docker create $image" docker create --platform linux/amd64 --name "$CONTAINER_NAME" "$image" /bin/sh -lc 'exit 0' >/dev/null; then
+    if ! run_with_retries "docker create $image" docker create --platform linux/amd64 --user 0:0 --name "$CONTAINER_NAME" "$image" /bin/sh -lc 'trap : TERM INT; sleep infinity & wait' >/dev/null; then
         echo "Unable to create container from $image, trying next image if available" >&2
+        continue
+    fi
+
+    if ! run_with_retries "docker start $image" docker start "$CONTAINER_NAME" >/dev/null; then
+        echo "Unable to start container from $image, trying next image if available" >&2
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        continue
+    fi
+    if ! run_with_retries "copy WSL rootfs preparation script" \
+        docker cp "$PREPARE_SCRIPT" "${CONTAINER_NAME}:/tmp/orcastudio-prepare-rootfs.sh"; then
+        echo "Unable to copy the WSL rootfs preparation script into $image, trying next image if available" >&2
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        continue
+    fi
+
+    if ! run_with_retries "prepare Linux auth runtime dependencies" docker exec \
+        -e DEBIAN_FRONTEND=noninteractive "$CONTAINER_NAME" /bin/sh -lc \
+        'sed -i "s/\r$//" /tmp/orcastudio-prepare-rootfs.sh; exec /bin/sh /tmp/orcastudio-prepare-rootfs.sh "$1"' \
+        sh "$ROOTFS_MARKER"; then
+        echo "Unable to prepare runtime dependencies in $image, trying next image if available" >&2
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        continue
+    fi
+    if ! run_with_retries "docker stop $image" docker stop "$CONTAINER_NAME" >/dev/null; then
+        echo "Unable to stop prepared container from $image, trying next image if available" >&2
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
         continue
     fi
 
@@ -82,8 +124,8 @@ for image in "${IMAGES[@]}"; do
         continue
     fi
 
-    if ! tar -tf "$OUTPUT_TAR" >/dev/null 2>&1; then
-        echo "created rootfs tar is invalid: $OUTPUT_TAR" >&2
+    if ! validate_rootfs_tar "$OUTPUT_TAR"; then
+        echo "created rootfs tar is invalid or missing Linux auth runtime marker/dependencies: $OUTPUT_TAR" >&2
         rm -f "$OUTPUT_TAR"
         continue
     fi

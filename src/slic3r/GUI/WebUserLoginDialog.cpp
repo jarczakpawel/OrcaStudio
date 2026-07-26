@@ -6,6 +6,8 @@
 #include "slic3r/GUI/wxExtensions.hpp"
 #include "slic3r/GUI/GUI_App.hpp"
 #include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/BBLNetworkPlugin.hpp"
+#include "slic3r/Utils/SlicerLinuxRuntime/SlicerLinuxRuntimeConfig.hpp"
 #include "libslic3r_version.h"
 
 #include <wx/sizer.h>
@@ -26,7 +28,9 @@
 #include "MainFrame.hpp"
 #include <boost/dll.hpp>
 
+#include <chrono>
 #include <sstream>
+#include <thread>
 #include <slic3r/GUI/Widgets/WebView.hpp>
 #include <slic3r/GUI/Widgets/HyperLink.hpp> // ORCA
 using namespace std;
@@ -54,6 +58,39 @@ int reserve_loopback_port()
     } catch (...) {
         return 0;
     }
+}
+
+
+bool can_connect_loopback_port(int port)
+{
+    if (port <= 0)
+        return false;
+    try {
+        boost::asio::io_service io_service;
+        boost::asio::ip::tcp::socket socket(io_service);
+        boost::system::error_code error;
+        socket.connect({boost::asio::ip::address_v4::loopback(), static_cast<unsigned short>(port)}, error);
+        return !error;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool wait_for_loopback_port(int port)
+{
+#if defined(_WIN32)
+    // WSL2 may need a few seconds after the guest service is ready before its
+    // localhost proxy is reachable from Windows. Do not cancel login early.
+    constexpr int loopback_wait_attempts = 200;
+#else
+    constexpr int loopback_wait_attempts = 30;
+#endif
+    for (int attempt = 0; attempt < loopback_wait_attempts; ++attempt) {
+        if (can_connect_loopback_port(port))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
 }
 
 std::string rewrite_loopback_url(std::string url, int port)
@@ -148,18 +185,85 @@ ZUserLogin::ZUserLogin(std::shared_ptr<ICloudServiceAgent> cloud_agent)
         strlang.Replace("_", "-");
         TargetUrl = wxString::FromUTF8(m_cloud_agent->get_cloud_login_url(strlang.ToStdString()));
 
-        BOOST_LOG_TRIVIAL(info) << "login url = " << TargetUrl.ToStdString();
-
         m_bbl_user_agent = wxString::Format("BBL-Slicer/v%s", wxGetApp().get_bbl_client_version());
 
-        // Create the webview
-        m_browser = WebView::CreateWebView(this, TargetUrl);
+        if (m_cloud_agent->get_id() == BBL_CLOUD_PROVIDER && Slic3r::SlicerLinuxRuntime::use_linux_runtime()) {
+            std::string auth_reply;
+            {
+                auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+                auto& plugin = BBLNetworkPlugin::instance();
+                auto start_auth_v2 = plugin.get_linux_auth_start_v2();
+                auto start_auth = plugin.get_linux_auth_start();
+                if ((!start_auth_v2 && !start_auth) ||
+                    !plugin.get_linux_auth_status() ||
+                    !plugin.get_linux_auth_cancel() ||
+                    !plugin.get_agent()) {
+                    m_linux_auth_error = "Linux authentication runtime is unavailable";
+                } else if (start_auth_v2) {
+                    wxString language = wxGetApp().current_language_code_safe().BeforeFirst('_').BeforeFirst('-');
+                    if (language.empty())
+                        language = "en";
+                    auth_reply = start_auth_v2(
+                        plugin.get_agent(),
+                        TargetUrl.ToStdString(),
+                        SLIC3R_VERSION,
+                        language.ToStdString(),
+                        wxGetApp().dark_mode());
+                } else {
+                    auth_reply = start_auth(plugin.get_agent(), TargetUrl.ToStdString());
+                }
+            }
+            if (!auth_reply.empty()) {
+                try {
+                    const json reply = json::parse(auth_reply);
+                    const std::string diagnostic = reply.value("diagnostic", std::string());
+                    if (!diagnostic.empty())
+                        BOOST_LOG_TRIVIAL(info) << "linux_auth_start: " << diagnostic;
+                    if (reply.value("ok", false) && reply.value("state", std::string()) == "running") {
+                        BOOST_LOG_TRIVIAL(info)
+                            << "linux_auth_identity: platform=" << reply.value("platform", std::string())
+                            << " version=" << reply.value("client_version", std::string())
+                            << " language=" << reply.value("language", std::string())
+                            << " theme=" << reply.value("theme", std::string());
+                        const std::string viewer_url = reply.value("viewer_url", std::string());
+                        const int viewer_port = reply.value("novnc_port", 0);
+                        if (!viewer_url.empty() && viewer_port > 0 && wait_for_loopback_port(viewer_port)) {
+                            TargetUrl = wxString::FromUTF8(viewer_url);
+                            m_linux_viewer_port = viewer_port;
+                            m_linux_auth = true;
+                            m_networkOk = true;
+                        } else {
+                            auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+                            auto& plugin = BBLNetworkPlugin::instance();
+                            auto cancel_auth = plugin.get_linux_auth_cancel();
+                            if (cancel_auth && plugin.get_agent())
+                                cancel_auth(plugin.get_agent());
+                            m_linux_auth_error = "Linux authentication viewer is not reachable on the host loopback interface";
+                        }
+                    } else {
+                        m_linux_auth_error = reply.value("error", std::string("Linux authentication runtime failed to start"));
+                    }
+                } catch (const std::exception& e) {
+                    m_linux_auth_error = e.what();
+                }
+            }
+            if (!m_linux_auth) {
+                BOOST_LOG_TRIVIAL(error) << "linux_auth_start: " << m_linux_auth_error;
+                wxMessageBox(wxString::FromUTF8(m_linux_auth_error), _L("Login"), wxICON_ERROR);
+                return;
+            }
+        }
+
+        const wxString initial_url = m_linux_auth ? "about:blank" : TargetUrl;
+        m_browser = WebView::CreateWebView(this, initial_url);
         if (m_browser == nullptr) {
             wxLogError("Could not init m_browser");
             return;
         }
-        m_browser->Hide();
-        m_browser->SetSize(0, 0);
+        if (!m_linux_auth) {
+            m_browser->Hide();
+            m_browser->SetSize(0, 0);
+        }
 
         // Connect the webview events
         Bind(wxEVT_WEBVIEW_NAVIGATING, &ZUserLogin::OnNavigationRequest, this, m_browser->GetId());
@@ -173,9 +277,22 @@ ZUserLogin::ZUserLogin(std::shared_ptr<ICloudServiceAgent> cloud_agent)
 
         // UI
         SetTitle(_L("Login"));
-        // Set a more sensible size for web browsing
-        wxSize pSize = FromDIP(wxSize(650, 840));
+        wxSize pSize = FromDIP(wxSize(m_linux_auth ? 656 : 650, 840));
         SetSize(pSize);
+
+        if (m_linux_auth) {
+            auto* sizer = new wxBoxSizer(wxVERTICAL);
+            sizer->Add(m_browser, 1, wxEXPAND);
+            SetSizer(sizer);
+            m_browser->Show();
+            Layout();
+            CallAfter([this] {
+                if (m_browser && m_linux_auth) {
+                    m_browser->LoadURL(TargetUrl);
+                    m_browser->SetFocus();
+                }
+            });
+        }
 
         CentreOnParent();
     }
@@ -183,6 +300,13 @@ ZUserLogin::ZUserLogin(std::shared_ptr<ICloudServiceAgent> cloud_agent)
 }
 
 ZUserLogin::~ZUserLogin() {
+    if (m_linux_auth) {
+        auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+        auto& plugin = BBLNetworkPlugin::instance();
+        auto cancel = plugin.get_linux_auth_cancel();
+        if (cancel && plugin.get_agent())
+            cancel(plugin.get_agent());
+    }
     if (m_timer != NULL) {
         m_timer->Stop();
         delete m_timer;
@@ -193,15 +317,62 @@ ZUserLogin::~ZUserLogin() {
 void ZUserLogin::OnTimer(wxTimerEvent &event) {
     m_timer->Stop();
 
-    if (m_networkOk == false)
-    {
-        ShowErrorPage();
+    if (m_linux_auth) {
+        std::string status_reply;
+        bool status_available = false;
+        {
+            auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+            auto& plugin = BBLNetworkPlugin::instance();
+            auto status_fn = plugin.get_linux_auth_status();
+            auto* agent = plugin.get_agent();
+            status_available = status_fn && agent;
+            if (status_available)
+                status_reply = status_fn(agent);
+        }
+        if (!status_available) {
+            BOOST_LOG_TRIVIAL(error) << "linux_auth_status: runtime unavailable";
+            wxMessageBox(_L("Linux authentication runtime stopped unexpectedly."), _L("Login"), wxICON_ERROR);
+            EndModal(wxID_CANCEL);
+            return;
+        }
+        try {
+            const json reply = json::parse(status_reply);
+            const std::string state = reply.value("state", std::string("error"));
+            if (state == "success") {
+                m_linux_auth = false; // runtime already applied change_user; do not cancel it in destructor
+                wxGetApp().request_user_login(1, BBL_CLOUD_PROVIDER);
+                EndModal(wxID_OK);
+                return;
+            }
+            if (state == "error" || state == "cancelled") {
+                const std::string error = reply.value("error", std::string("Login failed"));
+                const std::string diagnostic = reply.value("diagnostic", std::string());
+                BOOST_LOG_TRIVIAL(error) << "linux_auth_status: " << error;
+                if (!diagnostic.empty())
+                    BOOST_LOG_TRIVIAL(error) << "linux_auth_status: " << diagnostic;
+                wxMessageBox(wxString::FromUTF8(error), _L("Login"), wxICON_ERROR);
+                EndModal(wxID_CANCEL);
+                return;
+            }
+        } catch (const std::exception& e) {
+            BOOST_LOG_TRIVIAL(error) << "linux_auth_status: " << e.what();
+            wxMessageBox(wxString::FromUTF8(e.what()), _L("Login"), wxICON_ERROR);
+            EndModal(wxID_CANCEL);
+            return;
+        }
+        m_timer->Start(500, true);
+        return;
     }
+
+    if (m_networkOk == false)
+        ShowErrorPage();
 }
 
 bool ZUserLogin::run() {
+    if (!m_browser)
+        return false;
     m_timer = new wxTimer(this, NETWORK_OFFLINE_TIMER_ID);
-    m_timer->Start(8000);
+    m_timer->Start(m_linux_auth ? 500 : 8000, true);
 
     if (this->ShowModal() == wxID_OK) {
         return true;
@@ -248,8 +419,15 @@ void ZUserLogin::OnIdle(wxIdleEvent &WXUNUSED(evt))
  */
 void ZUserLogin::OnNavigationRequest(wxWebViewEvent &evt)
 {
-    //wxLogMessage("%s", "Navigation request to '" + evt.GetURL() + "'(target='" + evt.GetTarget() + "')");
-
+    if (m_linux_auth) {
+        const wxString url = evt.GetURL().Lower();
+        const wxString loopback_v4 = wxString::Format("http://127.0.0.1:%d/", m_linux_viewer_port);
+        const wxString loopback_name = wxString::Format("http://localhost:%d/", m_linux_viewer_port);
+        if (m_linux_viewer_port <= 0 || !(url.StartsWith(loopback_v4) || url.StartsWith(loopback_name) || url.StartsWith("about:blank"))) {
+            evt.Veto();
+            return;
+        }
+    }
     UpdateState();
 }
 
@@ -286,6 +464,15 @@ void ZUserLogin::OnDocumentLoaded(wxWebViewEvent &evt)
  */
 void ZUserLogin::OnNewWindow(wxWebViewEvent &evt)
 {
+    if (m_linux_auth) {
+        const wxString url = evt.GetURL().Lower();
+        const wxString loopback_v4 = wxString::Format("http://127.0.0.1:%d/", m_linux_viewer_port);
+        const wxString loopback_name = wxString::Format("http://localhost:%d/", m_linux_viewer_port);
+        evt.Veto();
+        if (m_linux_viewer_port > 0 && (url.StartsWith(loopback_v4) || url.StartsWith(loopback_name) || url.StartsWith("about:blank")))
+            m_browser->LoadURL(evt.GetURL());
+        return;
+    }
     wxString flag = " (other)";
 
     if (evt.GetNavigationAction() == wxWEBVIEW_NAV_ACTION_USER) { flag = " (user)"; }
@@ -313,6 +500,8 @@ void ZUserLogin::OnFullScreenChanged(wxWebViewEvent &evt)
 
 void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
 {
+    if (m_linux_auth)
+        return;
     wxString str_input = evt.GetString();
 
     try {
@@ -491,7 +680,7 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
                 jump_url = rewrite_loopback_url(jump_url, loopback_port);
                 CallAfter([this, jump_url] {
                     wxString url = wxString::FromUTF8(jump_url);
-                    wxLaunchDefaultBrowser(url);
+                    wxGetApp().open_browser_with_warning_dialog(url);
                     });
             }
         }
@@ -500,13 +689,13 @@ void ZUserLogin::OnScriptMessage(wxWebViewEvent &evt)
                 std::string jump_url = j["data"]["url"].get<std::string>();
                 CallAfter([this, jump_url] {
                     wxString url = wxString::FromUTF8(jump_url);
-                    wxLaunchDefaultBrowser(url);
+                    wxGetApp().open_browser_with_warning_dialog(url);
                     });
             }
             return;
         }
     } catch (std::exception &e) {
-        wxMessageBox(e.what(), "parse json failed", wxICON_WARNING);
+        wxMessageBox(e.what(), _L("parse json failed"), wxICON_WARNING);
         Close();
     }
 }

@@ -3,10 +3,27 @@
 set WP=%CD%
 set _START_TIME=%TIME%
 
+@REM Default target architecture to the host CPU arch; override by passing
+@REM "x64" or "arm64" as an argument. PROCESSOR_ARCHITEW6432 covers a 32-bit
+@REM shell running on a 64-bit OS, where PROCESSOR_ARCHITECTURE reads "x86".
+set arch=x64
+if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set arch=ARM64
+if /I "%PROCESSOR_ARCHITEW6432%"=="ARM64" set arch=ARM64
+if /I "%1"=="arm64" set arch=ARM64
+if /I "%2"=="arm64" set arch=ARM64
+if /I "%1"=="x64" set arch=x64
+if /I "%2"=="x64" set arch=x64
+
 @REM Check for Ninja Multi-Config option (-x)
 set USE_NINJA=0
 for %%a in (%*) do (
     if "%%a"=="-x" set USE_NINJA=1
+)
+
+@REM Check for unit-tests option ("tests")
+set BUILD_TESTS=OFF
+for %%a in (%*) do (
+    if /I "%%a"=="tests" set BUILD_TESTS=ON
 )
 
 if "%USE_NINJA%"=="1" (
@@ -70,10 +87,11 @@ echo Using CMake generator: %CMAKE_GENERATOR%
 if "%1"=="pack" (
     setlocal ENABLEDELAYEDEXPANSION
     cd %WP%/deps/build
+    if "%arch%"=="ARM64" cd %WP%/deps/build-arm64
     for /f "tokens=2-4 delims=/ " %%a in ('date /t') do set build_date=%%c%%b%%a
-    echo packing deps: OrcaSlicer_dep_win64_!build_date!_vs!VS_VERSION!.zip
+    echo packing deps: OrcaSlicer_dep_win-!arch!_!build_date!_vs!VS_VERSION!.zip
 
-    %WP%/tools/7z.exe a OrcaSlicer_dep_win64_!build_date!_vs!VS_VERSION!.zip OrcaSlicer_dep
+    %WP%/tools/7z.exe a OrcaSlicer_dep_win-!arch!_!build_date!_vs!VS_VERSION!.zip OrcaSlicer_dep
     goto :done
 )
 
@@ -95,7 +113,8 @@ if "%debug%"=="ON" (
         set build_dir=build
     )
 )
-echo build type set to %build_type%
+if "%arch%"=="ARM64" set build_dir=%build_dir%-arm64
+echo build type set to %build_type%, arch=%arch%
 
 setlocal DISABLEDELAYEDEXPANSION
 cd deps
@@ -118,7 +137,7 @@ if "%USE_NINJA%"=="1" (
     cmake --build . --config %build_type% --target deps
     if errorlevel 1 exit /b 1
 ) else (
-    cmake ../ -G %CMAKE_GENERATOR% -A x64 -DCMAKE_BUILD_TYPE=%build_type%
+    cmake ../ -G %CMAKE_GENERATOR% -A %arch% -DCMAKE_BUILD_TYPE=%build_type%
     if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target deps -- -m
     if errorlevel 1 exit /b 1
@@ -139,12 +158,12 @@ cd %build_dir%
 echo on
 set CMAKE_POLICY_VERSION_MINIMUM=3.5
 if "%USE_NINJA%"=="1" (
-    cmake .. -G %CMAKE_GENERATOR% -DORCA_TOOLS=ON -DBBL_RELEASE_TO_PUBLIC=1 -DBBL_INTERNAL_TESTING=0 %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type%
+    cmake .. -G %CMAKE_GENERATOR% -DORCA_TOOLS=ON -DBBL_RELEASE_TO_PUBLIC=1 -DBBL_INTERNAL_TESTING=0 %SIG_FLAG% -DBUILD_TESTS=%BUILD_TESTS% -DCMAKE_BUILD_TYPE=%build_type%
     if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target ALL_BUILD
     if errorlevel 1 exit /b 1
 ) else (
-    cmake .. -G %CMAKE_GENERATOR% -A x64 -DORCA_TOOLS=ON -DBBL_RELEASE_TO_PUBLIC=1 -DBBL_INTERNAL_TESTING=0 %SIG_FLAG% -DCMAKE_BUILD_TYPE=%build_type%
+    cmake .. -G %CMAKE_GENERATOR% -A %arch% -DORCA_TOOLS=ON -DBBL_RELEASE_TO_PUBLIC=1 -DBBL_INTERNAL_TESTING=0 %SIG_FLAG% -DBUILD_TESTS=%BUILD_TESTS% -DCMAKE_BUILD_TYPE=%build_type%
     if errorlevel 1 exit /b 1
     cmake --build . --config %build_type% --target ALL_BUILD -- -m
     if errorlevel 1 exit /b 1
@@ -225,6 +244,11 @@ if not exist "%HOST_RUNTIME_DIR%\slicer_linux_runtime_host_abi0" (
     exit /b 1
 )
 
+if not exist "%HOST_RUNTIME_DIR%\runtime-files.sha256" (
+    echo Missing Linux runtime manifest: %HOST_RUNTIME_DIR%\runtime-files.sha256
+    exit /b 1
+)
+
 if not exist "%HOST_RUNTIME_DIR%\ca-certificates.crt" (
     echo Missing CA bundle for linux Linux runtime: %HOST_RUNTIME_DIR%\ca-certificates.crt
     exit /b 1
@@ -241,7 +265,7 @@ echo   rootfs tar:   %SLICER_LINUX_RUNTIME_ROOTFS_TAR%
 exit /b 0
 
 :copy_slicer_linux_runtime
-set "INSTALL_DIR=%WP%\%build_dir%\OrcaSlicer"
+set "INSTALL_DIR=%WP%\%build_dir%\OrcaStudio"
 set "HOST_RUNTIME_DIR=%WP%\tools\slicer_linux_runtime_host\runtime\linux-x86_64"
 
 if not defined SLICER_LINUX_RUNTIME_ROOTFS_TAR (
@@ -263,6 +287,11 @@ if not exist "%HOST_RUNTIME_DIR%\slicer_linux_runtime_host_abi1" (
 
 if not exist "%HOST_RUNTIME_DIR%\slicer_linux_runtime_host_abi0" (
     echo Missing linux host ABI0 runtime: %HOST_RUNTIME_DIR%\slicer_linux_runtime_host_abi0
+    exit /b 1
+)
+
+if not exist "%HOST_RUNTIME_DIR%\runtime-files.sha256" (
+    echo Missing Linux runtime manifest: %HOST_RUNTIME_DIR%\runtime-files.sha256
     exit /b 1
 )
 

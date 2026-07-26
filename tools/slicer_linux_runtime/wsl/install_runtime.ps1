@@ -31,6 +31,40 @@ function Get-ScriptDir {
     return (Get-Location).Path
 }
 
+
+function Resolve-WslExecutable {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:WINDIR)) {
+        $candidates += (Join-Path $env:WINDIR 'System32\wsl.exe')
+        $candidates += (Join-Path $env:WINDIR 'Sysnative\wsl.exe')
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+
+    $command = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if ($command -and -not [string]::IsNullOrWhiteSpace($command.Source) -and (Test-Path $command.Source)) {
+        return $command.Source
+    }
+
+    throw @'
+Windows Subsystem for Linux (wsl.exe) was not found.
+Open PowerShell as Administrator and run:
+  wsl --install
+Restart Windows, then verify:
+  where.exe wsl
+  wsl --status
+  wsl -l -v
+If wsl.exe is still unavailable, run:
+  dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+  dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+Then restart Windows and start OrcaStudio again.
+'@
+}
+
 function Convert-FileToLf([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or !(Test-Path $Path)) {
         return
@@ -86,7 +120,108 @@ function Resolve-DistroName([string]$Dir, [string]$Current) {
 }
 
 function Get-FileSha256([string]$Path) {
-    return (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+
+function Test-CaBundle([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or !(Test-Path $Path)) {
+        return $false
+    }
+
+    $item = Get-Item $Path
+    if ($item.Length -lt 65536) {
+        return $false
+    }
+
+    $text = [System.IO.File]::ReadAllText($Path)
+    $matches = [regex]::Matches($text, '-----BEGIN CERTIFICATE-----')
+    return $matches.Count -ge 50
+}
+
+
+function ConvertTo-NormalizedRootfsTarEntry {
+    param([AllowEmptyString()][string]$Name)
+
+    $normalized = ([string]$Name) -replace '[\r\n]+$', ''
+    while ($normalized.StartsWith('./', [System.StringComparison]::Ordinal)) {
+        $normalized = $normalized.Substring(2)
+    }
+    $normalized = $normalized.TrimStart([char[]]@('/'))
+    $normalized = $normalized.TrimEnd([char[]]@('/'))
+    return $normalized
+}
+
+function Get-RootfsTarEntryMap {
+    param(
+        [Parameter(Mandatory = $true)][string]$TarPath,
+        [Parameter(Mandatory = $true)][string]$TarExecutable
+    )
+
+    $entries = @(& $TarExecutable -tf $TarPath 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $entries.Count -eq 0) {
+        throw "Invalid or empty WSL rootfs tar: $TarPath"
+    }
+
+    $entryMap = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
+    foreach ($entry in $entries) {
+        $raw = [string]$entry
+        $normalized = ConvertTo-NormalizedRootfsTarEntry $raw
+        if (-not [string]::IsNullOrWhiteSpace($normalized) -and -not $entryMap.ContainsKey($normalized)) {
+            $entryMap.Add($normalized, $raw)
+        }
+    }
+    return ,$entryMap
+}
+
+function Repair-CaBundleFromRootFs([string]$Dir) {
+    $caPath = Join-Path $Dir 'ca-certificates.crt'
+    if (Test-CaBundle $caPath) {
+        return
+    }
+
+    $rootFsPath = Join-Path $Dir 'windows-wsl2-rootfs.tar'
+    if (!(Test-Path $rootFsPath)) {
+        throw 'CA bundle is missing or invalid and windows-wsl2-rootfs.tar is unavailable for recovery'
+    }
+
+    $tarCommand = Get-Command tar.exe -ErrorAction SilentlyContinue
+    if (-not $tarCommand) {
+        $tarCommand = Get-Command tar -ErrorAction SilentlyContinue
+    }
+    if (-not $tarCommand) {
+        throw 'CA bundle is missing or invalid and tar is unavailable for recovery'
+    }
+
+    $entryMap = Get-RootfsTarEntryMap -TarPath $rootFsPath -TarExecutable $tarCommand.Source
+    $caEntryName = 'etc/ssl/certs/ca-certificates.crt'
+    if (-not $entryMap.ContainsKey($caEntryName)) {
+        throw 'The bundled WSL rootfs does not contain the CA certificate bundle entry'
+    }
+
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('orcastudio-ca-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    try {
+        $rawEntry = $entryMap[$caEntryName]
+        & $tarCommand.Source -xf $rootFsPath -C $tempDir $rawEntry 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract CA certificate bundle member: $rawEntry"
+        }
+
+        $recovered = Join-Path $tempDir 'etc/ssl/certs/ca-certificates.crt'
+        if (!(Test-CaBundle $recovered)) {
+            throw 'The bundled WSL rootfs does not contain a valid CA certificate bundle'
+        }
+
+        Copy-Item -Force $recovered $caPath
+        Write-Host "Recovered CA bundle from windows-wsl2-rootfs.tar: $caPath"
+    } finally {
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempDir
+    }
+
+    if (!(Test-CaBundle $caPath)) {
+        throw 'Failed to recover a valid CA certificate bundle'
+    }
 }
 
 function Get-RootFsHashMarkerPath([string]$Dir) {
@@ -190,12 +325,13 @@ function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList) {
     $stdoutPath = [System.IO.Path]::GetTempFileName()
     $stderrPath = [System.IO.Path]::GetTempFileName()
     try {
-        $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -WindowStyle Hidden
+        & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
+        $exitCode = $LASTEXITCODE
         $stdoutText = if (Test-Path $stdoutPath) { Normalize-NativeText (Read-TextAuto $stdoutPath) } else { '' }
         $stderrText = if (Test-Path $stderrPath) { Normalize-NativeText (Read-TextAuto $stderrPath) } else { '' }
         $combined = (($stdoutText + "`n" + $stderrText).Trim())
         return @{
-            ExitCode = $proc.ExitCode
+            ExitCode = $exitCode
             StdOut = $stdoutText
             StdErr = $stderrText
             Combined = $combined
@@ -299,11 +435,10 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
-$script:wsl = Join-Path $env:WINDIR 'System32\wsl.exe'
-if (!(Test-Path $script:wsl)) {
-    throw 'wsl.exe not found'
-}
+$script:wsl = Resolve-WslExecutable
 $wsl = $script:wsl
+
+Repair-CaBundleFromRootFs $PackageDir
 
 if (-not $SkipCopyToComponentDir) {
     New-Item -ItemType Directory -Force -Path $ComponentDir | Out-Null
@@ -313,14 +448,16 @@ if (-not $SkipCopyToComponentDir) {
         'slicer_linux_runtime_host',
         'slicer_linux_runtime_host_abi1',
         'slicer_linux_runtime_host_abi0',
+        'slicer_linux_auth_browser',
+        'run_auth_browser.sh',
         'slicer_linux_runtime_wsl_distro.txt',
         'slicer_linux_runtime_component_dir.txt',
-        'slicer_linux_runtime_wsl_run_host.sh',
         'slicer_linux_runtime_wsl_run_host.sh',
         'install_runtime.ps1',
         'install_runtime.cmd',
         'verify_runtime.ps1',
         'windows-wsl2-rootfs.tar',
+        'runtime-files.sha256',
         'README_runtime_runtime.txt',
         'assemble_windows_runtime_bundle.ps1',
         'linux_component_manifest.json',
@@ -356,15 +493,22 @@ if (-not $SkipCopyToComponentDir) {
     Write-Host "WSL distro: $DistroName"
 }
 
+if (!(Test-CaBundle (Join-Path $PackageDir 'ca-certificates.crt'))) {
+    throw 'Invalid CA certificate bundle: ca-certificates.crt'
+}
+
 $requiredFiles = @(
     'slicer_linux_runtime.dll',
     'slicer_linux_runtime_host',
     'slicer_linux_runtime_host_abi1',
     'slicer_linux_runtime_host_abi0',
+    'slicer_linux_auth_browser',
+    'run_auth_browser.sh',
     'slicer_linux_runtime_wsl_distro.txt',
     'install_runtime.ps1',
     'verify_runtime.ps1',
     'windows-wsl2-rootfs.tar',
+    'runtime-files.sha256',
     'ca-certificates.crt',
     'slicer_base64.cer'
 )
@@ -377,7 +521,6 @@ foreach ($name in $requiredFiles) {
 }
 
 $bootstrapPath = Join-Path $PackageDir 'slicer_linux_runtime_wsl_run_host.sh'
-if (!(Test-Path $bootstrapPath)) { $bootstrapPath = Join-Path $PackageDir 'slicer_linux_runtime_wsl_run_host.sh' }
 if (!(Test-Path $bootstrapPath)) {
     throw 'Missing package file: slicer_linux_runtime_wsl_run_host.sh'
 }
@@ -465,9 +608,9 @@ $verifyArgs = @(
     '-File', (Join-Path $PackageDir 'verify_runtime.ps1'),
     '-PackageDir', $PackageDir,
     '-DistroName', $DistroName,
+    '-InstallDir', $InstallDir,
     '-ComponentCacheDir', $ComponentCacheDir,
-    '-AllowMissingComponent',
-    '-SkipProbe'
+    '-AllowMissingComponent'
 )
 
 $verifyShell = $null

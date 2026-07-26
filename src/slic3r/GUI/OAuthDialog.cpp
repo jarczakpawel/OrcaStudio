@@ -61,7 +61,7 @@ bool OAuthDialog::Show(bool show)
         replace_job(*m_worker, std::move(job));
 
         // Open login URL in external browser
-        wxLaunchDefaultBrowser(_params.login_url);
+        wxGetApp().open_browser_with_warning_dialog(_params.login_url);
     }
 
     return DPIDialog::Show(show);

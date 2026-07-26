@@ -49,6 +49,7 @@ LaunchSpec build_default_launch_spec()
     spec.argv = {host_path.string()};
     spec.env = {
         {"SLICER_LINUX_RUNTIME_COMPONENT_DIR", component_dir.string()},
+        {"SLICER_LINUX_RUNTIME_CA_BUNDLE", (component_dir / "ca-certificates.crt").string()},
         {"SLICER_LINUX_RUNTIME_COMPONENT_SO", (component_dir / linux_component_library_name()).string()},
         {"SLICER_LINUX_RUNTIME_SOURCE_SO", (component_dir / linux_source_library_name()).string()}
     };

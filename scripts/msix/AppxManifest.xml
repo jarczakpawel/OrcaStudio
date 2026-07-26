@@ -11,10 +11,10 @@
   <Identity Name="@MSIX_IDENTITY_NAME@"
             Publisher="@MSIX_PUBLISHER@"
             Version="@MSIX_VERSION@"
-            ProcessorArchitecture="x64" />
+            ProcessorArchitecture="@MSIX_ARCH@" />
 
   <Properties>
-    <DisplayName>BambuStudio</DisplayName>
+    <DisplayName>OrcaStudio</DisplayName>
     <PublisherDisplayName>@MSIX_PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <!-- Keep config in the real %APPDATA%\OrcaSlicer so it survives uninstall and
@@ -38,16 +38,16 @@
   </Resources>
 
   <Applications>
-    <Application Id="BambuStudio" Executable="bambu-studio.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="OrcaStudio" Executable="OrcaStudio.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="BambuStudio"
-        Description="Open-source BambuStudio slicer build for FDM 3D printers"
+        DisplayName="OrcaStudio"
+        Description="Open-source OrcaStudio slicer for FDM 3D printers"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png" />
       <Extensions>
         <uap:Extension Category="windows.fileTypeAssociation">
-          <uap:FileTypeAssociation Name="bambustudio-models">
+          <uap:FileTypeAssociation Name="orcastudio-models">
             <uap:SupportedFileTypes>
               <uap:FileType>.3mf</uap:FileType>
               <uap:FileType>.stl</uap:FileType>

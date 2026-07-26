@@ -62,13 +62,13 @@ private:
     int                                 timeout_count = 0;
     int                                 m_connect_try_times = 0;
     bool                                m_is_in_sending_mode{ false };
-    bool                                m_auto_retry_0500_409d_used{ false };
     bool                                m_is_auto_retry_0500_409d_invoke{ false };
     bool                                m_auto_retry_0500_409d_pending{ false };
-    int                                 m_auto_retry_0500_409d_round{ 0 };
+    bool                                m_auto_retry_0500_409d_exhausted{ false };
+    int                                 m_auto_retry_0500_409d_attempts{ 0 };
+    int                                 m_auto_retry_0500_409d_ready_checks{ 0 };
     int                                 m_auto_retry_0500_409d_wait_left{ 0 };
     std::string                         m_auto_retry_0500_409d_dev_id;
-    std::chrono::system_clock::time_point m_auto_retry_0500_409d_update_time{};
     std::unique_ptr<wxTimer>            m_auto_retry_0500_409d_timer{ nullptr };
     bool                                m_is_rename_mode{ false };
     bool                                enable_prepare_mode{ true };

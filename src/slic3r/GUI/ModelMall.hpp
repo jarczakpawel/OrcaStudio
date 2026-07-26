@@ -15,6 +15,8 @@
 #include <wx/image.h>
 #include <wx/icon.h>
 #include <wx/dialog.h>
+#include <wx/timer.h>
+#include <nlohmann/json.hpp>
 
 #if wxUSE_WEBVIEW_IE
 #include "wx/msw/webview_ie.h"
@@ -52,15 +54,23 @@ namespace Slic3r { namespace GUI {
         void on_show(wxShowEvent& event);
         void on_back(wxMouseEvent& evt);
         void on_forward(wxMouseEvent& evt);
-        void go_to_url(wxString url);
+        void go_to_url(wxString url, bool bind_ticket = false);
         void show_control(bool show);
         void go_to_mall(wxString url);
         void go_to_publish(wxString url);
         void on_refresh(wxMouseEvent& evt);
+        void on_linux_browser_timer(wxTimerEvent& evt);
+        void on_linux_viewer_navigation(wxWebViewEvent& evt);
+        void on_linux_viewer_new_window(wxWebViewEvent& evt);
+        bool send_linux_browser_command(const nlohmann::json& command);
+        void stop_linux_browser();
     public:
         wxPanel* m_web_control_panel{nullptr};
         wxWebView* m_browser{nullptr};
         wxString m_url;
+        wxTimer m_linux_browser_timer;
+        bool m_linux_browser_active{false};
+        int m_linux_viewer_port{0};
     };
 
 }} // namespace Slic3r::GUI

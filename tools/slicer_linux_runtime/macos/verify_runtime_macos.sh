@@ -62,10 +62,10 @@ normalize_component_cache_dir() {
 
 COMPONENT_CACHE_DIR=$(normalize_component_cache_dir "$COMPONENT_CACHE_DIR")
 
-APP_SUPPORT_DIR="$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime"
+APP_SUPPORT_DIR="${SLICER_LINUX_RUNTIME_MAC_APP_SUPPORT_DIR:-$HOME/Library/Application Support/BambuStudio_OrcaSlicer/slicer-linux-runtime}"
 RUNTIME_DIR="${SLICER_LINUX_RUNTIME_MAC_RUNTIME_DIR:-$APP_SUPPORT_DIR/runtime}"
 LOG_DIR="$APP_SUPPORT_DIR/logs"
-INSTALL_VERSION="SLICER-LINUX-RUNTIME-MAC-0.16"
+INSTALL_VERSION="SLICER-LINUX-RUNTIME-MAC-0.34-BAMBU-NETWORK-ROSETTA-SPLITLOCK-V21"
 INSTALL_VERSION_FILE="$APP_SUPPORT_DIR/install_version.txt"
 PROBE_MARKER_FILE="$APP_SUPPORT_DIR/component_probe_marker.txt"
 mkdir -p "$APP_SUPPORT_DIR" "$LOG_DIR"
@@ -82,7 +82,23 @@ trim_file() {
     if [[ ! -f "$path" ]]; then
         return 1
     fi
-    LC_ALL=C tr -d '\r' < "$path" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    LC_ALL=C awk 'NR == 1 { gsub(/\r/, ""); sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print }' "$path"
+}
+
+validate_ca_bundle() {
+    local path="$1"
+    local label="${2:-$path}"
+    local size certs
+    if [[ ! -f "$path" ]]; then
+        echo "missing CA certificate bundle: $label" >&2
+        return 1
+    fi
+    size=$(wc -c < "$path" | tr -d '[:space:]')
+    certs=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$path" 2>/dev/null || true)
+    if [[ -z "$size" || "$size" -lt 65536 || "$certs" -lt 50 ]]; then
+        echo "invalid CA certificate bundle: $label (bytes=${size:-0}, certificates=${certs:-0})" >&2
+        return 1
+    fi
 }
 
 find_limactl() {
@@ -117,6 +133,28 @@ require_file() {
     fi
 }
 
+validate_runtime_manifest() {
+    local dir="$1"
+    require_file "$dir/runtime-files.sha256" "$dir/runtime-files.sha256"
+    if grep -Eq '^[0-9a-fA-F]{64}  \.' "$dir/runtime-files.sha256"; then
+        echo "runtime manifest contains transient hidden state" >&2
+        return 1
+    fi
+    if grep -Eq '^[0-9a-fA-F]{64}  runtime-files\.sha256$' "$dir/runtime-files.sha256"; then
+        echo "runtime manifest must not contain itself" >&2
+        return 1
+    fi
+    if ! awk '
+        !/^[0-9a-fA-F]{64}  [^\/]+$/ { exit 1 }
+        { count++ }
+        END { if (count < 10) exit 1 }
+    ' "$dir/runtime-files.sha256"; then
+        echo "invalid runtime manifest: $dir/runtime-files.sha256" >&2
+        return 1
+    fi
+    (cd "$dir" && shasum -a 256 -c runtime-files.sha256 >/dev/null)
+}
+
 compare_file() {
     local src="$1"
     local dst="$2"
@@ -131,13 +169,28 @@ compare_file() {
     fi
 }
 
+atomic_copy_file() {
+    local src="$1"
+    local dst="$2"
+    local dir base tmp
+    dir=$(dirname -- "$dst")
+    base=$(basename -- "$dst")
+    mkdir -p "$dir"
+    tmp=$(mktemp "$dir/.${base}.tmp.XXXXXX")
+    if ! cp -f "$src" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$dst"
+}
+
 compare_copied_payload() {
     local path base
     for path in "$COMPONENT_DIR"/*; do
         [[ -f "$path" ]] || continue
         base=$(basename -- "$path")
         case "$base" in
-            slicer_linux_runtime_host|slicer_linux_runtime_host_abi1|slicer_linux_runtime_host_abi0|libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|ca-certificates.crt|slicer_base64.cer|ld-linux-x86-64.so.2|lib*.so|lib*.so.*|*.so|*.so.*)
+            slicer_linux_runtime_host|slicer_linux_runtime_host_abi1|slicer_linux_runtime_host_abi0|slicer_linux_auth_browser|slicer_linux_auth_browser_x86_64|slicer_linux_auth_browser_aarch64|run_auth_browser.sh|libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|runtime-files.sha256|ca-certificates.crt|slicer_base64.cer|ld-linux-x86-64.so.2|lib*.so|lib*.so.*|*.so|*.so.*)
                 compare_file "$path" "$RUNTIME_DIR/$base" "$base"
                 ;;
         esac
@@ -154,9 +207,9 @@ sync_payload_files_from_dir() {
         [[ -f "$path" ]] || continue
         base=$(basename -- "$path")
         case "$base" in
-            slicer_linux_runtime_host|slicer_linux_runtime_host_abi1|slicer_linux_runtime_host_abi0|libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|ca-certificates.crt|slicer_base64.cer|ld-linux-x86-64.so.2|lib*.so|lib*.so.*|*.so|*.so.*)
+            slicer_linux_runtime_host|slicer_linux_runtime_host_abi1|slicer_linux_runtime_host_abi0|slicer_linux_auth_browser|slicer_linux_auth_browser_x86_64|slicer_linux_auth_browser_aarch64|run_auth_browser.sh|libbambu_networking.so|libBambuSource.so|linux_component_manifest.json|runtime-files.sha256|ca-certificates.crt|slicer_base64.cer|ld-linux-x86-64.so.2|lib*.so|lib*.so.*|*.so|*.so.*)
                 if [[ ! -f "$RUNTIME_DIR/$base" ]] || ! cmp -s "$path" "$RUNTIME_DIR/$base"; then
-                    cp -f "$path" "$RUNTIME_DIR/$base"
+                    atomic_copy_file "$path" "$RUNTIME_DIR/$base"
                 fi
                 ;;
         esac
@@ -172,32 +225,55 @@ sync_runtime_payload() {
     if [[ -n "$COMPONENT_CACHE_DIR" && "$COMPONENT_CACHE_DIR" != "$COMPONENT_DIR" ]]; then
         sync_payload_files_from_dir "$COMPONENT_CACHE_DIR"
     fi
-    chmod 755 "$RUNTIME_DIR/slicer_linux_runtime_host" "$RUNTIME_DIR/slicer_linux_runtime_host_abi1" "$RUNTIME_DIR/slicer_linux_runtime_host_abi0" 2>/dev/null || true
+    chmod 755 "$RUNTIME_DIR/slicer_linux_runtime_host" \
+        "$RUNTIME_DIR/slicer_linux_runtime_host_abi1" \
+        "$RUNTIME_DIR/slicer_linux_runtime_host_abi0" \
+        "$RUNTIME_DIR/slicer_linux_auth_browser" \
+        "$RUNTIME_DIR/slicer_linux_auth_browser_x86_64" \
+        "$RUNTIME_DIR/slicer_linux_auth_browser_aarch64" \
+        "$RUNTIME_DIR/run_auth_browser.sh" 2>/dev/null || true
     [[ ! -f "$RUNTIME_DIR/ld-linux-x86-64.so.2" ]] || chmod 755 "$RUNTIME_DIR/ld-linux-x86-64.so.2"
     chmod 755 "$RUNTIME_DIR"/*.so "$RUNTIME_DIR"/*.so.* 2>/dev/null || true
 }
 
-runtime_host_env_prefix() {
-    printf '%s' "export SLICER_LINUX_RUNTIME_COMPONENT_DIR=$(shell_quote "$RUNTIME_DIR"); "
-    printf '%s' "export SLICER_LINUX_RUNTIME_COMPONENT_SO=$(shell_quote "$RUNTIME_DIR/libbambu_networking.so"); "
-    printf '%s' "export SLICER_LINUX_RUNTIME_SOURCE_SO=$(shell_quote "$RUNTIME_DIR/libBambuSource.so"); "
-    printf '%s' "export SLICER_LINUX_RUNTIME_MEDIA_SO=$(shell_quote "$RUNTIME_DIR/liblive555.so"); "
-    printf '%s' "export SLICER_LINUX_RUNTIME_PROBE_LOG_DIR=$(shell_quote "$LOG_DIR"); "
-    printf '%s' "export SLICER_LINUX_RUNTIME_COUNTRY_CODE=PL; "
-    printf '%s' "unset LD_LIBRARY_PATH; "
-    printf '%s' "if [ -f $(shell_quote "$RUNTIME_DIR/ca-certificates.crt") ]; then export SSL_CERT_FILE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); export CURL_CA_BUNDLE=$(shell_quote "$RUNTIME_DIR/ca-certificates.crt"); fi; "
+
+guest_auth_browser_path() {
+    local guest_arch
+    local guest_arch_output=""
+    guest_arch_output=$("$LIMACTL" shell "$INSTANCE" -- uname -m)
+    guest_arch=$(LC_ALL=C awk 'NR == 1 { gsub(/\r/, ""); print }' <<< "$guest_arch_output")
+    case "$guest_arch" in
+        aarch64|arm64) printf '%s\n' "$RUNTIME_DIR/slicer_linux_auth_browser_aarch64" ;;
+        x86_64|amd64) printf '%s\n' "$RUNTIME_DIR/slicer_linux_auth_browser_x86_64" ;;
+        *) echo "unsupported Lima guest architecture: ${guest_arch:-unknown}" >&2; return 1 ;;
+    esac
 }
 
 probe_linux_payload() {
-    local cmd
-    cmd="$(runtime_host_env_prefix) exec /bin/sh $(shell_quote "$RUNTIME_DIR/slicer_linux_runtime_host") --probe-load"
-    "$LIMACTL" shell "$INSTANCE" -- /bin/sh -lc "$cmd"
+    local wrapper="$COMPONENT_DIR/slicer-linux-runtime-host-wrapper"
+    local host="$RUNTIME_DIR/slicer_linux_runtime_host"
+    if [[ ! -x "$wrapper" ]]; then
+        echo "macOS runtime bridge wrapper is missing: $wrapper" >&2
+        return 1
+    fi
 
-    local out
-    cmd="$(runtime_host_env_prefix) exec /bin/sh $(shell_quote "$RUNTIME_DIR/slicer_linux_runtime_host") --probe-stdio-roundtrip"
-    out=$(printf x | "$LIMACTL" shell "$INSTANCE" -- /bin/sh -lc "$cmd")
+    local out=""
+    local rc=0
+    set +e
+    out=$(printf x | \
+        SLICER_LINUX_RUNTIME_REQUIRE_COMPATIBLE_HOST=1 \
+        SLICER_LINUX_RUNTIME_MAC_APP_SUPPORT_DIR="$APP_SUPPORT_DIR" \
+        SLICER_LINUX_RUNTIME_MAC_RUNTIME_DIR="$RUNTIME_DIR" \
+        SLICER_LINUX_RUNTIME_MAC_LIMA_INSTANCE="$INSTANCE" \
+            "$wrapper" "$host" "$RUNTIME_DIR" "$COMPONENT_DIR" --probe-stdio-roundtrip)
+    rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+        echo "runtime plug-in compatibility/stdio transaction failed: rc=$rc" >&2
+        return 1
+    fi
     if [[ "$out" != "SLICER_RUNTIME_STDIO_OK" ]]; then
-        echo "runtime stdio roundtrip probe failed: ${out:-<empty>}" >&2
+        echo "runtime plug-in load/stdio transaction failed: ${out:-<empty>}" >&2
         return 1
     fi
 }
@@ -228,7 +304,14 @@ require_file "$COMPONENT_DIR/libslicer_linux_runtime.dylib" "libslicer_linux_run
 require_file "$COMPONENT_DIR/slicer_linux_runtime_host" "slicer_linux_runtime_host"
 require_file "$COMPONENT_DIR/slicer_linux_runtime_host_abi1" "slicer_linux_runtime_host_abi1"
 require_file "$COMPONENT_DIR/slicer_linux_runtime_host_abi0" "slicer_linux_runtime_host_abi0"
+require_file "$COMPONENT_DIR/liborcastudio_rosetta_splitlock_compat.so" "liborcastudio_rosetta_splitlock_compat.so"
+require_file "$COMPONENT_DIR/slicer_linux_auth_browser" "slicer_linux_auth_browser"
+require_file "$COMPONENT_DIR/slicer_linux_auth_browser_x86_64" "slicer_linux_auth_browser_x86_64"
+require_file "$COMPONENT_DIR/slicer_linux_auth_browser_aarch64" "slicer_linux_auth_browser_aarch64"
+require_file "$COMPONENT_DIR/run_auth_browser.sh" "run_auth_browser.sh"
 require_file "$COMPONENT_DIR/ca-certificates.crt" "ca-certificates.crt"
+validate_ca_bundle "$COMPONENT_DIR/ca-certificates.crt" "ca-certificates.crt"
+validate_runtime_manifest "$COMPONENT_DIR"
 require_file "$COMPONENT_DIR/slicer_base64.cer" "slicer_base64.cer"
 require_file "$COMPONENT_DIR/ld-linux-x86-64.so.2" "ld-linux-x86-64.so.2"
 require_file "$COMPONENT_DIR/libc.so.6" "libc.so.6"
@@ -263,7 +346,14 @@ fi
 require_file "$RUNTIME_DIR/slicer_linux_runtime_host" "runtime/slicer_linux_runtime_host"
 require_file "$RUNTIME_DIR/slicer_linux_runtime_host_abi1" "runtime/slicer_linux_runtime_host_abi1"
 require_file "$RUNTIME_DIR/slicer_linux_runtime_host_abi0" "runtime/slicer_linux_runtime_host_abi0"
+require_file "$RUNTIME_DIR/liborcastudio_rosetta_splitlock_compat.so" "runtime/liborcastudio_rosetta_splitlock_compat.so"
+require_file "$RUNTIME_DIR/slicer_linux_auth_browser" "runtime/slicer_linux_auth_browser"
+require_file "$RUNTIME_DIR/slicer_linux_auth_browser_x86_64" "runtime/slicer_linux_auth_browser_x86_64"
+require_file "$RUNTIME_DIR/slicer_linux_auth_browser_aarch64" "runtime/slicer_linux_auth_browser_aarch64"
+require_file "$RUNTIME_DIR/run_auth_browser.sh" "runtime/run_auth_browser.sh"
 require_file "$RUNTIME_DIR/ca-certificates.crt" "runtime/ca-certificates.crt"
+validate_ca_bundle "$RUNTIME_DIR/ca-certificates.crt" "runtime/ca-certificates.crt"
+validate_runtime_manifest "$RUNTIME_DIR"
 require_file "$RUNTIME_DIR/slicer_base64.cer" "runtime/slicer_base64.cer"
 require_file "$RUNTIME_DIR/ld-linux-x86-64.so.2" "runtime/ld-linux-x86-64.so.2"
 require_file "$RUNTIME_DIR/libc.so.6" "runtime/libc.so.6"
@@ -292,9 +382,27 @@ if [[ -z "$INSTANCE" ]]; then
     exit 1
 fi
 
-if ! "$LIMACTL" shell "$INSTANCE" -- /usr/bin/env true >/dev/null 2>&1; then
+if ! "$LIMACTL" shell --workdir=/ "$INSTANCE" -- /usr/bin/env true >/dev/null 2>&1; then
     echo "Lima instance '$INSTANCE' is not ready" >&2
     exit 1
+fi
+
+dependency_check=$("$COMPONENT_DIR/install_runtime_macos.sh" -PrintGuestVerifier)
+if [[ "$dependency_check" != '#!/usr/bin/env bash'* ]]; then
+    echo "install_runtime_macos.sh did not emit a valid guest verifier" >&2
+    exit 1
+fi
+if ! "$LIMACTL" shell --workdir=/ "$INSTANCE" -- /bin/bash -s -- <<< "$dependency_check"; then
+    echo "Linux authentication or amd64 system-loader dependencies are missing in Lima" >&2
+    exit 1
+fi
+
+if [[ "$SKIP_PROBE" -eq 0 ]]; then
+    auth_browser=$(guest_auth_browser_path)
+    auth_probe="unset LD_LIBRARY_PATH LD_PRELOAD; $(shell_quote "$auth_browser") --probe"
+    "$LIMACTL" shell --workdir=/ "$INSTANCE" -- /bin/sh -lc "$auth_probe" >> "$LOG_DIR/auth-browser-probe.log" 2>&1
+    auth_self_test="unset LD_LIBRARY_PATH LD_PRELOAD; xvfb-run -a $(shell_quote "$auth_browser") --self-test"
+    "$LIMACTL" shell --workdir=/ "$INSTANCE" -- /bin/sh -lc "$auth_self_test" >> "$LOG_DIR/auth-browser-self-test.log" 2>&1
 fi
 
 if [[ "$COMPONENT_AVAILABLE" -eq 1 ]]; then

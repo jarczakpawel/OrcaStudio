@@ -17,6 +17,9 @@
 	"filament_flush_temp": [
 		"0"
 	],
+	"filament_flush_temp_fast": [
+		"240"
+	],
 	"hot_plate_temp": [
 		"65"
 	],

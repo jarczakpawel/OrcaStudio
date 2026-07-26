@@ -204,7 +204,7 @@ void open_ms_store_product_page()
     if (fn(&length, family_name.data()) != ERROR_SUCCESS)
         return;
     family_name.resize(length > 0 ? length - 1 : 0); // drop the terminating null
-    wxLaunchDefaultBrowser(wxString(L"ms-windows-store://pdp/?PFN=") + family_name.c_str());
+    wxGetApp().open_browser_with_warning_dialog(wxString(L"ms-windows-store://pdp/?PFN=") + family_name.c_str());
 #endif
 }
 

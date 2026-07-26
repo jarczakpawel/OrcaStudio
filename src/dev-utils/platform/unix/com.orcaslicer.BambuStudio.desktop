@@ -1,8 +1,8 @@
 [Desktop Entry]
-Name=BambuStudio-OrcaSlicer
+Name=OrcaStudio
 GenericName=3D Printing Software
-Icon=BambuStudio-OrcaSlicer
-Exec=bambu-studio %U
+Icon=OrcaStudio
+Exec=orca-studio %U
 Terminal=false
 Type=Application
 PrefersNonDefaultGPU=true

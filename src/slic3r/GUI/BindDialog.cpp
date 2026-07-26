@@ -35,10 +35,10 @@ wxString get_fail_reason(int code)
         return _L("Failed to publish login request");
 
     else if (code == BAMBU_NETWORK_ERR_BIND_GET_PRINTER_TICKET_TIMEOUT)
-        return _L("Get ticket from device timeout");
+        return _L("Timeout getting ticket from device");
 
     else if (code == BAMBU_NETWORK_ERR_BIND_GET_CLOUD_TICKET_TIMEOUT)
-        return _L("Get ticket from server timeout");
+        return _L("Timeout getting ticket from server");
 
     else if (code == BAMBU_NETWORK_ERR_BIND_POST_TICKET_TO_CLOUD_FAILED)
         return _L("Failed to post ticket to server");
@@ -478,7 +478,7 @@ PingCodeBindDialog::~PingCodeBindDialog() {
          else{
              url = "https://www.bambulab.com/policies/privacy";
          }
-         wxLaunchDefaultBrowser(url);
+         wxGetApp().open_browser_with_warning_dialog(url);
      });
 
      sizere_notice_agreement->Add(0, 0, 0, wxTOP, FromDIP(4));
@@ -590,7 +590,7 @@ PingCodeBindDialog::~PingCodeBindDialog() {
      sizer_error_code->Add(m_st_txt_error_code, 0, wxALL, 0);
 
 
-     auto st_title_error_desc = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, wxT("Error desc"));
+     auto st_title_error_desc = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, _L("Error desc"));
      auto st_title_error_desc_doc = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, ": ");
      m_st_txt_error_desc = new Label(m_sw_bind_failed_info, wxEmptyString);
      st_title_error_desc->SetForegroundColour(0x909090);
@@ -607,7 +607,7 @@ PingCodeBindDialog::~PingCodeBindDialog() {
      sizer_error_desc->Add(st_title_error_desc_doc, 0, wxALL, 0);
      sizer_error_desc->Add(m_st_txt_error_desc, 0, wxALL, 0);
 
-     auto st_title_extra_info = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, wxT("Extra info"));
+     auto st_title_extra_info = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, _L("Extra info"));
      auto st_title_extra_info_doc = new wxStaticText(m_sw_bind_failed_info, wxID_ANY, ": ");
      m_st_txt_extra_info = new Label(m_sw_bind_failed_info, wxEmptyString);
      st_title_extra_info->SetForegroundColour(0x909090);
@@ -813,7 +813,7 @@ PingCodeBindDialog::~PingCodeBindDialog() {
 
      m_simplebook->SetSelection(0);
      auto m_bind_job = std::make_unique<BindJob>(
-        m_machine_info->get_dev_id(), m_machine_info->get_dev_ip(), m_machine_info->bind_sec_link, m_machine_info->bind_ssdp_version);
+        m_machine_info->get_dev_id(), m_machine_info->get_dev_ip(), m_machine_info->get_show_printer_type(), m_machine_info->bind_sec_link, m_machine_info->bind_ssdp_version);
 
      if (m_machine_info && (m_machine_info->get_printer_series() == PrinterSeries::SERIES_X1)) {
          m_bind_job->set_improved(false);
@@ -877,7 +877,7 @@ void BindMachineDialog::on_show(wxShowEvent &event)
             std::string avatar_url = wxGetApp().getAgent()->get_user_avatar(provider);
             Slic3r::Http http = Slic3r::Http::get(avatar_url);
             std::string  suffix = avatar_url.substr(avatar_url.find_last_of(".") + 1);
-            http.header("accept", "image/" + suffix)
+            http.via_linux_runtime().header("accept", "image/" + suffix)
                 .on_complete([this, time = std::weak_ptr<int>(m_tocken)](std::string body, unsigned int status) {
                 if (time.expired()) return;
                 wxMemoryInputStream stream(body.data(), body.size());
@@ -1083,7 +1083,7 @@ void UnBindMachineDialog::on_show(wxShowEvent &event)
             std::string avatar_url = wxGetApp().getAgent()->get_user_avatar(provider);
             Slic3r::Http http = Slic3r::Http::get(avatar_url);
             std::string  suffix = avatar_url.substr(avatar_url.find_last_of(".") + 1);
-            http.header("accept", "image/" + suffix)
+            http.via_linux_runtime().header("accept", "image/" + suffix)
                 .on_complete([this, time = std::weak_ptr<int>(m_tocken)](std::string body, unsigned int status) {
                 if (time.expired()) return;
                 wxMemoryInputStream stream(body.data(), body.size());

@@ -3,9 +3,13 @@
 
 #include "IPrinterAgent.hpp"
 #include "ICloudServiceAgent.hpp"
+#include <atomic>
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 namespace Slic3r {
 
@@ -43,9 +47,10 @@ public:
     // Binding
     int ping_bind(std::string ping_code) override;
     int bind_detect(std::string dev_ip, std::string sec_link, detectResult& detect) override;
-    int bind(std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn) override;
+    int bind(std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn) override;
     int unbind(std::string dev_id) override;
     int request_bind_ticket(std::string* ticket) override;
+    int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback) override;
     int set_server_callback(OnServerErrFn fn) override;
 
     // Machine Selection
@@ -96,6 +101,8 @@ private:
         WasCancelledFn cancel_fn = nullptr;
         OnWaitFn wait_fn = nullptr;
         int retry_count = 0;
+        bool retry_in_flight = false;
+        std::uint64_t generation = 0;
     };
 
     int invoke_print_request_untracked(LastPrintRequestType type,
@@ -112,6 +119,14 @@ private:
     std::shared_ptr<ICloudServiceAgent> m_cloud_agent;
     mutable std::mutex m_last_print_request_mutex;
     LastPrintRequest m_last_print_request;
+    struct RetryWorker {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+
+    std::mutex m_retry_threads_mutex;
+    std::vector<RetryWorker> m_retry_workers;
+    std::atomic<bool> m_retry_shutdown{false};
 };
 
 } // namespace Slic3r

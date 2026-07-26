@@ -38,6 +38,7 @@ public:
     void SetMachineObject(MachineObject * obj);
 
     bool IsStreaming() const;
+    bool stop_for_network_reload(int timeout_ms);
 
     void ToggleStream();
 
@@ -98,6 +99,7 @@ private:
     boost::thread m_thread;
 
     bool m_streaming = false;
+    bool m_reload_barrier_done = false;
     bool m_user_triggered = false;
     int m_failed_retry = 0;
     int m_failed_code = 0;

@@ -302,8 +302,12 @@ std::shared_ptr<HttpServer::Response> HttpServer::auth_handle_request(const std:
     // ?access_token= redirect path and never sends ?ticket= here.
     const std::string ticket = url_get_param(url, "ticket");
     const std::string ticket_redirect_url = url_get_param(url, "redirect_url");
-    if (!ticket.empty() && !ticket_redirect_url.empty() &&
-        BBLNetworkPlugin::instance().get_get_my_token() != nullptr) {
+    bool has_get_my_token = false;
+    {
+        auto module_lock = BBLNetworkPlugin::lock_module_for_call();
+        has_get_my_token = BBLNetworkPlugin::instance().get_get_my_token() != nullptr;
+    }
+    if (!ticket.empty() && !ticket_redirect_url.empty() && has_get_my_token) {
         BOOST_LOG_TRIVIAL(info) << "thirdparty_login: ticket flow";
         NetworkAgent* agent = wxGetApp().getAgent();
         if (!agent) {

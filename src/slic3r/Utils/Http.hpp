@@ -92,6 +92,8 @@ public:
 	static void set_extra_headers(std::map<std::string, std::string> headers);
 	static std::map<std::string, std::string> get_extra_headers();
 
+    static void set_bambu_extra_headers(std::map<std::string, std::string> headers);
+
 	~Http();
 
 	Http(const Http &) = delete;
@@ -125,6 +127,11 @@ public:
 	// shared client for compatibility with self-signed print hosts; opt in for any
 	// request carrying authentication credentials or sensitive user data.
 	Http& tls_verify(bool enable);
+
+    // Select the Linux runtime explicitly. On Windows/macOS Bambu URLs use the
+    // runtime automatically unless native transport is forced for bootstrap.
+    Http& via_linux_runtime(bool enable = true);
+    Http& via_native_transport(bool enable = true);
 
 	Http& form_clear();
 	// Add a HTTP multipart form field

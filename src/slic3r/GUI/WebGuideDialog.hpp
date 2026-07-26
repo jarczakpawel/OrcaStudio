@@ -122,6 +122,7 @@ private:
 
     bool InstallNetplugin;
     bool network_plugin_ready {false};
+    std::string m_downloaded_plugin_version;
 
     json m_OrcaFilaList;
     std::string m_OrcaFilaLibPath;

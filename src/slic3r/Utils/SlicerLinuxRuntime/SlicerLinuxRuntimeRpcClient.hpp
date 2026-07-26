@@ -32,6 +32,7 @@ public:
     RpcBinaryReply invoke_binary(const std::string& method, const nlohmann::json& payload = nlohmann::json::object(), const std::vector<unsigned char>& request_binary = {});
     void invoke_void(const std::string& method, const nlohmann::json& payload = nlohmann::json::object());
     std::string last_error() const;
+    void shutdown();
 
 private:
     RpcClient() = default;
@@ -52,6 +53,7 @@ private:
         bool expects_binary{false};
         bool json_received{false};
         bool binary_received{false};
+        std::size_t expected_binary_size{0};
         nlohmann::json payload;
         std::vector<unsigned char> binary;
     };
@@ -60,17 +62,20 @@ private:
     bool ensure_handshake();
     bool start_locked();
     void stop();
+    void stop_locked();
     void reader_loop();
 
     mutable std::mutex m_state_mutex;
     std::mutex m_write_mutex;
-    std::unique_ptr<Proc> m_proc;
+    std::mutex m_lifecycle_mutex;
+    std::shared_ptr<Proc> m_proc;
     std::thread m_reader;
     int m_next_id{1};
     std::string m_last_error;
     std::map<int, std::shared_ptr<Pending>> m_pending;
     std::atomic<bool> m_reader_stop{false};
     bool m_handshake_ok{false};
+    bool m_reader_failed{false};
 };
 
 }

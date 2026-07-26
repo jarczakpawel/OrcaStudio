@@ -80,6 +80,7 @@ public:
     bool        task_flow_cali;
     bool        task_vibration_cali;
     bool        task_record_timelapse;
+    bool        task_timelapse_use_internal { false };
     bool        task_layer_inspect;
     bool        cloud_print_only { false };
     bool        has_sdcard { false };
@@ -88,7 +89,6 @@ public:
 
     DevStorage::SdcardState sdcard_state = DevStorage::SdcardState::NO_SDCARD;        
     bool        task_ext_change_assist { false };
-    bool        task_timelapse_use_internal { false };
 
     int         auto_bed_leveling{0};
     int         auto_flow_cali{0};
@@ -99,7 +99,7 @@ public:
         int auto_bed_levelingt,
         int auto_flow_calit,
         int auto_offset_calit,
-        int extruder_calit_manual_mode = -1)
+        int extruder_cali_manual_mode_value = -1)
     {
         task_bed_type       = bed_type;
         task_bed_leveling   = bed_leveling;
@@ -112,7 +112,7 @@ public:
         auto_bed_leveling = auto_bed_levelingt;
         auto_flow_cali = auto_flow_calit;
         auto_offset_cali = auto_offset_calit;
-        extruder_cali_manual_mode = extruder_calit_manual_mode;
+        extruder_cali_manual_mode = extruder_cali_manual_mode_value;
 
     }
 

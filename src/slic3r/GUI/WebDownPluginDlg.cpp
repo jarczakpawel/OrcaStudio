@@ -171,7 +171,7 @@ void DownPluginFrame::OnNewWindow(wxWebViewEvent &evt)
     wxString flag = " (other)";
 
     wxString NewUrl = evt.GetURL();
-    wxLaunchDefaultBrowser(NewUrl);
+    wxGetApp().open_browser_with_warning_dialog(NewUrl);
     // if (evt.GetNavigationAction() == wxWEBVIEW_NAV_ACTION_USER) { flag = " (user)"; }
     // wxLogMessage("%s", "New window; url='" + evt.GetURL() + "'" + flag);
 
@@ -310,13 +310,13 @@ void DownPluginFrame::OnScriptResponseMessage(wxCommandEvent &WXUNUSED(evt))
 int DownPluginFrame::DownloadPlugin()
 {
     return wxGetApp().download_plugin(
-        "plugins", "network_plugin.zip", [this](int status, int percent, bool &cancel) { return ShowPluginStatus(status, percent, cancel); }, nullptr);
+        "plugins", "network_plugin.zip", [this](int status, int percent, bool &cancel) { return ShowPluginStatus(status, percent, cancel); }, nullptr, &m_downloaded_plugin_version);
 }
 
 int DownPluginFrame::InstallPlugin()
 {
     return wxGetApp().install_plugin(
-        "plugins", "network_plugin.zip", [this](int status, int percent, bool &cancel) { return ShowPluginStatus(status, percent, cancel); });
+        "plugins", "network_plugin.zip", [this](int status, int percent, bool &cancel) { return ShowPluginStatus(status, percent, cancel); }, nullptr, m_downloaded_plugin_version);
 }
 
 int DownPluginFrame::ShowPluginStatus(int status, int percent, bool &cancel)

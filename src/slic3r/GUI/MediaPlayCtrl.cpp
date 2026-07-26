@@ -7,7 +7,7 @@
 #include "I18N.hpp"
 #include "MsgDialog.hpp"
 #include "DownloadProgressDialog.hpp"
-#include "slic3r/Utils/NetworkAgent.hpp"
+#include "slic3r/Utils/BBLNetworkPlugin.hpp"
 
 #include <cstring>
 
@@ -33,10 +33,10 @@ wxDEFINE_EVENT(EVT_MEDIA_CTRL_FIRST_FRAME, wxCommandEvent);
 static std::map<int, std::string> error_messages = {
     {1, L("The device cannot handle more conversations. Please retry later.")},
     {2, L("Player is malfunctioning. Please reinstall the system player.")},
-    {100, L("The player is not loaded, please click \"play\" button to retry.")},
-    {101, L("The player is not loaded, please click \"play\" button to retry.")},
-    {102, L("The player is not loaded, please click \"play\" button to retry.")},
-    {103, L("The player is not loaded, please click \"play\" button to retry.")},
+    {100, L("The player is not loaded; please click the \"play\" button to retry.")},
+    {101, L("The player is not loaded; please click the \"play\" button to retry.")},
+    {102, L("The player is not loaded; please click the \"play\" button to retry.")},
+    {103, L("The player is not loaded; please click the \"play\" button to retry.")},
     {104, L("The player is not loaded because the GStreamer GTK video sink is missing or failed to initialize.")}
 };
 
@@ -133,10 +133,7 @@ MediaPlayCtrl::MediaPlayCtrl(wxWindow *parent, BBLMediaCtrl *media_ctrl, const w
 
     m_button_play->Bind(wxEVT_COMMAND_BUTTON_CLICKED, [this](auto &e) { TogglePlay(); });
     m_button_play->Bind(wxEVT_RIGHT_UP, [this](auto & e) { m_media_ctrl->Play(); });
-    // m_label_status->Bind(wxEVT_LEFT_UP, [this](auto &e) {
-    //     auto url = wxString::Format(L"https://wiki.bambulab.com/%s/software/bambu-studio/faq/live-view", L"en");
-    //     wxLaunchDefaultBrowser(url);
-    // });
+    // Orca: live-view FAQ link binding removed (vendor URL)
 
     Bind(wxEVT_RIGHT_UP, [this](auto & e) {
         wxClipboard & c = *wxTheClipboard;
@@ -206,7 +203,7 @@ void MediaPlayCtrl::SetMachineObject(MachineObject* obj)
         m_device_busy    = obj->is_camera_busy_off();
         m_tutk_state     = obj->tutk_state;
 
-        if (DevPrinterConfigUtil::get_printer_series_str(obj->printer_type) == "series_o" && NetworkAgent::use_legacy_network) {
+        if (DevPrinterConfigUtil::get_printer_series_str(obj->printer_type) == "series_o" && BBLNetworkPlugin::instance().use_legacy_network()) {
             // Legacy plugin cannot support remote play for H2D, force using local mode
             m_remote_proto = MachineObject::LVR_None;
         }
@@ -375,7 +372,7 @@ void MediaPlayCtrl::Play()
     if (!m_remote_proto) { // not support tutk
         m_failed_code = -1;
         m_url = "bambu:///local/";
-        Stop(_L("Please enter the IP of printer to connect."));
+        Stop(_L("Please enter the IP of the printer to connect."));
         return;
     }
 
@@ -708,6 +705,45 @@ void MediaPlayCtrl::SetStatus(wxString const &msg2, bool hyperlink)
 
 bool MediaPlayCtrl::IsStreaming() const { return m_streaming; }
 
+bool MediaPlayCtrl::stop_for_network_reload(int timeout_ms)
+{
+    Stop(" ");
+    {
+        boost::unique_lock lock(m_mutex);
+        m_reload_barrier_done = false;
+        m_tasks.push_back("<stop>");
+        m_tasks.push_back("<reload>");
+        m_cond.notify_all();
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            boost::unique_lock lock(m_mutex);
+            if (m_reload_barrier_done)
+                break;
+        }
+        if (wxTheApp)
+            wxTheApp->ProcessPendingEvents();
+        wxMilliSleep(10);
+    }
+
+    {
+        boost::unique_lock lock(m_mutex);
+        if (!m_reload_barrier_done)
+            return false;
+    }
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (NetworkAgent::active_source_tunnels() == 0)
+            return true;
+        if (wxTheApp)
+            wxTheApp->ProcessPendingEvents();
+        wxMilliSleep(10);
+    }
+    return NetworkAgent::active_source_tunnels() == 0;
+}
+
 void MediaPlayCtrl::load()
 {
     m_last_state = MEDIASTATE_LOADING;
@@ -763,6 +799,8 @@ void MediaPlayCtrl::media_proc()
         else if (url == "<play>") {
             m_media_ctrl->Play();
         }
+        else if (url == "<reload>") {
+        }
         else {
             BOOST_LOG_TRIVIAL(info) <<  "MediaPlayCtrl: start load";
 #if defined(__WXMAC__) || defined(__APPLE__)
@@ -775,6 +813,11 @@ void MediaPlayCtrl::media_proc()
         }
         lock.lock();
         m_tasks.pop_front();
+        if (url == "<reload>") {
+            m_reload_barrier_done = true;
+            m_cond.notify_all();
+            continue;
+        }
         wxMediaEvent theEvent(wxEVT_MEDIA_STATECHANGED, m_media_ctrl->GetId());
         theEvent.SetId(0);
         m_media_ctrl->GetEventHandler()->AddPendingEvent(theEvent);

@@ -40,6 +40,11 @@ void EventPump::ensure_started()
     g_pump_thread = std::thread([this] { run(); });
 }
 
+void EventPump::request_stop()
+{
+    g_stop.store(true, std::memory_order_release);
+}
+
 void EventPump::stop()
 {
     std::lock_guard<std::mutex> lock(g_pump_mutex);

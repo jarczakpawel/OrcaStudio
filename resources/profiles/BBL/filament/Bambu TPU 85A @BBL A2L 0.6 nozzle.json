@@ -38,6 +38,9 @@
 	"filament_retraction_length": [
 		"1.3"
 	],
+	"filament_support_printable": [
+		"2"
+	],
 	"impact_strength_z": [
 		"88.7"
 	],

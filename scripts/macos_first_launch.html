@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OrcaStudio - macOS first launch help</title>
+  <style>
+    body { max-width: 780px; margin: 42px auto; padding: 0 24px; font: 17px/1.55 -apple-system, BlinkMacSystemFont, sans-serif; color: #1d1d1f; }
+    h1, h2 { line-height: 1.2; }
+    .box { padding: 18px 22px; border: 1px solid #d2d2d7; border-radius: 14px; background: #f5f5f7; }
+    .important { font-weight: 700; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    a { color: #06c; }
+  </style>
+</head>
+<body>
+  <h1>OrcaStudio - macOS first launch help</h1>
+
+  <p class="important">Use these steps only if OrcaStudio does not open normally.</p>
+
+  <div class="box">
+    <ol>
+      <li>Drag <strong>OrcaStudio.app</strong> to the <strong>Applications</strong> folder.</li>
+      <li>Try to open OrcaStudio normally from <strong>Applications</strong>.</li>
+      <li>If macOS blocks the app, Control-click <strong>OrcaStudio.app</strong>, choose <strong>Open</strong>, and confirm <strong>Open</strong> again.</li>
+      <li>If that option is not available, open <strong>System Settings &gt; Privacy &amp; Security</strong>, scroll to the Security section, and click <strong>Open Anyway</strong>.</li>
+    </ol>
+
+    <p>No Terminal commands are normally required. This approval should only be needed for the first launch.</p>
+  </div>
+
+  <h2>If OrcaStudio still has problems</h2>
+
+  <p>Old application data or files left by an earlier build may cause problems. Quit OrcaStudio completely, then clear its local data and try again.</p>
+
+  <div class="box">
+    <ol>
+      <li>Open <strong>Finder</strong>.</li>
+      <li>From the menu bar, choose <strong>Go &gt; Go to Folder...</strong>, or press <strong>Shift-Command-G</strong>.</li>
+      <li>Paste this path exactly, including the <code>~</code> at the beginning:</li>
+    </ol>
+
+    <p><code>~/Library/Application Support/BambuStudio_OrcaSlicer</code></p>
+
+    <ol start="4">
+      <li>Move the contents of that folder to the Trash, or rename the whole folder as a temporary backup.</li>
+      <li>Start OrcaStudio again.</li>
+    </ol>
+
+    <p>This resets OrcaStudio's local settings, login data, cached plug-ins and local runtime files. You may need to sign in again and allow OrcaStudio to reinstall its runtime.</p>
+  </div>
+
+  <p><a href="https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac">Official Apple instructions</a></p>
+</body>
+</html>

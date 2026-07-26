@@ -29,6 +29,8 @@ public:
     static int initialize_network_module(bool using_backup = false, const std::string& version = "");
     static int unload_network_module();
     static bool is_network_module_loaded();
+    static int active_source_tunnels();
+    static int active_forwarder_callbacks();
 #if defined(_MSC_VER) || defined(_WIN32)
     static HMODULE get_bambu_source_entry();
 #else
@@ -36,7 +38,6 @@ public:
 #endif
     static std::string get_version();
     static void* get_network_function(const char* name);
-    static bool use_legacy_network;
 
     static NetworkLibraryLoadError get_load_error();
     static void clear_load_error();
@@ -151,7 +152,7 @@ public:
     bool start_discovery(bool start, bool sending);
     int ping_bind(std::string ping_code);
     int bind_detect(std::string dev_ip, std::string sec_link, detectResult& detect);
-    int bind(std::string dev_ip, std::string dev_id, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn);
+    int bind(std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update_fn);
     int unbind(std::string dev_id);
     std::string get_user_selected_machine();
     int set_user_selected_machine(std::string dev_id);
@@ -168,6 +169,7 @@ public:
     FilamentSyncMode get_filament_sync_mode() const;
     bool fetch_filament_info(std::string dev_id);
     int request_bind_ticket(std::string* ticket);
+    int get_hms_snapshot(std::string dev_id, std::string file_name, std::function<void(std::string, int)> callback);
 
 private:
     struct PrinterCallbacks {

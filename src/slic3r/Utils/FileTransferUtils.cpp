@@ -1,8 +1,4 @@
-#include <wx/wx.h>
-#include <type_traits>
 #include "FileTransferUtils.hpp"
-#include "slic3r/GUI/GUI_App.hpp"
-#include "slic3r/GUI/DeviceCore/DevManager.h"
 
 namespace Slic3r {
 
@@ -35,191 +31,484 @@ FileTransferModule::FileTransferModule(ModuleHandle networking_module, int requi
     ft_job_set_msg_cb  = sym_lookup<fn_ft_job_set_msg_cb>(networking_, "ft_job_set_msg_cb");
     ft_job_try_get_msg = sym_lookup<fn_ft_job_try_get_msg>(networking_, "ft_job_try_get_msg");
     ft_job_get_msg     = sym_lookup<fn_ft_job_get_msg>(networking_, "ft_job_get_msg");
+
+    if (!ft_abi_version)
+        throw std::runtime_error("Bambu networking plugin does not export ft_abi_version");
+    const int actual_abi_version = ft_abi_version();
+    if (actual_abi_version < required_abi_version)
+        throw std::runtime_error("Bambu networking plugin file-transfer ABI is too old");
 }
 
-FileTransferTunnel::FileTransferTunnel(FileTransferModule &m, const std::string &url) : m_(&m)
+FileTransferTunnel::FileTransferTunnel(std::shared_ptr<FileTransferModule> m, const std::string &url) : m_(std::move(m))
 {
-    // Guard against missing symbols in older Bambu networking plugins.
-    // These symbols were added in a newer plugin ABI; if the installed
-    // plugin predates them, ft_tunnel_create/ft_tunnel_set_status_cb
-    // will be null and calling them crashes.
-    if (!m_->ft_tunnel_create || !m_->ft_tunnel_set_status_cb) {
-        throw std::runtime_error("Bambu networking plugin is too old: missing ft_tunnel_* symbols. "
-                                 "Please update the networking plugin.");
+    if (!m_ || !m_->ft_tunnel_create || !m_->ft_tunnel_set_status_cb) {
+        throw std::runtime_error("Bambu networking plugin is too old: missing ft_tunnel_* symbols. Please update the networking plugin.");
     }
-    FT_TunnelHandle *h{};
-    if (m_->ft_tunnel_create(url.c_str(), &h) != 0 || !h) {
+    FT_TunnelHandle *handle{};
+    if (m_->ft_tunnel_create(url.c_str(), &handle) != FT_OK || !handle)
         throw std::runtime_error("ft_tunnel_create failed");
-    }
-    h_ = h;
+    h_ = handle;
 
-    // C API: ft_status_cb(void* user, int old_status, int new_status, int err, const char* msg)
-    auto tramp = [](void *user, int old_status, int new_status, int err_code, const char *msg) noexcept {
-        auto *self    = reinterpret_cast<FileTransferTunnel *>(user);
-        self->status_ = new_status;
-        if (!self->status_cb_) return;
+    auto callback = [](void *user, int old_status, int new_status, int err_code, const char *msg) noexcept {
+        auto *self = static_cast<FileTransferTunnel *>(user);
+        if (!self)
+            return;
+        const bool deliver = self->enter_callback();
+        TunnelStatusCb fn;
+        if (deliver) {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            self->status_ = new_status;
+            fn = self->status_cb_;
+        }
         try {
-            self->status_cb_(old_status, new_status, err_code, std::string(msg ? msg : ""));
+            if (fn)
+                fn(old_status, new_status, err_code, std::string(msg ? msg : ""));
         } catch (...) {}
+        self->leave_callback();
     };
-    if (m_->ft_tunnel_set_status_cb(h_, tramp, this) == ft_err::FT_EXCEPTION) { throw std::runtime_error("ft_tunnel_set_status_cb failed"); }
+    if (m_->ft_tunnel_set_status_cb(h_, callback, this) != FT_OK) {
+        m_->ft_tunnel_release(h_);
+        h_ = nullptr;
+        throw std::runtime_error("ft_tunnel_set_status_cb failed");
+    }
+}
+
+bool FileTransferTunnel::enter_callback() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++active_callbacks_;
+    return !closing_;
+}
+
+void FileTransferTunnel::leave_callback() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_callbacks_ > 0)
+        --active_callbacks_;
+    if (closing_ && active_callbacks_ == 0)
+        callback_cv_.notify_all();
+}
+
+void FileTransferTunnel::reset() noexcept
+{
+    FT_TunnelHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_)
+            return;
+        closing_ = true;
+        handle = h_;
+        h_ = nullptr;
+        mod = m_;
+    }
+    if (handle && mod) {
+        try {
+            if (mod->ft_tunnel_set_status_cb)
+                (void) mod->ft_tunnel_set_status_cb(handle, nullptr, nullptr);
+            if (mod->ft_tunnel_shutdown)
+                (void) mod->ft_tunnel_shutdown(handle);
+            if (mod->ft_tunnel_release)
+                mod->ft_tunnel_release(handle);
+        } catch (...) {}
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    callback_cv_.wait(lock, [this] { return active_callbacks_ == 0; });
+    conn_cb_ = {};
+    status_cb_ = {};
+    m_.reset();
 }
 
 void FileTransferTunnel::start_connect()
 {
-    // C API: ft_conn_cb(void* user, int ok, int err, const char* msg)
-    auto tramp = [](void *user, int ok, int ec, const char *msg) noexcept {
-        auto *pcb = reinterpret_cast<ConnectionCb *>(user);
-        if (!pcb) return;
+    FT_TunnelHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            throw std::runtime_error("tunnel handle invalid");
+        handle = h_;
+        mod = m_;
+    }
+    auto callback = [](void *user, int ok, int ec, const char *msg) noexcept {
+        auto *self = static_cast<FileTransferTunnel *>(user);
+        if (!self)
+            return;
+        const bool deliver = self->enter_callback();
+        ConnectionCb fn;
+        if (deliver) {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            fn = self->conn_cb_;
+        }
         try {
-            (*pcb)(ok == 0, ec, std::string(msg ? msg : ""));
+            if (fn)
+                fn(ok == 0, ec, std::string(msg ? msg : ""));
         } catch (...) {}
+        self->leave_callback();
     };
-    if (m_->ft_tunnel_start_connect(h_, tramp, &conn_cb_) == ft_err::FT_EXCEPTION) { throw std::runtime_error("ft_tunnel_start_connect failed"); }
+    if (!mod || !mod->ft_tunnel_start_connect || mod->ft_tunnel_start_connect(handle, callback, this) != FT_OK)
+        throw std::runtime_error("ft_tunnel_start_connect failed");
 }
 
 bool FileTransferTunnel::sync_start_connect()
 {
-    return m_->ft_tunnel_sync_connect(h_) == FT_OK;
+    FT_TunnelHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return false;
+        handle = h_;
+        mod = m_;
+    }
+    return mod && mod->ft_tunnel_sync_connect && mod->ft_tunnel_sync_connect(handle) == FT_OK;
 }
 
-void FileTransferTunnel::on_connection(ConnectionCb cb) { conn_cb_ = std::move(cb); }
-void FileTransferTunnel::on_status(TunnelStatusCb cb) { status_cb_ = std::move(cb); }
+void FileTransferTunnel::on_connection(ConnectionCb cb)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!closing_)
+        conn_cb_ = std::move(cb);
+}
+
+void FileTransferTunnel::on_status(TunnelStatusCb cb)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!closing_)
+        status_cb_ = std::move(cb);
+}
 
 void FileTransferTunnel::shutdown()
 {
-    if (m_->ft_tunnel_shutdown) (void) m_->ft_tunnel_shutdown(h_);
+    FT_TunnelHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return;
+        handle = h_;
+        mod = m_;
+    }
+    if (mod && mod->ft_tunnel_shutdown)
+        (void) mod->ft_tunnel_shutdown(handle);
 }
 
-FileTransferJob::FileTransferJob(FileTransferModule &m, const std::string &params_json) : m_(&m)
+int FileTransferTunnel::get_status() const
 {
-    FT_JobHandle *h{};
-    if (m_->ft_job_create(params_json.c_str(), &h) != 0 || !h) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_;
+}
 
-    }
-    h_ = h;
+bool FileTransferTunnel::check_valid() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !closing_ && h_ != nullptr;
+}
 
-    // C API: ft_job_result_cb(void* user, int tunnel_err, ft_job_result result)
-    auto tramp = [](void *user, ft_job_result r) noexcept {
-        auto *self = reinterpret_cast<FileTransferJob *>(user);
-        if (!self) return;
+FT_TunnelHandle *FileTransferTunnel::native() const noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return closing_ ? nullptr : h_;
+}
 
-        try {
-            self->finished_ = true;
-            self->solve_result(r);
+FileTransferJob::FileTransferJob(std::shared_ptr<FileTransferModule> m, const std::string &params_json) : m_(std::move(m))
+{
+    if (!m_ || !m_->ft_job_create || !m_->ft_job_set_result_cb)
+        throw std::runtime_error("Bambu networking plugin is too old: missing ft_job_* symbols. Please update the networking plugin.");
 
-            if (self->result_cb_) self->result_cb_(self->res_, self->resp_ec_, self->res_json_, self->res_bin_);
-        } catch (...) {
-            // swallow
+    FT_JobHandle *handle{};
+    if (m_->ft_job_create(params_json.c_str(), &handle) != FT_OK || !handle)
+        throw std::runtime_error("ft_job_create failed");
+    h_ = handle;
+
+    auto callback = [](void *user, ft_job_result result) noexcept {
+        auto *self = static_cast<FileTransferJob *>(user);
+        if (!self)
+            return;
+        const bool deliver = self->enter_callback();
+        ResultCb fn;
+        int res = 0;
+        int resp_ec = 0;
+        std::string json;
+        std::vector<std::byte> bin;
+        std::shared_ptr<FileTransferModule> mod;
+        {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            if (deliver) {
+                self->finished_ = true;
+                self->solve_result_locked(result);
+                res = self->res_;
+                resp_ec = self->resp_ec_;
+                json = self->res_json_;
+                bin = self->res_bin_;
+                fn = self->result_cb_;
+            }
+            mod = self->m_;
         }
-
         try {
-            if (auto *mod = self ? self->m_ : nullptr) {
-                if (mod->ft_job_result_destroy)
-                    mod->ft_job_result_destroy(&r);
-                else if (mod->ft_free) {
-                    if (r.json) mod->ft_free((void *) r.json);
-                    if (r.bin) mod->ft_free((void *) r.bin);
-                }
+            if (fn)
+                fn(res, resp_ec, std::move(json), std::move(bin));
+        } catch (...) {}
+        try {
+            if (mod && mod->ft_job_result_destroy)
+                mod->ft_job_result_destroy(&result);
+            else if (mod && mod->ft_free) {
+                if (result.json)
+                    mod->ft_free(const_cast<char *>(result.json));
+                if (result.bin)
+                    mod->ft_free(const_cast<void *>(result.bin));
             }
         } catch (...) {}
+        self->leave_callback();
     };
 
-    if (m_->ft_job_set_result_cb(h_, tramp, this) == ft_err::FT_EXCEPTION) { throw std::runtime_error("ft_job_set_result_cb failed"); }
+    if (m_->ft_job_set_result_cb(h_, callback, this) != FT_OK) {
+        m_->ft_job_release(h_);
+        h_ = nullptr;
+        throw std::runtime_error("ft_job_set_result_cb failed");
+    }
 }
 
-void FileTransferJob::on_result(ResultCb cb) { result_cb_ = std::move(cb); }
+bool FileTransferJob::enter_callback() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++active_callbacks_;
+    return !closing_;
+}
+
+void FileTransferJob::leave_callback() noexcept
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_callbacks_ > 0)
+        --active_callbacks_;
+    if (closing_ && active_callbacks_ == 0)
+        callback_cv_.notify_all();
+}
+
+void FileTransferJob::reset() noexcept
+{
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_)
+            return;
+        closing_ = true;
+        handle = h_;
+        h_ = nullptr;
+        mod = m_;
+    }
+    if (handle && mod) {
+        try {
+            if (mod->ft_job_set_result_cb)
+                (void) mod->ft_job_set_result_cb(handle, nullptr, nullptr);
+            if (mod->ft_job_set_msg_cb)
+                (void) mod->ft_job_set_msg_cb(handle, nullptr, nullptr);
+            if (mod->ft_job_cancel)
+                (void) mod->ft_job_cancel(handle);
+            if (mod->ft_job_release)
+                mod->ft_job_release(handle);
+        } catch (...) {}
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    callback_cv_.wait(lock, [this] { return active_callbacks_ == 0; });
+    result_cb_ = {};
+    msg_cb_ = {};
+    m_.reset();
+}
+
+void FileTransferJob::on_result(ResultCb cb)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!closing_)
+        result_cb_ = std::move(cb);
+}
 
 bool FileTransferJob::get_result(int &ec, int &resp_ec, std::string &json, std::vector<std::byte> &bin, uint32_t timeout_ms)
 {
-    if (!h_) throw std::runtime_error("job handle invalid");
-    ft_job_result result;
-    if (m_->ft_job_get_result(h_, timeout_ms, &result) == ft_err::FT_EXCEPTION) return false;
-    solve_result(result);
-    m_->ft_job_result_destroy(&result);
-    ec = res_;
-    resp_ec = res_;
-    json    = res_json_;
-    bin     = res_bin_;
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return false;
+        handle = h_;
+        mod = m_;
+    }
+    if (!mod || !mod->ft_job_get_result)
+        return false;
+    ft_job_result result{};
+    if (mod->ft_job_get_result(handle, timeout_ms, &result) != FT_OK)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        solve_result_locked(result);
+        finished_ = true;
+        ec = res_;
+        resp_ec = resp_ec_;
+        json = res_json_;
+        bin = res_bin_;
+    }
+    if (mod->ft_job_result_destroy)
+        mod->ft_job_result_destroy(&result);
+    else if (mod->ft_free) {
+        if (result.json)
+            mod->ft_free(const_cast<char *>(result.json));
+        if (result.bin)
+            mod->ft_free(const_cast<void *>(result.bin));
+    }
     return true;
 }
 
 void FileTransferJob::start_on(FileTransferTunnel &t)
 {
-    if (!h_) throw std::runtime_error("job handle invalid");
-    if (m_->ft_tunnel_start_job(t.native(), h_) == ft_err::FT_EXCEPTION) { throw std::runtime_error("ft_tunnel_start_job failed"); }
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            throw std::runtime_error("job handle invalid");
+        handle = h_;
+        mod = m_;
+    }
+    FT_TunnelHandle *tunnel = t.native();
+    if (!tunnel || !mod || !mod->ft_tunnel_start_job || mod->ft_tunnel_start_job(tunnel, handle) != FT_OK)
+        throw std::runtime_error("ft_tunnel_start_job failed");
 }
 
 void FileTransferJob::on_msg(MsgCb cb)
 {
-    msg_cb_ = std::move(cb);
-    if (!h_) return;
-
-    // C API: ft_job_msg_cb(void* user, ft_job_msg msg)
-    auto tramp = [](void *user, ft_job_msg m) noexcept {
-        auto *self = reinterpret_cast<FileTransferJob *>(user);
-        if (!self) return;
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return;
+        msg_cb_ = std::move(cb);
+        handle = h_;
+        mod = m_;
+    }
+    auto callback = [](void *user, ft_job_msg msg) noexcept {
+        auto *self = static_cast<FileTransferJob *>(user);
+        if (!self)
+            return;
+        const bool deliver = self->enter_callback();
+        MsgCb fn;
+        std::shared_ptr<FileTransferModule> callback_mod;
+        {
+            std::lock_guard<std::mutex> lock(self->mutex_);
+            if (deliver)
+                fn = self->msg_cb_;
+            callback_mod = self->m_;
+        }
         try {
-            if (self->msg_cb_) { self->msg_cb_(m.kind, std::string(m.json ? m.json : "")); }
+            if (fn)
+                fn(msg.kind, std::string(msg.json ? msg.json : ""));
         } catch (...) {}
-
         try {
-            if (auto *mod = self->m_) {
-                if (mod->ft_job_msg_destroy)
-                    mod->ft_job_msg_destroy(&m);
-                else if (mod->ft_free && m.json)
-                    mod->ft_free((void *) m.json);
-            }
+            if (callback_mod && callback_mod->ft_job_msg_destroy)
+                callback_mod->ft_job_msg_destroy(&msg);
+            else if (callback_mod && callback_mod->ft_free && msg.json)
+                callback_mod->ft_free(const_cast<char *>(msg.json));
         } catch (...) {}
+        self->leave_callback();
     };
-
-    if (m_->ft_job_set_msg_cb(h_, tramp, this) == ft_err::FT_EXCEPTION) { throw std::runtime_error("ft_job_set_msg_cb failed"); }
+    if (!mod || !mod->ft_job_set_msg_cb || mod->ft_job_set_msg_cb(handle, callback, this) != FT_OK)
+        throw std::runtime_error("ft_job_set_msg_cb failed");
 }
 
 bool FileTransferJob::try_get_msg(int &kind, std::string &json)
 {
-    if (!h_) return false;
-    ft_job_msg m{};
-    int        rc = m_->ft_job_try_get_msg(h_, &m);
-    if (rc != 0) return false;
-
-    kind = m.kind;
-    json.assign(m.json ? m.json : "");
-
-    if (m_->ft_job_msg_destroy)
-        m_->ft_job_msg_destroy(&m);
-    else if (m_->ft_free && m.json)
-        m_->ft_free((void *) m.json);
-
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return false;
+        handle = h_;
+        mod = m_;
+    }
+    if (!mod || !mod->ft_job_try_get_msg)
+        return false;
+    ft_job_msg msg{};
+    if (mod->ft_job_try_get_msg(handle, &msg) != FT_OK)
+        return false;
+    kind = msg.kind;
+    json.assign(msg.json ? msg.json : "");
+    if (mod->ft_job_msg_destroy)
+        mod->ft_job_msg_destroy(&msg);
+    else if (mod->ft_free && msg.json)
+        mod->ft_free(const_cast<char *>(msg.json));
     return true;
 }
 
 bool FileTransferJob::get_msg(uint32_t timeout_ms, int &kind, std::string &json)
 {
-    if (!h_) return false;
-    ft_job_msg m{};
-    int        rc = m_->ft_job_get_msg(h_, timeout_ms, &m);
-    if (rc != 0) return false;
-
-    kind = m.kind;
-    json.assign(m.json ? m.json : "");
-
-    if (m_->ft_job_msg_destroy)
-        m_->ft_job_msg_destroy(&m);
-    else if (m_->ft_free && m.json)
-        m_->ft_free((void *) m.json);
-
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return false;
+        handle = h_;
+        mod = m_;
+    }
+    if (!mod || !mod->ft_job_get_msg)
+        return false;
+    ft_job_msg msg{};
+    if (mod->ft_job_get_msg(handle, timeout_ms, &msg) != FT_OK)
+        return false;
+    kind = msg.kind;
+    json.assign(msg.json ? msg.json : "");
+    if (mod->ft_job_msg_destroy)
+        mod->ft_job_msg_destroy(&msg);
+    else if (mod->ft_free && msg.json)
+        mod->ft_free(const_cast<char *>(msg.json));
     return true;
 }
 
-void FileTransferJob::solve_result(ft_job_result result)
+FT_JobHandle *FileTransferJob::native() const noexcept
 {
-    res_     = result.ec;
-    resp_ec_ = result.resp_ec;
+    std::lock_guard<std::mutex> lock(mutex_);
+    return closing_ ? nullptr : h_;
+}
 
+bool FileTransferJob::check_valid() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !closing_ && h_ != nullptr;
+}
+
+bool FileTransferJob::finished() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return finished_;
+}
+
+void FileTransferJob::cancel()
+{
+    FT_JobHandle *handle = nullptr;
+    std::shared_ptr<FileTransferModule> mod;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closing_ || !h_)
+            return;
+        handle = h_;
+        mod = m_;
+    }
+    if (mod && mod->ft_job_cancel)
+        (void) mod->ft_job_cancel(handle);
+}
+
+void FileTransferJob::solve_result_locked(const ft_job_result &result)
+{
+    res_ = result.ec;
+    resp_ec_ = result.resp_ec;
     res_bin_.clear();
-    if (result.bin && result.bin_size) res_bin_.assign(reinterpret_cast<const std::byte *>(result.bin),
-        reinterpret_cast<const std::byte *>(result.bin) + result.bin_size);
+    if (result.bin && result.bin_size) {
+        const auto *first = static_cast<const std::byte *>(result.bin);
+        res_bin_.assign(first, first + result.bin_size);
+    }
     res_json_.assign(result.json ? result.json : "");
 }
 

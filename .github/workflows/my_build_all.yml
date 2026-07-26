@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: my-build-all-${{ github.event.release.tag_name || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build_windows:
@@ -59,7 +59,7 @@ jobs:
           find release-artifacts -type f -print0 | while IFS= read -r -d '' file; do
             base="$(basename "$file")"
             case "$base" in
-              BambuStudio-OrcaSlicer_Windows_*.exe|BambuStudio-OrcaSlicer_Windows_*_portable.zip|BambuStudio-OrcaSlicer_Mac_arm64_*.dmg|BambuStudio-OrcaSlicer_Mac_x86_64_*.dmg|BambuStudio-OrcaSlicer_LinuxDir_*.tar.gz|BambuStudio-OrcaSlicer_Linux_AppImage_*.AppImage|BambuStudio-OrcaSlicer_*.deb|BambuStudio-OrcaSlicer_*.flatpak|SHA256SUMS*.txt|Debug_PDB_*.7z)
+              OrcaStudio_Windows_*.exe|OrcaStudio_Windows_*_portable.zip|OrcaStudio_Mac_arm64_*.dmg|OrcaStudio_Mac_x86_64_*.dmg|OrcaStudio_LinuxDir_*.tar.gz|OrcaStudio_Linux_AppImage_*.AppImage|OrcaStudio_*.deb|OrcaStudio_*.flatpak|SHA256SUMS*.txt|Debug_PDB_*.7z)
                 cp "$file" release-files/"$base"
                 ;;
               *)

@@ -9,6 +9,8 @@ get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
+find_package(ZLIB REQUIRED)
 find_package(nlohmann_json CONFIG QUIET)
 
 set(HOST_SOURCES
@@ -39,9 +41,14 @@ function(add_host_variant target_name abi_value)
     if (TARGET nlohmann_json::nlohmann_json)
         target_link_libraries(${target_name} PRIVATE nlohmann_json::nlohmann_json)
     endif()
+    # Keep static archive consumers after libcurl. The dependency order matters
+    # with GNU ld and lld when CURL::libcurl points at libcurl.a.
     target_link_libraries(${target_name} PRIVATE
-        Threads::Threads
+        CURL::libcurl
+        ZLIB::ZLIB
+        OpenSSL::SSL
         OpenSSL::Crypto
+        Threads::Threads
         ${CMAKE_DL_LIBS}
     )
 endfunction()
@@ -49,3 +56,9 @@ endfunction()
 add_host_variant(slicer_linux_runtime_host_abi1 1)
 add_host_variant(slicer_linux_runtime_host_abi0 0)
 add_custom_target(slicer_linux_runtime_host DEPENDS slicer_linux_runtime_host_abi1 slicer_linux_runtime_host_abi0)
+
+option(SLICER_LINUX_RUNTIME_BUILD_AUTH_BROWSER "Build the WebKitGTK Linux authentication browser" ON)
+if (SLICER_LINUX_RUNTIME_BUILD_AUTH_BROWSER)
+    add_subdirectory("${REPO_ROOT}/tools/slicer_linux_auth_helper" "${CMAKE_BINARY_DIR}/slicer_linux_auth_helper")
+    add_dependencies(slicer_linux_runtime_host slicer_linux_auth_browser)
+endif()

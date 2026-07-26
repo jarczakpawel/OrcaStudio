@@ -39,7 +39,7 @@ static void start_new_slicer_or_gcodeviewer(const NewSlicerInstanceType instance
 	wxString path;
 	wxFileName::SplitPath(wxStandardPaths::Get().GetExecutablePath(), &path, nullptr, nullptr, wxPATH_NATIVE);
 	path += "\\";
-	path += (instance_type == NewSlicerInstanceType::Slicer) ? "bambu-studio.exe" : "bambu-gcodeviewer.exe";
+	path += (instance_type == NewSlicerInstanceType::Slicer) ? "OrcaStudio.exe" : "bambu-gcodeviewer.exe";
 	std::vector<const wchar_t*> args;
 	args.reserve(4);
 	args.emplace_back(path.wc_str());

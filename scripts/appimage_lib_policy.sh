@@ -8,7 +8,7 @@ appimage_is_host_library() {
 
     case "$lib_name" in
         linux-vdso.so.*|linux-gate.so.*|ld-linux*.so*|ld64.so*|ld-musl-*.so*|libc.so*|libpthread.so*|libm.so*|libdl.so*|librt.so*|libresolv.so*|libutil.so*|libanl.so*|libnsl.so*|libBrokenLocale.so*|libcrypt.so*|libnss_*.so*|\
-        libGL.so*|libOpenGL.so*|libGLX*.so*|libEGL.so*|libGLES*.so*|libGLdispatch.so*|libdrm.so*|libdrm_*.so*|libgbm.so*|libwayland-*.so*|libxcb*.so*|libX11.so*|libX11-xcb.so*|libXau.so*|libXdmcp.so*|libXext.so*|libXdamage.so*|libXfixes.so*|libXcomposite.so*|libXrender.so*|libXrandr.so*|libXcursor.so*|libXi.so*|libXinerama.so*|libxshmfence.so*|libxkbcommon.so*|libxkbcommon-x11.so*|libSM.so*|libICE.so*|libudev.so*|libasound.so*|libpulse.so*|libpulsecommon*.so*|libjack.so*|libpipewire-*.so*|libvulkan.so*|libva.so*|libva-*.so*|\
+        libGL.so*|libOpenGL.so*|libGLX*.so*|libGLU.so*|libEGL.so*|libGLES*.so*|libGLdispatch.so*|libdrm.so*|libdrm_*.so*|libgbm.so*|libwayland-*.so*|libxcb*.so*|libX11.so*|libX11-xcb.so*|libXau.so*|libXdmcp.so*|libXext.so*|libXdamage.so*|libXfixes.so*|libXcomposite.so*|libXrender.so*|libXrandr.so*|libXcursor.so*|libXi.so*|libXinerama.so*|libxshmfence.so*|libxkbcommon.so*|libxkbcommon-x11.so*|libSM.so*|libICE.so*|libudev.so*|libasound.so*|libpulse.so*|libpulsecommon*.so*|libjack.so*|libpipewire-*.so*|libvulkan.so*|libva.so*|libva-*.so*|\
         libgtk-*.so*|libgdk-*.so*|libpango*.so*|libatk-bridge-*.so*|libatk*.so*|libatspi.so*|libcairo*.so*|libgdk_pixbuf-*.so*|libgio-2.0.so*|libgmodule-2.0.so*|libgobject-2.0.so*|libglib-2.0.so*|\
         libgstreamer-1.0.so*|libgst*.so*|libsoup-*.so*|libwebkit2gtk-*.so*|libjavascriptcoregtk-*.so*|libsecret-1.so*|libmanette-0.2.so*|libenchant-2.so*|libhyphen.so*|libtasn1.so*|\
         libfontconfig.so*|libfreetype.so*|libharfbuzz*.so*|libfribidi.so*|libgraphite2.so*|libthai.so*|libdatrie.so*|libepoxy.so*|libpixman-1.so*|\
@@ -24,31 +24,6 @@ appimage_is_host_library() {
 
 appimage_is_elf_file() {
     file -b "$1" 2>/dev/null | grep -q '^ELF '
-}
-
-
-appimage_find_library_in_paths() {
-    local lib_name="$1"
-    local path_entry candidate
-    local -a _appimage_search_paths
-
-    if [[ -z "$lib_name" ]]; then
-        return 1
-    fi
-
-    IFS=':' read -r -a _appimage_search_paths <<< "${LD_LIBRARY_PATH:-}"
-    for path_entry in "${_appimage_search_paths[@]}"; do
-        if [[ -z "$path_entry" ]]; then
-            continue
-        fi
-        candidate="$path_entry/$lib_name"
-        if [[ -e "$candidate" ]]; then
-            readlink -f "$candidate"
-            return 0
-        fi
-    done
-
-    return 1
 }
 
 appimage_list_direct_dependencies() {
@@ -82,12 +57,7 @@ appimage_list_direct_dependencies() {
         fi
 
         if [[ "$line" == *"=> not found"* ]]; then
-            dep="$(appimage_find_library_in_paths "$dep_name" 2>/dev/null || true)"
-            if [[ -n "$dep" ]]; then
-                echo "$dep"
-            else
-                echo "MISSING:$dep_name"
-            fi
+            echo "MISSING:$dep_name"
             continue
         fi
 

@@ -19,6 +19,7 @@ jobs:
     env:
       DIST_ID: ubuntu24.04
       EVENT_TAG: ${{ github.event.release.tag_name }}
+      ORCA_BUNDLE_DESKTOP_STACK: '0'
 
     steps:
       - name: Checkout
@@ -55,6 +56,21 @@ jobs:
       - name: Apt-Install Dependencies
         uses: ./.github/actions/apt-install-deps
 
+      - name: Install AppImage build and smoke-test inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            dbus-x11 \
+            libjavascriptcoregtk-4.1-0 \
+            libwebkit2gtk-4.1-dev \
+            xvfb
+
+          pkg-config --exists webkit2gtk-4.1
+          ldconfig -p | grep -F 'libwebkit2gtk-4.1.so.0'
+          ldconfig -p | grep -F 'libjavascriptcoregtk-4.1.so.0'
+
       - name: Linux - cache deps
         id: cache_linux_deps
         uses: actions/cache@v5
@@ -86,13 +102,17 @@ jobs:
           rm -rf build build-dbg build-dbginfo out
           mkdir -p out
 
-          ./build_linux.sh -istrlL
+          ORCA_SKIP_APPIMAGE_AUDIT=1 ./build_linux.sh -strlL
+          (
+            cd build
+            ORCA_BUNDLE_DESKTOP_STACK=0 bash ./src/build_linux_image.sh -i -R Release
+          )
 
           app_bin=""
           for candidate in \
-            ./build/package/bin/bambu-studio \
-            ./build/package/bin/orca-slicer \
-            ./build/package/bin/OrcaSlicer; do
+            ./build/package/bin/orca-studio.bin \
+            ./build/package/bin/bambu-studio.bin \
+            ./build/package/bin/orca-slicer.bin; do
             if [ -x "$candidate" ]; then
               app_bin="$candidate"
               break
@@ -104,6 +124,10 @@ jobs:
             exit 1
           fi
           ./scripts/check_appimage_libs.sh ./build/package "$app_bin"
+          test ! -e ./build/package/share/orca-bundled-desktop-runtime
+          test -z "$(find ./build/package -type f \( -name 'libwebkit2gtk-*.so*' -o -name 'libjavascriptcoregtk-*.so*' \) -print -quit)"
+          grep -F 'missing host WebKitGTK 4.1 runtime libraries' ./build/package/libexec/orca-studio-env
+          grep -F 'locale charmap' ./build/package/orca-studio
 
           mapfile -t appimages < <(find build -maxdepth 3 -type f -name '*.AppImage' ! -name 'appimagetool.AppImage' | LC_ALL=C sort)
 
@@ -119,8 +143,48 @@ jobs:
           fi
 
           appimage="${appimages[0]}"
-          mv "$appimage" "out/BambuStudio-OrcaSlicer_Linux_AppImage_${DIST_ID}_amd64_${VER}.AppImage"
-          chmod +x "out/BambuStudio-OrcaSlicer_Linux_AppImage_${DIST_ID}_amd64_${VER}.AppImage"
+          mv "$appimage" "out/OrcaStudio_Linux_AppImage_${DIST_ID}_amd64_${VER}.AppImage"
+          final_appimage="out/OrcaStudio_Linux_AppImage_${DIST_ID}_amd64_${VER}.AppImage"
+          chmod +x "$final_appimage"
+
+          rm -rf out/squashfs-root
+          (
+            cd out
+            "./$(basename "$final_appimage")" --appimage-extract >/dev/null
+          )
+          ./scripts/check_appimage_libs.sh out/squashfs-root out/squashfs-root/bin/orca-studio.bin
+
+          smoke_root="$(mktemp -d)"
+          mkdir -p "$smoke_root/home" "$smoke_root/config" "$smoke_root/cache" "$smoke_root/runtime"
+          chmod 0700 "$smoke_root/runtime"
+          smoke_log="$smoke_root/appimage-smoke.log"
+          set +e
+          timeout --signal=TERM --kill-after=5s 20s \
+            xvfb-run -a dbus-run-session -- \
+            env \
+              HOME="$smoke_root/home" \
+              XDG_CONFIG_HOME="$smoke_root/config" \
+              XDG_CACHE_HOME="$smoke_root/cache" \
+              XDG_RUNTIME_DIR="$smoke_root/runtime" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              out/squashfs-root/AppRun >"$smoke_log" 2>&1
+          smoke_rc=$?
+          set -e
+          if [[ "$smoke_rc" -ne 0 && "$smoke_rc" -ne 124 && "$smoke_rc" -ne 143 ]]; then
+            echo "ERROR: AppImage startup smoke test exited unexpectedly: $smoke_rc" >&2
+            cat "$smoke_log" >&2
+            exit "$smoke_rc"
+          fi
+          if grep -Fq 'Unable to spawn a new child process' "$smoke_log" || \
+             grep -Fq 'Switching Orca Slicer to language' "$smoke_log" || \
+             grep -Fq 'dumped core' "$smoke_log"; then
+            echo "ERROR: AppImage startup smoke test found a fatal runtime diagnostic" >&2
+            cat "$smoke_log" >&2
+            exit 1
+          fi
+          echo "AppImage startup smoke test passed (process remained healthy until timeout)."
+          rm -rf "$smoke_root" out/squashfs-root
 
       - name: Linux - checksums
         shell: bash
@@ -131,6 +195,6 @@ jobs:
       - name: Upload artifacts (Linux AppImage ubuntu24.04)
         uses: actions/upload-artifact@v7
         with:
-          name: bambustudio-orcaslicer-linux-appimage-${{ env.DIST_ID }}-${{ github.sha }}
+          name: orcastudio-linux-appimage-${{ env.DIST_ID }}-${{ github.sha }}
           path: out/
           if-no-files-found: error

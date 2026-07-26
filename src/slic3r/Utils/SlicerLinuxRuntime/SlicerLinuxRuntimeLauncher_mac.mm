@@ -8,6 +8,9 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 namespace Slic3r::SlicerLinuxRuntime {
 
@@ -68,24 +71,29 @@ std::string shell_quote(const std::string& value)
     return out;
 }
 
-std::string run_and_capture(const std::string& command, int* exit_code = nullptr)
+int allocate_loopback_port()
 {
-    std::string output;
-    FILE* pipe = popen(command.c_str(), "r");
-    if (!pipe) {
-        if (exit_code)
-            *exit_code = -1;
-        return {};
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return 0;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return 0;
     }
 
-    char buffer[4096];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
-        output += buffer;
-
-    const int rc = pclose(pipe);
-    if (exit_code)
-        *exit_code = rc;
-    return trim_ascii(output);
+    socklen_t len = sizeof(addr);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
+        ::close(fd);
+        return 0;
+    }
+    const int port = ntohs(addr.sin_port);
+    ::close(fd);
+    return port;
 }
 
 std::filesystem::path runtime_dir()
@@ -115,7 +123,6 @@ std::string first_missing_runtime_file(const std::filesystem::path& component_di
     const std::string plugin_required_files[] = {
         mac_host_wrapper_file_name(),
         mac_runtime_install_script_file_name(),
-        mac_runtime_verify_script_file_name(),
         mac_lima_instance_file_name()
     };
 
@@ -131,6 +138,11 @@ std::string first_missing_runtime_file(const std::filesystem::path& component_di
         host_executable_file_name(),
         std::string("slicer_linux_runtime_host_abi1"),
         std::string("slicer_linux_runtime_host_abi0"),
+        std::string("liborcastudio_rosetta_splitlock_compat.so"),
+        std::string("slicer_linux_auth_browser"),
+        std::string("slicer_linux_auth_browser_x86_64"),
+        std::string("slicer_linux_auth_browser_aarch64"),
+        std::string("run_auth_browser.sh"),
         std::string("ca-certificates.crt"),
         std::string("slicer_base64.cer"),
         std::string("ld-linux-x86-64.so.2"),
@@ -149,47 +161,21 @@ std::string first_missing_runtime_file(const std::filesystem::path& component_di
             return name;
     }
 
-    const std::string component_required_files[] = {
-        linux_component_library_name(),
-        linux_source_library_name()
-    };
+    const bool allow_componentless = required_env("SLICER_LINUX_RUNTIME_ALLOW_COMPONENTLESS") == "1";
+    if (!allow_componentless) {
+        const std::string component_required_files[] = {
+            linux_component_library_name(),
+            linux_source_library_name()
+        };
 
-    for (const std::string& name : component_required_files) {
-        if (!std::filesystem::exists(component_dir / std::filesystem::path(name)) &&
-            !std::filesystem::exists(runtime_dir_path / std::filesystem::path(name)))
-            return name;
+        for (const std::string& name : component_required_files) {
+            if (!std::filesystem::exists(component_dir / std::filesystem::path(name)) &&
+                !std::filesystem::exists(runtime_dir_path / std::filesystem::path(name)))
+                return name;
+        }
     }
 
     return {};
-}
-
-bool probe_runtime_ready(const std::filesystem::path& component_dir, std::string* reason, bool full_probe)
-{
-    const auto verify_script = component_dir / mac_runtime_verify_script_file_name();
-    if (!std::filesystem::exists(verify_script)) {
-        if (reason)
-            *reason = "mac runtime verify script missing";
-        return false;
-    }
-
-    std::string command =
-        std::string("/bin/bash ") + shell_quote(verify_script.string()) +
-        " -PackageDir " + shell_quote(component_dir.string()) +
-        " -ComponentDir " + shell_quote(component_dir.string());
-    if (!full_probe)
-        command += " -SkipProbe";
-
-    int rc = -1;
-    const std::string output = run_and_capture(command + " 2>&1", &rc);
-    if (rc == 0) {
-        if (reason)
-            reason->clear();
-        return true;
-    }
-
-    if (reason)
-        *reason = output.empty() ? std::string("macOS Lima runtime is not ready") : output;
-    return false;
 }
 
 LaunchSpec error_launch_spec(const std::string& message)
@@ -231,10 +217,6 @@ std::string launch_preflight_error()
     if (instance.empty())
         return "SLICER_LINUX_RUNTIME_MAC_LIMA_INSTANCE is not set and slicer_linux_runtime_lima_instance.txt is missing or empty";
 
-    std::string reason;
-    if (!probe_runtime_ready(component_dir, &reason, false))
-        return reason.empty() ? std::string("macOS Lima runtime is not ready") : reason;
-
     return {};
 }
 
@@ -256,6 +238,11 @@ LaunchSpec build_default_launch_spec()
     const std::filesystem::path wrapper_path = component_dir / mac_host_wrapper_file_name();
     const std::filesystem::path host_path = runtime_dir_path / host_executable_file_name();
 
+    int novnc_port = allocate_loopback_port();
+    int vnc_port = allocate_loopback_port();
+    if (novnc_port <= 0 || vnc_port <= 0 || novnc_port == vnc_port)
+        return error_launch_spec("failed to allocate private loopback ports for Linux browser transport");
+
     LaunchSpec spec;
     spec.description = "macOS via Lima linux guest";
     spec.argv = {wrapper_path.string(), host_path.string(), runtime_dir_path.string(), component_dir.string()};
@@ -264,9 +251,11 @@ LaunchSpec build_default_launch_spec()
         {"SLICER_LINUX_RUNTIME_COMPONENT_SO", (runtime_dir_path / linux_component_library_name()).string()},
         {"SLICER_LINUX_RUNTIME_SOURCE_SO", (runtime_dir_path / linux_source_library_name()).string()},
         {"SLICER_LINUX_RUNTIME_REQUIRE_LINUX_GUEST", "1"},
-        {"SLICER_LINUX_RUNTIME_EXPECTED_ABI_VERSION", expected_component_abi_version()},
         {"SLICER_LINUX_RUNTIME_MAC_RUNTIME_DIR", runtime_dir_path.string()},
-        {"SLICER_LINUX_RUNTIME_MAC_LIMA_INSTANCE", instance}
+        {"SLICER_LINUX_RUNTIME_MAC_LIMA_INSTANCE", instance},
+        {"SLICER_LINUX_RUNTIME_AUTH_HOST_NOVNC_PORT", std::to_string(novnc_port)},
+        {"SLICER_LINUX_RUNTIME_AUTH_NOVNC_PORT", std::to_string(novnc_port)},
+        {"SLICER_LINUX_RUNTIME_AUTH_VNC_PORT", std::to_string(vnc_port)}
     };
     return spec;
 }
