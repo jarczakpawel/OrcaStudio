@@ -175,6 +175,15 @@ bool DownloadProgressDialog::Show(bool show)
         Bind(EVT_INSTALL_NETWORK_FAILED, [this](wxCommandEvent& evt) {
             m_status_bar->change_button_label(_L("Close"));
             m_status_bar->set_progress(0);
+#if defined(_WIN32)
+            if (!evt.GetString().empty()) {
+                wxString details = evt.GetString();
+                if (details.length() > 1600)
+                    details = details.Left(1600) + "\n...";
+                MessageDialog error_dialog(this, details, _L("Plug-in installation failed"), wxOK | wxICON_ERROR);
+                error_dialog.ShowModal();
+            }
+#endif
             this->m_simplebook_status->SetSelection(2);
             m_status_bar->set_cancel_callback_fina(
                 [this]() {

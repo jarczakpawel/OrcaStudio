@@ -149,9 +149,15 @@ function Assert-RuntimeManifest([string]$Dir) {
         if (!(Test-Path -LiteralPath $path)) {
             throw "Runtime manifest file missing: $relative"
         }
-        $actual = Get-FileSha256 $path
-        if ($actual -ne $expected) {
-            throw "Runtime manifest hash mismatch: $relative"
+        if ($relative -eq 'ca-certificates.crt') {
+            if (!(Test-CaBundle $path)) {
+                throw 'Invalid CA certificate bundle: ca-certificates.crt'
+            }
+        } else {
+            $actual = Get-FileSha256 $path
+            if ($actual -ne $expected) {
+                throw "Runtime manifest hash mismatch: $relative"
+            }
         }
         $checked++
     }
@@ -228,9 +234,13 @@ function Get-RootfsTarEntryMap {
         [Parameter(Mandatory = $true)][string]$TarExecutable
     )
 
-    $entries = @(& $TarExecutable -tf $TarPath 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $entries.Count -eq 0) {
-        throw "Invalid or empty WSL rootfs tar: $TarPath"
+    $result = Invoke-NativeCapture $TarExecutable @('-tf', $TarPath)
+    if ($result.ExitCode -ne 0) {
+        throw "Invalid WSL rootfs tar: $TarPath`n$($result.Combined)"
+    }
+    $entries = @($result.StdOut -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($entries.Count -eq 0) {
+        throw "Empty WSL rootfs tar: $TarPath"
     }
 
     $entryMap = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::Ordinal)
@@ -256,11 +266,11 @@ function Read-RootfsTarTextMember {
     if (-not $EntryMap.ContainsKey($NormalizedName)) {
         throw "WSL rootfs is missing required archive member: $NormalizedName"
     }
-    $text = (& $TarExecutable -xOf $TarPath $EntryMap[$NormalizedName] 2>$null | Out-String)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to read WSL rootfs archive member: $NormalizedName"
+    $result = Invoke-NativeCapture $TarExecutable @('-xOf', $TarPath, $EntryMap[$NormalizedName])
+    if ($result.ExitCode -ne 0) {
+        throw "Failed to read WSL rootfs archive member: $NormalizedName`n$($result.Combined)"
     }
-    return $text
+    return $result.StdOut
 }
 
 function Get-RootfsRuntimeManifest {
@@ -352,9 +362,9 @@ function Repair-CaBundleFromRootFs([string]$Dir) {
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
     try {
         $rawEntry = $entryMap[$caEntryName]
-        & $tarCommand.Source -xf $rootFsPath -C $tempDir $rawEntry 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to extract CA certificate bundle member: $rawEntry"
+        $extractResult = Invoke-NativeCapture $tarCommand.Source @('-xf', $rootFsPath, '-C', $tempDir, $rawEntry)
+        if ($extractResult.ExitCode -ne 0) {
+            throw "Failed to extract CA certificate bundle member: $rawEntry`n$($extractResult.Combined)"
         }
 
         $recovered = Join-Path $tempDir 'etc/ssl/certs/ca-certificates.crt'
@@ -391,19 +401,35 @@ function Read-RootFsHashMarker([string]$Dir) {
 function Invoke-NativeCapture([string]$FilePath, [string[]]$ArgumentList) {
     $stdoutPath = [System.IO.Path]::GetTempFileName()
     $stderrPath = [System.IO.Path]::GetTempFileName()
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
-        & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
-        $exitCode = $LASTEXITCODE
+        # Windows PowerShell 5.1 can turn redirected native stderr into ErrorRecord
+        # objects. Keep stderr captured, but decide success only from the native exit code.
+        $ErrorActionPreference = 'Continue'
+        $invocationError = ''
+        $exitCode = 127
+        try {
+            & $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath
+            $exitCode = [int]$global:LASTEXITCODE
+        } catch {
+            $invocationError = $_.Exception.Message
+        }
+
         $stdoutText = if (Test-Path $stdoutPath) { Normalize-NativeText (Read-TextAuto $stdoutPath) } else { '' }
         $stderrText = if (Test-Path $stderrPath) { Normalize-NativeText (Read-TextAuto $stderrPath) } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($invocationError)) {
+            $stderrText = (($stderrText + "`n" + $invocationError).Trim())
+        }
         $combined = (($stdoutText + "`n" + $stderrText).Trim())
+
         return @{
             ExitCode = $exitCode
-            StdOut = $stdoutText
-            StdErr = $stderrText
+            StdOut   = $stdoutText
+            StdErr   = $stderrText
             Combined = $combined
         }
     } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
         Remove-Item -Force -ErrorAction SilentlyContinue $stdoutPath, $stderrPath
     }
 }

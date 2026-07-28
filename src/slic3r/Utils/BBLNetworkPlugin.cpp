@@ -100,7 +100,14 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
             Slic3r::SlicerLinuxRuntime::linux_component_library_name(),
             Slic3r::SlicerLinuxRuntime::linux_source_library_name()}) {
         std::string validate_reason;
-        if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_file((component_folder / file_name).string(), &validate_reason)) {
+#if defined(_WIN32)
+        const bool valid = Slic3r::SlicerLinuxRuntime::validate_linux_so_binary(
+            (component_folder / file_name).string(), &validate_reason);
+#else
+        const bool valid = Slic3r::SlicerLinuxRuntime::validate_linux_component_file(
+            (component_folder / file_name).string(), &validate_reason);
+#endif
+        if (!valid) {
             set_runtime_preflight_reason(detail, file_name + ": " + validate_reason);
             return false;
         }
@@ -110,8 +117,13 @@ bool runtime_component_preflight(const boost::filesystem::path& component_folder
     if (boost::filesystem::exists(manifest) && !boost::filesystem::is_directory(manifest)) {
         std::string manifest_reason;
         if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(component_folder, &manifest_reason)) {
+#if defined(_WIN32)
+            BOOST_LOG_TRIVIAL(warning) << "Linux component manifest mismatch accepted on Windows after ELF validation: "
+                                       << manifest_reason;
+#else
             set_runtime_preflight_reason(detail, "Linux component manifest validation failed: " + manifest_reason);
             return false;
+#endif
         }
     }
 

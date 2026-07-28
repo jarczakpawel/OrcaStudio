@@ -271,9 +271,15 @@ jobs:
           stage_binary_sha="$(shasum -a 256 "$stage/OrcaStudio.app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
           ln -s /Applications "$stage/Applications"
           cp "$GITHUB_WORKSPACE/scripts/macos_first_launch.html" "$stage/00 - FIRST LAUNCH - OPEN ME.html"
-          ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          event_tag="${{ github.event.release.tag_name }}"
+          tag="${event_tag:-${GITHUB_REF_NAME:-}}"
+          if [[ "$tag" == v* ]]; then
+            ver="${tag#v}"
+          else
+            ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          fi
           if [ -z "$ver" ]; then
-            echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
+            echo "ERROR: release version could not be resolved"
             exit 1
           fi
           dmg="$GITHUB_WORKSPACE/OrcaStudio_Mac_arm64_V${ver}.dmg"
@@ -499,9 +505,15 @@ jobs:
           stage_binary_sha="$(shasum -a 256 "$stage/OrcaStudio.app/Contents/MacOS/OrcaStudio" | awk '{print $1}')"
           ln -s /Applications "$stage/Applications"
           cp "$GITHUB_WORKSPACE/scripts/macos_first_launch.html" "$stage/00 - FIRST LAUNCH - OPEN ME.html"
-          ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          event_tag="${{ github.event.release.tag_name }}"
+          tag="${event_tag:-${GITHUB_REF_NAME:-}}"
+          if [[ "$tag" == v* ]]; then
+            ver="${tag#v}"
+          else
+            ver=$(sed -nE 's/^[[:space:]]*set\(SLIC3R_VERSION[[:space:]]+"([^"]+)".*/\1/p' version.inc | head -n1)
+          fi
           if [ -z "$ver" ]; then
-            echo "ERROR: SLIC3R_VERSION could not be resolved from version.inc"
+            echo "ERROR: release version could not be resolved"
             exit 1
           fi
           dmg="$GITHUB_WORKSPACE/OrcaStudio_Mac_x86_64_V${ver}.dmg"

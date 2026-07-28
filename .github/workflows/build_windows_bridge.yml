@@ -129,15 +129,23 @@ jobs:
           if ($eventName -eq 'pull_request') {
               $ver = "PR" + $prNumber
           } else {
-              $versionContent = Get-Content version.inc -Raw
-              if ($versionContent -match 'set\(SLIC3R_VERSION "(.*?)"\)') {
-                  $ver = $matches[1]
-              } elseif ($versionContent -match 'set\(SoftFever_VERSION "(.*?)"\)') {
-                  $ver = $matches[1]
-              } else {
-                  $ver = "git" + $env:GITHUB_SHA.Substring(0, 7)
+              $tag = "${{ github.event.release.tag_name }}"
+              if ([string]::IsNullOrWhiteSpace($tag)) {
+                  $tag = $env:GITHUB_REF_NAME
               }
-              $ver = "V$ver"
+
+              if ($tag -match '^v(.+)$') {
+                  $ver = "V" + $matches[1]
+              } else {
+                  $versionContent = Get-Content version.inc -Raw
+                  if ($versionContent -match 'set\(SLIC3R_VERSION "(.*?)"\)') {
+                      $ver = "V" + $matches[1]
+                  } elseif ($versionContent -match 'set\(SoftFever_VERSION "(.*?)"\)') {
+                      $ver = "V" + $matches[1]
+                  } else {
+                      $ver = "git" + $env:GITHUB_SHA.Substring(0, 7)
+                  }
+              }
           }
 
           echo "ver=$ver" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
@@ -233,6 +241,22 @@ jobs:
           }
           $installers | ForEach-Object {
             Write-Host ("Installer: {0} ({1:N0} bytes)" -f $_.FullName, $_.Length)
+          }
+
+      - name: Normalize installer release filename
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $installers = @(Get-ChildItem -LiteralPath "$env:GITHUB_WORKSPACE\build" -Filter "OrcaStudio*.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one OrcaStudio installer, found $($installers.Count)"
+          }
+          $target = Join-Path "$env:GITHUB_WORKSPACE\build" "OrcaStudio_Windows_Installer_${{ env.ver }}.exe"
+          if ($installers[0].FullName -ne $target) {
+            Move-Item -LiteralPath $installers[0].FullName -Destination $target -Force
+          }
+          if (!(Test-Path -LiteralPath $target)) {
+            throw "Normalized installer was not created: $target"
           }
 
       - name: Upload artifacts Win installer

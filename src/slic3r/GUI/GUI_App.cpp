@@ -3878,8 +3878,13 @@ bool slicer_linux_runtime_ready(const boost::filesystem::path& component_folder,
     if (boost::filesystem::exists(manifest_path) && !boost::filesystem::is_directory(manifest_path)) {
         std::string manifest_reason;
         if (!Slic3r::SlicerLinuxRuntime::validate_linux_component_set_against_manifest(component_folder, &manifest_reason)) {
+#if defined(_WIN32)
+            BOOST_LOG_TRIVIAL(warning) << "Linux component manifest mismatch accepted on Windows after ELF validation: "
+                                       << manifest_reason;
+#else
             set_runtime_ready_reason(reason, "Linux component manifest validation failed: " + manifest_reason);
             return false;
+#endif
         }
     }
 

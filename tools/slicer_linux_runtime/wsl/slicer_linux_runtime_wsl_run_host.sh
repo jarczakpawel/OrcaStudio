@@ -64,7 +64,6 @@ resolve_payload_sources() {
     AUTH_RUNNER_SRC="$(find_preferred_file run_auth_browser.sh || true)"
     CA_BUNDLE_SRC="$(find_preferred_file ca-certificates.crt || true)"
     SLICER_CERT_SRC="$(find_preferred_file slicer_base64.cer || true)"
-    MANIFEST_SRC="$(find_preferred_file linux_component_manifest.json || true)"
 }
 
 wait_for_payload_sources() {
@@ -186,7 +185,6 @@ append_source "slicer_linux_runtime_host_abi1" "$ABI1_SRC"
 append_source "slicer_linux_runtime_host_abi0" "$ABI0_SRC"
 append_source "slicer_linux_auth_browser" "$AUTH_BROWSER_SRC"
 append_source "run_auth_browser.sh" "$AUTH_RUNNER_SRC"
-append_source "linux_component_manifest.json" "$MANIFEST_SRC"
 append_source "ca-certificates.crt" "$CA_BUNDLE_SRC"
 append_source "slicer_base64.cer" "$SLICER_CERT_SRC"
 append_package_extras
@@ -203,7 +201,6 @@ log "abi1_src=${ABI1_SRC:-missing}"
 log "abi0_src=${ABI0_SRC:-missing}"
 log "auth_browser_src=${AUTH_BROWSER_SRC:-missing}"
 log "auth_runner_src=${AUTH_RUNNER_SRC:-missing}"
-log "manifest_src=${MANIFEST_SRC:-missing}"
 log "ca_bundle_src=${CA_BUNDLE_SRC:-missing}"
 log "slicer_cert_src=${SLICER_CERT_SRC:-missing}"
 

@@ -908,20 +908,71 @@ SLICER_LINUX_RUNTIME_EXPORT std::string bambu_network_build_login_info(void* age
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_ping_bind(void* agent, std::string ping_code) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.ping_bind", {{"agent", agent_id(a)}, {"ping_code", ping_code}}) : invalid_handle(); }
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_bind_detect(void* agent, std::string dev_ip, std::string sec_link, detectResult& out)
 {
-    auto* a = require_agent(agent); if (!a) return invalid_handle();
-    const auto j = ok_or_error(RpcClient::instance().invoke_json("net.bind_detect", {{"agent", agent_id(a)}, {"dev_ip", dev_ip}, {"sec_link", sec_link}}));
-    if (j.contains("detect")) {
-        const auto& d = j["detect"];
-        out.result_msg = d.value("result_msg", std::string());
-        out.command = d.value("command", std::string());
-        out.dev_id = d.value("dev_id", std::string());
-        out.model_id = d.value("model_id", std::string());
-        out.dev_name = d.value("dev_name", std::string());
-        out.version = d.value("version", std::string());
-        out.bind_state = d.value("bind_state", std::string());
-        out.connect_type = d.value("connect_type", std::string());
+    auto* a = require_agent(agent);
+    if (!a)
+        return invalid_handle();
+
+    out = detectResult{};
+    const auto fail = [&](std::string message) {
+        out = detectResult{};
+        out.result_msg = message;
+        set_last_error(std::move(message));
+        return -1;
+    };
+
+    const auto j = RpcClient::instance().invoke_json(
+        "net.bind_detect", {{"agent", agent_id(a)}, {"dev_ip", dev_ip}, {"sec_link", sec_link}});
+    if (!j.is_object() || !j.contains("ok") || !j["ok"].is_boolean())
+        return fail("net.bind_detect returned a malformed RPC reply");
+    if (!j["ok"].get<bool>()) {
+        if (j.contains("error") && j["error"].is_string())
+            return fail(j["error"].get<std::string>());
+        return fail("net.bind_detect RPC failed");
     }
-    return j.value("value", 0);
+    if (!j.contains("value") || !j["value"].is_number_integer())
+        return fail("net.bind_detect returned no result code");
+
+    int result = 0;
+    try {
+        if (j["value"].is_number_unsigned()) {
+            const auto unsigned_result = j["value"].get<std::uint64_t>();
+            if (unsigned_result > static_cast<std::uint64_t>(INT_MAX))
+                return fail("net.bind_detect returned an out-of-range result code");
+            result = static_cast<int>(unsigned_result);
+        } else {
+            const auto signed_result = j["value"].get<std::int64_t>();
+            if (signed_result < INT_MIN || signed_result > INT_MAX)
+                return fail("net.bind_detect returned an out-of-range result code");
+            result = static_cast<int>(signed_result);
+        }
+    } catch (const nlohmann::json::exception&) {
+        return fail("net.bind_detect returned an invalid result code");
+    }
+    if (!j.contains("detect") || !j["detect"].is_object())
+        return fail("net.bind_detect returned no detectResult payload");
+
+    const auto& d = j["detect"];
+    const auto read_string = [&](const char* name, std::string& value) {
+        if (!d.contains(name)) {
+            value.clear();
+            return true;
+        }
+        if (!d[name].is_string())
+            return false;
+        value = d[name].get<std::string>();
+        return true;
+    };
+    if (!read_string("result_msg", out.result_msg) ||
+        !read_string("command", out.command) ||
+        !read_string("dev_id", out.dev_id) ||
+        !read_string("model_id", out.model_id) ||
+        !read_string("dev_name", out.dev_name) ||
+        !read_string("version", out.version) ||
+        !read_string("bind_state", out.bind_state) ||
+        !read_string("connect_type", out.connect_type))
+        return fail("net.bind_detect returned an invalid detectResult field");
+
+    return result;
 }
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_report_consent(void* agent, std::string expand) { auto* a = require_agent(agent); return a ? RpcClient::instance().invoke_int("net.report_consent", {{"agent", agent_id(a)}, {"expand", expand}}) : invalid_handle(); }
 SLICER_LINUX_RUNTIME_EXPORT int bambu_network_bind(void* agent, std::string dev_ip, std::string dev_id, std::string dev_model, std::string sec_link, std::string timezone, bool improved, OnUpdateStatusFn update) { auto* a = require_agent(agent); return invoke_job_update_only("net.bind", "bind", a, {{"dev_ip", dev_ip}, {"dev_id", dev_id}, {"dev_model", dev_model}, {"sec_link", sec_link}, {"timezone", timezone}, {"improved", improved}}, std::move(update)); }

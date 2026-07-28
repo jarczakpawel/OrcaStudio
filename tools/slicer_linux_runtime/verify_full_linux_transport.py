@@ -1022,6 +1022,40 @@ require(
     "src/slic3r/Utils/SlicerLinuxRuntime/SlicerLinuxRuntimeConfig.cpp",
     'file_name == "runtime-files.sha256"',
 )
+for rel in (
+    "tools/slicer_linux_runtime/wsl/install_runtime.ps1",
+    "tools/slicer_linux_runtime/wsl/verify_runtime.ps1",
+):
+    require(
+        rel,
+        "$previousErrorActionPreference = $ErrorActionPreference",
+        "$ErrorActionPreference = 'Continue'",
+        "$exitCode = 127",
+        "& $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath",
+        "$exitCode = [int]$global:LASTEXITCODE",
+        "$ErrorActionPreference = $previousErrorActionPreference",
+    )
+    require_order(
+        rel,
+        "$ErrorActionPreference = 'Continue'",
+        "& $FilePath @ArgumentList 1> $stdoutPath 2> $stderrPath",
+        "$exitCode = [int]$global:LASTEXITCODE",
+    )
+    forbid(
+        rel,
+        "$LASTEXITCODE = $null",
+        "Start-Process @startParameters",
+    )
+require(
+    "tools/slicer_linux_runtime/wsl/install_runtime.ps1",
+    "Invoke-NativeCapture $TarExecutable @('-tf', $TarPath)",
+    "Invoke-NativeCapture $tarCommand.Source @('-xf', $rootFsPath, '-C', $tempDir, $rawEntry)",
+)
+require(
+    "tools/slicer_linux_runtime/wsl/verify_runtime.ps1",
+    "if ($relative -eq 'ca-certificates.crt')",
+    "Invoke-NativeCapture $TarExecutable @('-xOf', $TarPath, $EntryMap[$NormalizedName])",
+)
 require(
     "src/slic3r/GUI/WebGuideDialog.cpp",
     'InstallNetplugin = requested && !network_plugin_ready',

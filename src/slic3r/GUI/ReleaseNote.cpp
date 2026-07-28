@@ -1963,16 +1963,18 @@ void InputIpAddressDialog::workerThreadFunc(std::string str_ip, std::string str_
         return;
     }
 
-    if (detectData.bind_state == "occupied") {
-        post_update_test_msg(w, wxEmptyString, true);
-        post_update_test_msg(w, _L("The printer has already been bound."), false);
-        return;
-    }
+if (detectData.connect_type != "farm") {
+        if (detectData.bind_state == "occupied") {
+            post_update_test_msg(w, wxEmptyString, true);
+            post_update_test_msg(w, _L("The printer has already been bound."), false);
+            return;
+        }
 
-    if (detectData.connect_type == "cloud") {
-        post_update_test_msg(w, wxEmptyString, true);
-        post_update_test_msg(w, _L("The printer mode is incorrect, please switch to LAN Only."), false);
-        return;
+        if (detectData.connect_type == "cloud") {
+            post_update_test_msg(w, wxEmptyString, true);
+            post_update_test_msg(w, _L("The printer mode is incorrect, please switch to LAN Only."), false);
+            return;
+        }
     }
     if (w.expired()) return;
 
