@@ -228,15 +228,6 @@ if (WIN32)
             endif()
         endforeach()
 
-        foreach(_cert_candidate
-            "${CMAKE_SOURCE_DIR}/cert/slicer_base64.cer"
-            "${CMAKE_SOURCE_DIR}/resources/cert/slicer_base64.cer")
-            if (EXISTS "${_cert_candidate}")
-                file(TO_CMAKE_PATH "${_cert_candidate}" _runtime_file_cmake)
-                list(APPEND SLICER_LINUX_RUNTIME_OPTIONAL_WINDOWS_RUNTIME_FILES "${_runtime_file_cmake}")
-                break()
-            endif()
-        endforeach()
     endif()
 endif()
 # target_include_directories(OrcaSlicer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/slic3r)
