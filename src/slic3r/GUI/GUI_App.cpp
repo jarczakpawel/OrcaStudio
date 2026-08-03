@@ -3931,9 +3931,14 @@ void copy_runtime_file_if_exists(const boost::filesystem::path& src_dir,
     boost::filesystem::create_directories(dst.parent_path());
 
     if (boost::filesystem::exists(dst)) {
+#ifdef _WIN32
+        if (check_copy(src.string(), dst.string()) == CopyFileResult::SUCCESS)
+            return;
+#else
         boost::system::error_code eq_ec;
         if (boost::filesystem::equivalent(src, dst, eq_ec) && !eq_ec)
             return;
+#endif
 
         boost::system::error_code rm_ec;
         boost::filesystem::remove(dst, rm_ec);
@@ -4069,6 +4074,10 @@ bool GUI_App::install_network_plugin_from_ota(bool& had_cache)
         auto copy_one = [&](const boost::filesystem::path& src, const boost::filesystem::path& dst) -> bool {
             boost::filesystem::create_directories(dst.parent_path());
             if (boost::filesystem::exists(dst)) {
+#ifdef _WIN32
+                if (check_copy(src.string(), dst.string()) == CopyFileResult::SUCCESS)
+                    return true;
+#endif
                 boost::system::error_code ec;
                 boost::filesystem::remove(dst, ec);
                 if (ec) {
