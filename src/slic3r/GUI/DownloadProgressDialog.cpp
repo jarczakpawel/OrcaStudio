@@ -157,6 +157,10 @@ bool DownloadProgressDialog::Show(bool show)
                     this->Close();
                 }
             );
+            if (IsModal())
+                EndModal(wxID_OK);
+            else
+                Close();
         });
 
         //download failed

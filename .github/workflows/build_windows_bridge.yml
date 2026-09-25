@@ -221,6 +221,28 @@ jobs:
         run: .\build_release_vs.bat slicer
 
 
+      - name: Normalize Windows runtime shell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          $scripts = @(
+              "$env:GITHUB_WORKSPACE\build\OrcaStudio\slicer_linux_runtime_wsl_run_host.sh",
+              "$env:GITHUB_WORKSPACE\build\OrcaStudio\slicer_linux_runtime_host",
+              "$env:GITHUB_WORKSPACE\build\OrcaStudio\run_auth_browser.sh"
+          )
+          foreach ($script in $scripts) {
+              if (!(Test-Path -LiteralPath $script)) {
+                  throw "Missing runtime shell script: $script"
+              }
+              $text = [System.IO.File]::ReadAllText($script)
+              $text = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+              [System.IO.File]::WriteAllText($script, $text, $utf8NoBom)
+              if ([System.IO.File]::ReadAllBytes($script) -contains 0x0D) {
+                  throw "Runtime shell script still contains CR bytes: $script"
+              }
+          }
+
       - name: Validate bundled Linux runtime package without requiring nested virtualization
         shell: pwsh
         run: |

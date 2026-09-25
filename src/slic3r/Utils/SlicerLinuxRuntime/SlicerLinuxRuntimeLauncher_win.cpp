@@ -317,6 +317,46 @@ std::string read_text_file_trimmed(const std::filesystem::path& path)
     return trim_ascii(value);
 }
 
+bool normalize_posix_script_lf(const std::filesystem::path& path, std::string* reason)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        if (reason)
+            *reason = "cannot open runtime script: " + path.string();
+        return false;
+    }
+
+    std::string input((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (input.find('\r') == std::string::npos)
+        return true;
+
+    std::string output;
+    output.reserve(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '\r') {
+            if (i + 1 < input.size() && input[i + 1] == '\n')
+                continue;
+            output.push_back('\n');
+        } else {
+            output.push_back(input[i]);
+        }
+    }
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        if (reason)
+            *reason = "cannot normalize runtime script: " + path.string();
+        return false;
+    }
+    out.write(output.data(), static_cast<std::streamsize>(output.size()));
+    if (!out) {
+        if (reason)
+            *reason = "failed to normalize runtime script: " + path.string();
+        return false;
+    }
+    return true;
+}
+
 std::string configured_distro_name(const std::filesystem::path& component_dir)
 {
     const auto env_value = required_env("SLICER_LINUX_RUNTIME_WSL_DISTRO");
@@ -536,6 +576,15 @@ LaunchSpec build_default_launch_spec()
         return error_launch_spec(reason.empty() ? "WSL2 runtime is not ready" : reason);
 
     const auto bootstrap_path = resolve_bootstrap_script_path(component_dir);
+    for (const auto& script : {
+            bootstrap_path,
+            component_dir / "slicer_linux_runtime_host",
+            component_dir / "run_auth_browser.sh"}) {
+        std::string normalize_reason;
+        if (!normalize_posix_script_lf(script, &normalize_reason))
+            return error_launch_spec(normalize_reason);
+    }
+
     const std::string component_dir_wsl = to_wsl_path(component_dir);
     const std::string plugin_cache_wsl = component_cache_dir.empty() ? std::string() : to_wsl_path(component_cache_dir);
     const std::string bootstrap_wsl = bootstrap_path.empty() ? std::string() : to_wsl_path(bootstrap_path);

@@ -554,7 +554,13 @@ if ($statusResult.ExitCode -ne 0) {
     throw ("WSL is not ready. Enable Microsoft-Windows-Subsystem-Linux and VirtualMachinePlatform, reboot, then try again. Details: {0}" -f $statusText)
 }
 
-Convert-FileToLf $bootstrapPath
+foreach ($scriptName in @(
+    'slicer_linux_runtime_wsl_run_host.sh',
+    'slicer_linux_runtime_host',
+    'run_auth_browser.sh'
+)) {
+    Convert-FileToLf (Join-Path $PackageDir $scriptName)
+}
 
 $rootFsTar = Join-Path $PackageDir 'windows-wsl2-rootfs.tar'
 $currentRootFsHash = Get-FileSha256 $rootFsTar
