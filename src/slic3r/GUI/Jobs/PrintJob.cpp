@@ -511,12 +511,19 @@ void PrintJob::process(Ctl &ctl)
 
 
     DeviceManager* dev = wxGetApp().getDeviceManager();
-    MachineObject* obj = dev->get_selected_machine();
+    MachineObject* obj = dev ? dev->get_selected_machine() : nullptr;
+    const std::string wait_dev_id = m_dev_id;
 
-    auto wait_fn = [this, &ctl, curr_percent, &obj](int state, std::string job_info) {
+    auto wait_fn = [&ctl, obj, wait_dev_id](int state, std::string job_info) {
+            (void)state;
             BOOST_LOG_TRIVIAL(info) << "print_job: get_job_info = " << job_info;
 
-            if (!obj->is_support_wait_sending_finish) {
+            if (!obj || !obj->is_support_wait_sending_finish) {
+                return true;
+            }
+
+            if (wxGetApp().is_bmcu_auto_retry_active(wait_dev_id)) {
+                BOOST_LOG_TRIVIAL(info) << "print_job: BMCU auto retry active, finish wait for dev_id=" << wait_dev_id;
                 return true;
             }
 
@@ -528,40 +535,34 @@ void PrintJob::process(Ctl &ctl)
                     curr_job_id = DevJsonValParser::get_longlong_val(job_info_j["job_id"]);
                 }
                 BOOST_LOG_TRIVIAL(trace) << "print_job: curr_obj_id=" << curr_job_id;
-
             } catch(...) {
                 ;
             }
 
-            if (obj) {
-                int time_out = 0;
-                while (time_out < PRINT_JOB_SENDING_TIMEOUT) {
-                    BOOST_LOG_TRIVIAL(trace) << "print_job: obj job_id = " << obj->job_id_;
-                    if (!obj->job_id_.empty() && obj->job_id_.compare(curr_job_id) == 0) {
-                        BOOST_LOG_TRIVIAL(info) << "print_job: got job_id = " << obj->job_id_ << ", time_out=" << time_out;
-                        return true;
-                    }
-                    if (obj->is_in_printing_status(obj->print_status)) {
-                        BOOST_LOG_TRIVIAL(info) << "print_job: printer has enter printing status, s = " << obj->print_status;
-                        return true;
-                    }
-                    // Break the wait-for-print-start loop on user cancel.
-                    if (ctl.was_canceled()) {
-                        BOOST_LOG_TRIVIAL(info) << "print_job: user cancel the job " << obj->job_id_;
-                        return true;
-                    }
-                    time_out++;
-                    boost::this_thread::sleep_for(boost::chrono::milliseconds(1000));
+            int time_out = 0;
+            while (time_out < PRINT_JOB_SENDING_TIMEOUT) {
+                BOOST_LOG_TRIVIAL(trace) << "print_job: obj job_id = " << obj->job_id_;
+                if (!obj->job_id_.empty() && obj->job_id_.compare(curr_job_id) == 0) {
+                    BOOST_LOG_TRIVIAL(info) << "print_job: got job_id = " << obj->job_id_ << ", time_out=" << time_out;
+                    return true;
                 }
-                //this->update_status(curr_percent, _L("Print task sending times out."));
-                //m_plater->update_print_error_info(BAMBU_NETWORK_ERR_TIMEOUT, wait_sending_finish.ToStdString(), desc_wait_sending_finish.ToStdString());
-                BOOST_LOG_TRIVIAL(info) << "print_job: timeout, cancel the job" << obj->job_id_;
-                /* handle tiemout */
-                //obj->command_task_cancel(curr_job_id);
-                //return false;
-                return true;
+                if (obj->is_in_printing_status(obj->print_status)) {
+                    BOOST_LOG_TRIVIAL(info) << "print_job: printer has enter printing status, s = " << obj->print_status;
+                    return true;
+                }
+                if (ctl.was_canceled()) {
+                    BOOST_LOG_TRIVIAL(info) << "print_job: user cancel the job " << obj->job_id_;
+                    return true;
+                }
+                if (wxGetApp().is_bmcu_auto_retry_active(wait_dev_id)) {
+                    BOOST_LOG_TRIVIAL(info) << "print_job: BMCU auto retry active, finish wait for dev_id=" << wait_dev_id;
+                    return true;
+                }
+                ++time_out;
+                boost::this_thread::sleep_for(boost::chrono::milliseconds(1000));
             }
-            BOOST_LOG_TRIVIAL(info) << "print_job: obj is null";
+
+            BOOST_LOG_TRIVIAL(info) << "print_job: timeout, cancel the job" << obj->job_id_;
             return true;
     };
 

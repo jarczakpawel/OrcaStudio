@@ -2168,8 +2168,11 @@ void LinuxRuntimeHost::unregister_job(std::int64_t job_id)
 void LinuxRuntimeHost::set_job_cancel(std::int64_t job_id, bool value)
 {
     auto job = get_job(job_id);
-    if (job)
-        job->cancel_requested = value;
+    if (!job)
+        return;
+    job->cancel_requested = value;
+    if (value)
+        job->wait_cv.notify_all();
 }
 
 void LinuxRuntimeHost::set_job_wait_reply(std::int64_t job_id, std::int64_t request_id, bool value)
@@ -2179,11 +2182,59 @@ void LinuxRuntimeHost::set_job_wait_reply(std::int64_t job_id, std::int64_t requ
         return;
     {
         std::lock_guard<std::mutex> lock(job->wait_mutex);
-        job->wait_request_id = request_id;
+        if (job->wait_request_id != request_id)
+            return;
         job->wait_reply_value = value;
         job->wait_reply_ready = true;
     }
     job->wait_cv.notify_all();
+}
+
+bool LinuxRuntimeHost::wait_for_job_reply(const std::shared_ptr<HostJobState>& job, int status, std::string job_info)
+{
+    if (!job)
+        return true;
+    if (m_shutting_down.load(std::memory_order_acquire) || job->cancel_requested.load(std::memory_order_acquire))
+        return false;
+
+    const auto request_id = m_next_wait_request.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(job->wait_mutex);
+        job->wait_request_id = request_id;
+        job->wait_reply_ready = false;
+        job->wait_reply_value = true;
+    }
+
+    queue_event(job->agent_handle, "job.wait", {
+        {"job_id", job->job_id},
+        {"kind", job->kind},
+        {"request_id", request_id},
+        {"status", status},
+        {"job_info", std::move(job_info)}
+    });
+
+    std::unique_lock<std::mutex> lock(job->wait_mutex);
+    const bool signaled = job->wait_cv.wait_for(lock, 35s, [this, &job, request_id] {
+        return m_shutting_down.load(std::memory_order_acquire) ||
+               job->cancel_requested.load(std::memory_order_acquire) ||
+               (job->wait_reply_ready && job->wait_request_id == request_id);
+    });
+
+    if (m_shutting_down.load(std::memory_order_acquire) || job->cancel_requested.load(std::memory_order_acquire))
+        return false;
+
+    if (!signaled || !job->wait_reply_ready || job->wait_request_id != request_id) {
+        host_log_json("job.wait.timeout", {
+            {"job_id", job->job_id},
+            {"kind", job->kind},
+            {"request_id", request_id}
+        });
+        return true;
+    }
+
+    const bool reply = job->wait_reply_value;
+    job->wait_reply_ready = false;
+    return reply;
 }
 
 std::shared_ptr<HostCallbackReplyState> LinuxRuntimeHost::register_callback_request(std::int64_t request_id)
@@ -3069,8 +3120,7 @@ nlohmann::json LinuxRuntimeHost::handle(const std::string& method, const nlohman
                 return job->cancel_requested.load();
             },
             [this, job](int status, std::string job_info) {
-                queue_event(job->agent_handle, "job.wait", {{"job_id", job->job_id}, {"kind", job->kind}, {"status", status}, {"job_info", job_info}});
-                return !job->cancel_requested.load();
+                return wait_for_job_reply(job, status, std::move(job_info));
             });
         unregister_job(job_id);
         host_log_json("net.start_print.result", {{"value", ret}, {"job_id", job_id}});
@@ -3096,8 +3146,7 @@ nlohmann::json LinuxRuntimeHost::handle(const std::string& method, const nlohman
                 return job->cancel_requested.load();
             },
             [this, job](int status, std::string job_info) {
-                queue_event(job->agent_handle, "job.wait", {{"job_id", job->job_id}, {"kind", job->kind}, {"status", status}, {"job_info", job_info}});
-                return !job->cancel_requested.load();
+                return wait_for_job_reply(job, status, std::move(job_info));
             });
         unregister_job(job_id);
         return {{"ok", true}, {"value", ret}, {"job_id", job_id}};

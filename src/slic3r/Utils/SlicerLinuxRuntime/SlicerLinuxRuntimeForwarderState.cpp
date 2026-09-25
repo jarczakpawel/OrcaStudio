@@ -50,6 +50,25 @@ void run_or_queue(const BBL::QueueOnMainFn& queue_on_main, std::function<void()>
     }
 }
 
+void stop_job_threads(const std::shared_ptr<RuntimeJobState>& job)
+{
+    if (!job)
+        return;
+
+    job->stop_cancel_watch = true;
+    if (job->cancel_watch.joinable())
+        job->cancel_watch.join();
+
+    std::thread wait_worker;
+    {
+        std::lock_guard<std::mutex> lock(job->wait_worker_mutex);
+        if (job->wait_worker.joinable())
+            wait_worker = std::move(job->wait_worker);
+    }
+    if (wait_worker.joinable())
+        wait_worker.join();
+}
+
 #if defined(_WIN32)
 std::wstring utf8_to_wstring(const std::string& s)
 {
@@ -147,13 +166,8 @@ int delete_agent(void* handle)
             jobs.push_back(job);
         agent->jobs.clear();
     }
-    for (auto& job : jobs) {
-        if (!job)
-            continue;
-        job->stop_cancel_watch = true;
-        if (job->cancel_watch.joinable())
-            job->cancel_watch.join();
-    }
+    for (auto& job : jobs)
+        stop_job_threads(job);
     delete agent;
     return 0;
 }
@@ -473,11 +487,39 @@ void dispatch_agent_event(std::int64_t remote_handle, const std::string& name, c
         return;
     }
     if (name == "job.wait") {
-        auto job = find_job_state(agent, payload.value("job_id", 0LL));
-        bool reply = true;
-        if (job && job->on_wait)
-            reply = job->on_wait(payload.value("status", 0), payload.value("job_info", std::string()));
-        RpcClient::instance().invoke_void("runtime.job_wait_reply", {{"job_id", payload.value("job_id", 0LL)}, {"request_id", payload.value("request_id", 0LL)}, {"reply", reply}});
+        const auto job_id = payload.value("job_id", 0LL);
+        const auto request_id = payload.value("request_id", 0LL);
+        auto job = find_job_state(agent, job_id);
+        if (!job || !job->on_wait) {
+            RpcClient::instance().invoke_void("runtime.job_wait_reply", {{"job_id", job_id}, {"request_id", request_id}, {"reply", true}});
+            return;
+        }
+
+        const int status = payload.value("status", 0);
+        const auto job_info = payload.value("job_info", std::string());
+        auto cb = job->on_wait;
+
+        std::thread previous;
+        {
+            std::lock_guard<std::mutex> lock(job->wait_worker_mutex);
+            if (job->wait_worker.joinable())
+                previous = std::move(job->wait_worker);
+        }
+        if (previous.joinable())
+            previous.join();
+
+        {
+            std::lock_guard<std::mutex> lock(job->wait_worker_mutex);
+            job->wait_worker = std::thread([job, cb, status, job_info, job_id, request_id] {
+                bool reply = true;
+                try {
+                    reply = cb(status, job_info);
+                } catch (...) {
+                    reply = false;
+                }
+                RpcClient::instance().invoke_void("runtime.job_wait_reply", {{"job_id", job_id}, {"request_id", request_id}, {"reply", reply}});
+            });
+        }
         return;
     }
     if (name == "job.complete") {
@@ -620,11 +662,7 @@ void unregister_job_state(RuntimeAgent* agent, std::int64_t job_id)
             agent->jobs.erase(it);
         }
     }
-    if (job) {
-        job->stop_cancel_watch = true;
-        if (job->cancel_watch.joinable())
-            job->cancel_watch.join();
-    }
+    stop_job_threads(job);
 }
 
 }

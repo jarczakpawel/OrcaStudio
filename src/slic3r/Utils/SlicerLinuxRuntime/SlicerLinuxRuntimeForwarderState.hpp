@@ -87,6 +87,8 @@ struct RuntimeJobState {
     std::string* out_string{nullptr};
     std::atomic<bool> stop_cancel_watch{false};
     std::thread cancel_watch;
+    std::mutex wait_worker_mutex;
+    std::thread wait_worker;
 };
 
 struct RuntimeTunnel {

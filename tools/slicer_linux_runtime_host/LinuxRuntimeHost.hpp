@@ -206,6 +206,7 @@ private:
     void unregister_job(std::int64_t job_id);
     void set_job_cancel(std::int64_t job_id, bool value);
     void set_job_wait_reply(std::int64_t job_id, std::int64_t request_id, bool value);
+    bool wait_for_job_reply(const std::shared_ptr<HostJobState>& job, int status, std::string job_info);
     std::shared_ptr<HostCallbackReplyState> register_callback_request(std::int64_t request_id);
     void unregister_callback_request(std::int64_t request_id);
     void set_callback_reply(std::int64_t request_id, const std::string& value);
